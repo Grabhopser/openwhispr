@@ -124,14 +124,21 @@ class ParakeetWsServer {
     return { spawnEnv, trace };
   }
 
+  hasCudaProviderLibrary(wsBinaryDir) {
+    const candidates =
+      process.platform === "win32"
+        ? ["onnxruntime_providers_cuda.dll"]
+        : ["libonnxruntime_providers_cuda.so"];
+
+    return candidates.some((name) => fs.existsSync(path.join(wsBinaryDir, name)));
+  }
+
   shouldPreferCuda(providerPreference, wsBinaryDir) {
     if (providerPreference === "cpu") return false;
     if (providerPreference === "cuda") return true;
 
-    if (process.platform !== "linux" || process.arch !== "x64") return false;
-    const hasCudaProviderLib = fs.existsSync(
-      path.join(wsBinaryDir, "libonnxruntime_providers_cuda.so")
-    );
+    if (!["linux", "win32"].includes(process.platform) || process.arch !== "x64") return false;
+    const hasCudaProviderLib = this.hasCudaProviderLibrary(wsBinaryDir);
     return hasCudaProviderLib && this.hasNvidiaGpu();
   }
 
@@ -304,7 +311,7 @@ class ParakeetWsServer {
         }
 
         if (
-          /libonnxruntime_providers_cuda\.so|libcudart\.so\.12|libcublas(?:Lt)?\.so\.12|libcufft\.so\.11|Failed to load shared library/i.test(
+          /libonnxruntime_providers_cuda\.so|onnxruntime_providers_cuda\.dll|libcudart\.so\.12|cudart64_12\.dll|libcublas(?:Lt)?\.so\.12|cublas(?:Lt)?64_12\.dll|libcufft\.so\.11|cufft64_11\.dll|cudnn64_9\.dll|Failed to load shared library|LoadLibrary failed|The specified module could not be found/i.test(
             line
           )
         ) {
