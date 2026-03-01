@@ -94,6 +94,8 @@ npm run evidence:parakeet-gpu:source
 npm run evidence:parakeet-gpu:win:source
 npm run benchmark:cleanup
 npm run benchmark:cleanup:ollama
+npm run evidence:cleanup-gpu
+npm run evidence:cleanup-gpu:ollama
 ```
 
 ## Star History
