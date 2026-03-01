@@ -89,6 +89,7 @@ Validate the local or packaged CUDA runtime matrix:
 ```bash
 npm run validate:parakeet-cuda
 npm run validate:parakeet-cuda:packaged
+npm run evidence:parakeet-gpu:source
 ```
 
 ## Star History
