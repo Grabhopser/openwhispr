@@ -96,6 +96,8 @@ npm run benchmark:cleanup
 npm run benchmark:cleanup:ollama
 npm run evidence:cleanup-gpu
 npm run evidence:cleanup-gpu:ollama
+npm run evidence:cleanup-gpu:win
+npm run evidence:cleanup-gpu:win:ollama
 ```
 
 ## Star History

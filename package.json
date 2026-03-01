@@ -63,6 +63,8 @@
     "evidence:parakeet-gpu:win:source": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/capture-parakeet-gpu-evidence.ps1 -Mode source",
     "evidence:cleanup-gpu": "bash scripts/capture-cleanup-gpu-evidence.sh --endpoint http://127.0.0.1:8000/v1",
     "evidence:cleanup-gpu:ollama": "bash scripts/capture-cleanup-gpu-evidence.sh --endpoint http://127.0.0.1:11434/v1",
+    "evidence:cleanup-gpu:win": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/capture-cleanup-gpu-evidence.ps1 -Endpoint http://127.0.0.1:8000/v1",
+    "evidence:cleanup-gpu:win:ollama": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/capture-cleanup-gpu-evidence.ps1 -Endpoint http://127.0.0.1:11434/v1",
     "benchmark:cleanup": "node scripts/benchmark-cleanup-model.js",
     "benchmark:cleanup:ollama": "node scripts/benchmark-cleanup-model.js --endpoint http://127.0.0.1:11434/v1",
     "download:nircmd": "node scripts/download-nircmd.js",
