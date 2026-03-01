@@ -29,10 +29,20 @@ const BINARIES = {
     libPattern: "*.dylib",
   },
   "win32-x64": {
-    archiveName: `sherpa-onnx-v${SHERPA_ONNX_VERSION}-win-x64-shared.tar.bz2`,
-    binaryPath: "sherpa-onnx-offline-websocket-server.exe",
-    outputName: "sherpa-onnx-ws-win32-x64.exe",
-    libPattern: "*.dll",
+    variants: {
+      cpu: {
+        archiveName: `sherpa-onnx-v${SHERPA_ONNX_VERSION}-win-x64-shared.tar.bz2`,
+        binaryPath: "sherpa-onnx-offline-websocket-server.exe",
+        outputName: "sherpa-onnx-ws-win32-x64.exe",
+        libPattern: "*.dll",
+      },
+      gpu: {
+        archiveName: `sherpa-onnx-v${SHERPA_ONNX_VERSION}-cuda-12.x-cudnn-9.x-win-x64-cuda.tar.bz2`,
+        binaryPath: "sherpa-onnx-offline-websocket-server.exe",
+        outputName: "sherpa-onnx-ws-win32-x64.exe",
+        libPattern: "*.dll",
+      },
+    },
   },
   "linux-x64": {
     variants: {

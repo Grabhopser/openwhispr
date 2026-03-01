@@ -631,11 +631,11 @@ OpenWhispr also supports NVIDIA Parakeet models via sherpa-onnx - a fast alterna
 
 - `parakeet-tdt-0.6b-v3`: Multilingual (25 languages), ~680MB
 
-**Parakeet provider controls (Linux x64)**:
+**Parakeet provider controls (Linux x64 / Windows x64)**:
 
 - Download-time binary variant: `SHERPA_ONNX_VARIANT=auto|cpu|gpu`
 - Runtime provider preference: `OPENWHISPR_PARAKEET_PROVIDER=auto|cpu|cuda|gpu`
-- Optional CUDA user-space runtime root: `OPENWHISPR_CUDA12_RUNTIME_DIR` (defaults to `~/.cache/openwhispr/cuda12-runtime`)
+- Optional CUDA user-space runtime root (Linux): `OPENWHISPR_CUDA12_RUNTIME_DIR` (defaults to `~/.cache/openwhispr/cuda12-runtime`)
 
 Examples:
 
@@ -711,10 +711,11 @@ OpenWhispr is designed with privacy and security in mind:
    - whisper.cpp is bundled with the app
    - If bundled binary fails, install via `brew install whisper-cpp` (macOS)
    - Check available disk space for models
-5. **Parakeet CUDA not activating** (Linux x64):
+5. **Parakeet CUDA not activating** (Linux x64 / Windows x64):
    - Re-download sherpa-onnx with GPU variant: `SHERPA_ONNX_VARIANT=gpu npm run download:sherpa-onnx -- --current --force`
    - Check NVIDIA visibility: `nvidia-smi -L`
-   - If CUDA libraries are not in system paths, set `OPENWHISPR_CUDA12_RUNTIME_DIR` to a folder containing `nvidia/*/lib`
+   - Linux only: if CUDA libraries are not in system paths, set `OPENWHISPR_CUDA12_RUNTIME_DIR` to a folder containing `nvidia/*/lib`
+   - Windows only: ensure NVIDIA driver/CUDA runtime DLLs are installed and available on `PATH`
    - Use `OPENWHISPR_PARAKEET_PROVIDER=cpu` as immediate fallback
 6. **Global hotkey conflicts**: Change the hotkey in the Control Panel - any key can be used
    - GNOME Wayland: Hotkeys are registered via gsettings; check Settings → Keyboard → Shortcuts for conflicts
