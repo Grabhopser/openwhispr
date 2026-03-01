@@ -7,6 +7,15 @@ const { execSync } = require("child_process");
 const REPO_DIR = path.resolve(__dirname, "..");
 const DEFAULT_BIN_DIR = path.join(REPO_DIR, "resources", "bin");
 const DEFAULT_MODEL_NAME = "parakeet-tdt-0.6b-v3";
+const PLATFORM_ARCH = `${process.platform}-${process.arch}`;
+const WS_BINARY_NAME =
+  process.platform === "win32"
+    ? `sherpa-onnx-ws-${PLATFORM_ARCH}.exe`
+    : `sherpa-onnx-ws-${PLATFORM_ARCH}`;
+const CUDA_PROVIDER_LIBRARY =
+  process.platform === "win32"
+    ? "onnxruntime_providers_cuda.dll"
+    : "libonnxruntime_providers_cuda.so";
 const DEFAULT_MODEL_DIR = path.join(
   os.homedir(),
   ".cache",
@@ -59,6 +68,12 @@ function ensureFile(filePath) {
   }
 }
 
+function setExecutable(filePath) {
+  try {
+    fs.chmodSync(filePath, 0o755);
+  } catch {}
+}
+
 function hasNvidiaGpu() {
   try {
     const out = execSync("nvidia-smi -L", {
@@ -88,32 +103,35 @@ async function withTimeout(promise, ms, label) {
   }
 }
 
+function isRuntimeLibraryFile(fileName) {
+  if (process.platform === "win32") return fileName.toLowerCase().endsWith(".dll");
+  if (process.platform === "darwin") return fileName.toLowerCase().endsWith(".dylib");
+  return /\.so(\.\d+)*$/i.test(fileName);
+}
+
+function copyFileIntoDir(src, destDir) {
+  const dest = path.join(destDir, path.basename(src));
+  fs.copyFileSync(src, dest);
+  setExecutable(dest);
+}
+
 function makeCpuOnlyBinaryDir(binDir) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "parakeet-cpu-only-"));
-  const required = [
-    "sherpa-onnx-ws-linux-x64",
-    "libonnxruntime.so",
-    "libsherpa-onnx-c-api.so",
-    "libsherpa-onnx-cxx-api.so",
-  ];
-  const optional = ["libonnxruntime_providers_shared.so"];
+  const wsBinaryPath = path.join(binDir, WS_BINARY_NAME);
+  ensureFile(wsBinaryPath);
+  copyFileIntoDir(wsBinaryPath, tmpDir);
 
-  required.forEach((name) => {
-    const src = path.join(binDir, name);
-    ensureFile(src);
-    const dest = path.join(tmpDir, name);
-    fs.copyFileSync(src, dest);
-    fs.chmodSync(dest, 0o755);
-  });
+  const skipNames = new Set([CUDA_PROVIDER_LIBRARY.toLowerCase()]);
+  const entries = fs.readdirSync(binDir, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.isDirectory()) continue;
+    if (entry.name === WS_BINARY_NAME) continue;
+    if (!isRuntimeLibraryFile(entry.name)) continue;
+    if (skipNames.has(entry.name.toLowerCase())) continue;
 
-  optional.forEach((name) => {
-    const src = path.join(binDir, name);
-    if (fs.existsSync(src)) {
-      const dest = path.join(tmpDir, name);
-      fs.copyFileSync(src, dest);
-      fs.chmodSync(dest, 0o755);
-    }
-  });
+    const src = path.join(binDir, entry.name);
+    copyFileIntoDir(src, tmpDir);
+  }
 
   return tmpDir;
 }
@@ -134,7 +152,7 @@ async function runCase({ name, provider, modelName, modelDir, binaryDir }) {
   process.env.OPENWHISPR_PARAKEET_PROVIDER = provider;
 
   const server = new ParakeetWsServer();
-  server.cachedWsBinaryPath = path.join(binaryDir, "sherpa-onnx-ws-linux-x64");
+  server.cachedWsBinaryPath = path.join(binaryDir, WS_BINARY_NAME);
 
   const startTs = Date.now();
   try {
@@ -153,7 +171,11 @@ async function runCase({ name, provider, modelName, modelDir, binaryDir }) {
         ? `${result.error}; stop_error=${stopErr.message}`
         : stopErr.message;
       try {
-        execSync("pkill -9 -f 'sherpa-onnx-ws-linux-x64'", { stdio: "ignore" });
+        if (process.platform === "win32") {
+          execSync(`taskkill /F /IM "${WS_BINARY_NAME}" /T`, { stdio: "ignore" });
+        } else {
+          execSync(`pkill -9 -f '${WS_BINARY_NAME}'`, { stdio: "ignore" });
+        }
       } catch {}
     }
 
@@ -223,11 +245,11 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   process.env.OPENWHISPR_LOG_LEVEL = process.env.OPENWHISPR_LOG_LEVEL || "warn";
 
-  ensureFile(path.join(args.binDir, "sherpa-onnx-ws-linux-x64"));
+  ensureFile(path.join(args.binDir, WS_BINARY_NAME));
   ensureFile(path.join(args.modelDir, "tokens.txt"));
 
   const cpuOnlyDir = makeCpuOnlyBinaryDir(args.binDir);
-  const hasCudaProviderLib = fs.existsSync(path.join(args.binDir, "libonnxruntime_providers_cuda.so"));
+  const hasCudaProviderLib = fs.existsSync(path.join(args.binDir, CUDA_PROVIDER_LIBRARY));
   const gpuDetected = hasNvidiaGpu();
   const expectCudaInAuto = hasCudaProviderLib && gpuDetected;
 
@@ -273,6 +295,8 @@ async function main() {
     host: os.hostname(),
     platform: process.platform,
     arch: process.arch,
+    wsBinaryName: WS_BINARY_NAME,
+    cudaProviderLibrary: CUDA_PROVIDER_LIBRARY,
     binDir: args.binDir,
     modelName: args.modelName,
     modelDir: args.modelDir,

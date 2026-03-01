@@ -505,11 +505,13 @@ open-whispr/
 - `npm run download:llama-server:all` - Download llama.cpp server for all platforms
 - `npm run download:sherpa-onnx` - Download sherpa-onnx for Parakeet local transcription
 - `npm run download:sherpa-onnx:all` - Download sherpa-onnx for all platforms
-- `npm run download:sherpa-onnx -- --variant auto|cpu|gpu` - Select sherpa-onnx Linux variant (default: `auto`)
+- `npm run download:sherpa-onnx -- --variant auto|cpu|gpu` - Select sherpa-onnx variant for current platform (Linux x64 / Windows x64; default: `auto`)
 - `npm run validate:parakeet-cuda` - Run strict local Parakeet CUDA runtime matrix against `resources/bin`
 - `npm run validate:parakeet-cuda:packaged` - Run the same matrix against `dist/linux-unpacked/resources/bin`
 - `npm run evidence:parakeet-gpu` - Capture live `nvidia-smi` process/memory evidence while running packaged Parakeet validator
 - `npm run evidence:parakeet-gpu:source` - Same GPU evidence capture against source `resources/bin`
+- `npm run evidence:parakeet-gpu:win` - Windows one-click Parakeet GPU evidence capture against `dist/win-unpacked/resources/bin`
+- `npm run evidence:parakeet-gpu:win:source` - Windows one-click Parakeet GPU evidence capture against source `resources/bin`
 - `npm run compile:native` - Compile native helpers (Globe key listener for macOS, key listener and fast paste for Windows, fast paste for Linux)
 - `npm run build` - Full build with signing (requires certificates)
 - `npm run build:mac` - macOS build with signing
@@ -716,6 +718,7 @@ OpenWhispr is designed with privacy and security in mind:
    - Check NVIDIA visibility: `nvidia-smi -L`
    - Linux only: if CUDA libraries are not in system paths, set `OPENWHISPR_CUDA12_RUNTIME_DIR` to a folder containing `nvidia/*/lib`
    - Windows only: ensure NVIDIA driver/CUDA runtime DLLs are installed and available on `PATH`
+   - Windows GPU evidence capture: `npm run evidence:parakeet-gpu:win` (or `npm run evidence:parakeet-gpu:win:source`)
    - Use `OPENWHISPR_PARAKEET_PROVIDER=cpu` as immediate fallback
 6. **Global hotkey conflicts**: Change the hotkey in the Control Panel - any key can be used
    - GNOME Wayland: Hotkeys are registered via gsettings; check Settings → Keyboard → Shortcuts for conflicts
