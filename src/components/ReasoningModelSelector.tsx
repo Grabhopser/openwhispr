@@ -318,6 +318,11 @@ export default function ReasoningModelSelector({
   const lastLoadedBaseRef = useRef<string | null>(null);
   const pendingBaseRef = useRef<string | null>(null);
   const isMountedRef = useRef(true);
+  const quickEndpointPresets = [
+    { label: "CUDA Server (8000)", value: "http://127.0.0.1:8000/v1" },
+    { label: "Ollama (11434)", value: "http://127.0.0.1:11434/v1" },
+    { label: "LM Studio (1234)", value: "http://127.0.0.1:1234/v1" },
+  ];
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -437,12 +442,13 @@ export default function ReasoningModelSelector({
 
         if (isMountedRef.current && latestReasoningBaseRef.current === normalizedBase) {
           setCustomModelOptions(mappedModels);
-          if (
-            reasoningModel &&
-            mappedModels.length > 0 &&
-            !mappedModels.some((model) => model.value === reasoningModel)
-          ) {
-            setReasoningModel("");
+          if (mappedModels.length > 0) {
+            const hasCurrentModel = mappedModels.some(
+              (candidate) => candidate.value === reasoningModel
+            );
+            if (!hasCurrentModel) {
+              setReasoningModel(mappedModels[0].value);
+            }
           }
           setCustomModelsError(null);
           lastLoadedBaseRef.current = normalizedBase;
@@ -569,6 +575,22 @@ export default function ReasoningModelSelector({
     if (!trimmedCustomBase) return;
     loadRemoteModels(undefined, true);
   }, [handleApplyCustomBase, isCustomBaseDirty, trimmedCustomBase, loadRemoteModels]);
+
+  const applyCustomEndpointPreset = useCallback(
+    (rawBase: string) => {
+      const normalized = normalizeBaseUrl(rawBase);
+      if (!normalized) return;
+      setSelectedMode("cloud");
+      setSelectedCloudProvider("custom");
+      setLocalReasoningProvider("custom");
+      setCustomBaseInput(normalized);
+      setCloudReasoningBaseUrl(normalized);
+      lastLoadedBaseRef.current = null;
+      pendingBaseRef.current = null;
+      loadRemoteModels(normalized, true);
+    },
+    [setLocalReasoningProvider, setCloudReasoningBaseUrl, loadRemoteModels]
+  );
 
   useEffect(() => {
     const localProviderIds = localProviders.map((p) => p.id);
@@ -760,6 +782,27 @@ export default function ReasoningModelSelector({
                       <code className="text-primary">http://localhost:8080/v1</code>{" "}
                       {t("reasoning.custom.localAi")}.
                     </p>
+                    <div className="pt-1 space-y-1">
+                      <p className="text-xs text-muted-foreground">
+                        {t("reasoning.custom.quickPresets", {
+                          defaultValue: "Quick presets",
+                        })}
+                      </p>
+                      <div className="flex flex-wrap gap-2">
+                        {quickEndpointPresets.map((preset) => (
+                          <Button
+                            key={preset.value}
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            className="text-xs h-7"
+                            onClick={() => applyCustomEndpointPreset(preset.value)}
+                          >
+                            {preset.label}
+                          </Button>
+                        ))}
+                      </div>
+                    </div>
                   </div>
 
                   <div className="space-y-2 pt-3">

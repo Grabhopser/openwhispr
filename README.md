@@ -513,6 +513,8 @@ open-whispr/
 - `npm run evidence:parakeet-gpu:source` - Same GPU evidence capture against source `resources/bin`
 - `npm run evidence:parakeet-gpu:win` - Windows one-click Parakeet GPU evidence capture against `dist/win-unpacked/resources/bin`
 - `npm run evidence:parakeet-gpu:win:source` - Windows one-click Parakeet GPU evidence capture against source `resources/bin`
+- `npm run benchmark:cleanup` - Benchmark OpenAI-compatible text cleanup endpoint with built-in corpus (auto-detects model via `/models`)
+- `npm run benchmark:cleanup:ollama` - Same benchmark against local Ollama endpoint (`http://127.0.0.1:11434/v1`)
 - `npm run compile:native` - Compile native helpers (Globe key listener for macOS, key listener and fast paste for Windows, fast paste for Linux)
 - `npm run build` - Full build with signing (requires certificates)
 - `npm run build:mac` - macOS build with signing
@@ -661,6 +663,28 @@ In `auto` mode, OpenWhispr attempts CUDA first only when GPU/provider prerequisi
 - **Parakeet**: Best for speed-critical use cases or lower-end hardware
 - **Whisper**: Best for quality-critical use cases or when you need specific model sizes
 
+### External CUDA Cleanup Endpoint (Recommended)
+
+For AI text cleanup/enhancement, the fastest path is to run an external OpenAI-compatible model server with GPU acceleration and route OpenWhispr to it.
+
+1. Open **Settings -> AI Enhancement -> Cloud -> Custom**
+2. In **Endpoint URL**, use one of the quick presets:
+   - `CUDA Server (8000)` -> `http://127.0.0.1:8000/v1`
+   - `Ollama (11434)` -> `http://127.0.0.1:11434/v1`
+   - `LM Studio (1234)` -> `http://127.0.0.1:1234/v1`
+3. Select a returned model from **Available Models**
+4. Optional: set API key if your local endpoint requires auth
+
+Benchmark cleanup latency/quality:
+
+```bash
+# Auto-discovers a model from /models on localhost:8000
+npm run benchmark:cleanup
+
+# Same benchmark against Ollama
+npm run benchmark:cleanup:ollama
+```
+
 ### Customization
 
 - **Hotkey**: Change in the Control Panel (default: backtick `) - fully customizable
@@ -721,14 +745,17 @@ OpenWhispr is designed with privacy and security in mind:
    - Windows only: ensure NVIDIA driver/CUDA runtime DLLs are installed and available on `PATH`
    - Windows GPU evidence capture: `npm run evidence:parakeet-gpu:win` (or `npm run evidence:parakeet-gpu:win:source`)
    - Use `OPENWHISPR_PARAKEET_PROVIDER=cpu` as immediate fallback
-6. **Global hotkey conflicts**: Change the hotkey in the Control Panel - any key can be used
+6. **AI cleanup is slow with local models**:
+   - Prefer an external CUDA endpoint via **Cloud -> Custom** and use a quick preset (`8000/11434/1234`)
+   - Run `npm run benchmark:cleanup` to record latency/quality and compare changes over time
+7. **Global hotkey conflicts**: Change the hotkey in the Control Panel - any key can be used
    - GNOME Wayland: Hotkeys are registered via gsettings; check Settings → Keyboard → Shortcuts for conflicts
-7. **Text not pasting**:
+8. **Text not pasting**:
    - macOS: Check accessibility permissions (System Settings → Privacy & Security → Accessibility)
    - Linux X11: Install `xdotool`
    - Linux Wayland: Install `wtype` or `ydotool` for paste simulation (ensure `ydotoold` daemon is running)
    - All platforms: Text is always copied to clipboard - use Ctrl+V (Cmd+V on macOS) to paste manually
-8. **Panel position**: If the panel appears off-screen, restart the app to reset position
+9. **Panel position**: If the panel appears off-screen, restart the app to reset position
 
 ### Getting Help
 
