@@ -42,6 +42,8 @@
     "download:sherpa-onnx:all": "node scripts/download-sherpa-onnx.js --all",
     "validate:parakeet-cuda": "node scripts/validate-parakeet-cuda-runtime.js --out ./parakeet_cuda_validation_results.json",
     "validate:parakeet-cuda:packaged": "node scripts/validate-parakeet-cuda-runtime.js --bin-dir ./dist/linux-unpacked/resources/bin --out ./parakeet_cuda_validation_packaged_results.json",
+    "evidence:parakeet-gpu": "bash scripts/capture-parakeet-gpu-evidence.sh --mode packaged",
+    "evidence:parakeet-gpu:source": "bash scripts/capture-parakeet-gpu-evidence.sh --mode source",
     "download:nircmd": "node scripts/download-nircmd.js",
     "download:windows-fast-paste": "node scripts/download-windows-fast-paste.js",
     "download:windows-key-listener": "node scripts/download-windows-key-listener.js",
