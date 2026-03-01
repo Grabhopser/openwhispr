@@ -515,6 +515,8 @@ open-whispr/
 - `npm run evidence:parakeet-gpu:win:source` - Windows one-click Parakeet GPU evidence capture against source `resources/bin`
 - `npm run evidence:cleanup-gpu` - Capture live `nvidia-smi` evidence while running cleanup benchmark against `http://127.0.0.1:8000/v1`
 - `npm run evidence:cleanup-gpu:ollama` - Same cleanup GPU evidence capture against local Ollama endpoint
+- `npm run evidence:cleanup-gpu:win` - Windows cleanup GPU evidence capture against `http://127.0.0.1:8000/v1`
+- `npm run evidence:cleanup-gpu:win:ollama` - Windows cleanup GPU evidence capture against local Ollama endpoint
 - `npm run benchmark:cleanup` - Benchmark OpenAI-compatible text cleanup endpoint with built-in corpus (auto-detects model via `/models`)
 - `npm run benchmark:cleanup:ollama` - Same benchmark against local Ollama endpoint (`http://127.0.0.1:11434/v1`)
 - `npm run compile:native` - Compile native helpers (Globe key listener for macOS, key listener and fast paste for Windows, fast paste for Linux)
@@ -688,6 +690,9 @@ npm run benchmark:cleanup:ollama
 
 # Capture GPU process/memory evidence while benchmark runs
 npm run evidence:cleanup-gpu
+
+# Windows PowerShell equivalent
+npm run evidence:cleanup-gpu:win
 ```
 
 ### Customization
@@ -754,6 +759,7 @@ OpenWhispr is designed with privacy and security in mind:
    - Prefer an external CUDA endpoint via **Cloud -> Custom** and use a quick preset (`8000/11434/1234`)
    - Run `npm run benchmark:cleanup` to record latency/quality and compare changes over time
    - Run `npm run evidence:cleanup-gpu` to verify the cleanup model process is consuming GPU memory
+   - On Windows, use `npm run evidence:cleanup-gpu:win` (or `:win:ollama`)
 7. **Global hotkey conflicts**: Change the hotkey in the Control Panel - any key can be used
    - GNOME Wayland: Hotkeys are registered via gsettings; check Settings → Keyboard → Shortcuts for conflicts
 8. **Text not pasting**:
