@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Parakeet CUDA Controls**: Added sherpa-onnx CPU/GPU variant selection and Parakeet provider diagnostics for CUDA startup and fallback tracing.
+
+### Changed
+
+- **Parakeet Runtime Provider Startup**: Added `OPENWHISPR_PARAKEET_PROVIDER=auto|cpu|cuda|gpu` support with CUDA-first startup when eligible and CPU fallback on CUDA initialization failure.
+
 ## [1.6.10] - 2026-04-20
 
 ### Added

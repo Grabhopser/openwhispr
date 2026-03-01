@@ -600,6 +600,7 @@ class ParakeetManager {
       sherpaOnnx: { available: false, path: null },
       modelsDir: this.getModelsDir(),
       models: [],
+      serverStatus: this.serverManager.getServerStatus(),
     };
 
     const binaryPath = this.serverManager.getBinaryPath();

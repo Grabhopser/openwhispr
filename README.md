@@ -73,6 +73,17 @@ Visit **[docs.openwhispr.com](https://docs.openwhispr.com)** for:
 
 React 19, TypeScript, Tailwind CSS v4, Electron 41, better-sqlite3, whisper.cpp, sherpa-onnx, shadcn/ui
 
+## Local Parakeet CUDA
+
+Linux x64 and Windows x64 builds can use a CUDA-capable sherpa-onnx package for NVIDIA Parakeet:
+
+```bash
+SHERPA_ONNX_VARIANT=gpu npm run download:sherpa-onnx -- --current --force
+OPENWHISPR_PARAKEET_PROVIDER=cuda npm run dev
+```
+
+Use `OPENWHISPR_PARAKEET_PROVIDER=auto|cpu|cuda|gpu` to control runtime provider selection. In `auto` mode, CUDA is attempted when an NVIDIA GPU and CUDA provider library are detected, with CPU fallback if CUDA startup fails.
+
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=OpenWhispr/openwhispr&type=date&legend=top-left)](https://www.star-history.com/#OpenWhispr/openwhispr&type=date&legend=top-left)
