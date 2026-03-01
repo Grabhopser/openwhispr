@@ -84,6 +84,13 @@ OPENWHISPR_PARAKEET_PROVIDER=cuda npm run dev
 
 Use `OPENWHISPR_PARAKEET_PROVIDER=auto|cpu|cuda|gpu` to control runtime provider selection. In `auto` mode, CUDA is attempted when an NVIDIA GPU and CUDA provider library are detected, with CPU fallback if CUDA startup fails.
 
+Validate the local or packaged CUDA runtime matrix:
+
+```bash
+npm run validate:parakeet-cuda
+npm run validate:parakeet-cuda:packaged
+```
+
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=OpenWhispr/openwhispr&type=date&legend=top-left)](https://www.star-history.com/#OpenWhispr/openwhispr&type=date&legend=top-left)
