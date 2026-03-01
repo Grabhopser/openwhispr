@@ -508,6 +508,7 @@ open-whispr/
 - `npm run download:sherpa-onnx -- --variant auto|cpu|gpu` - Select sherpa-onnx variant for current platform (Linux x64 / Windows x64; default: `auto`)
 - `npm run validate:parakeet-cuda` - Run strict local Parakeet CUDA runtime matrix against `resources/bin`
 - `npm run validate:parakeet-cuda:packaged` - Run the same matrix against `dist/linux-unpacked/resources/bin`
+- `npm run validate:parakeet-cuda:win:packaged` - Run the same matrix against `dist/win-unpacked/resources/bin`
 - `npm run evidence:parakeet-gpu` - Capture live `nvidia-smi` process/memory evidence while running packaged Parakeet validator
 - `npm run evidence:parakeet-gpu:source` - Same GPU evidence capture against source `resources/bin`
 - `npm run evidence:parakeet-gpu:win` - Windows one-click Parakeet GPU evidence capture against `dist/win-unpacked/resources/bin`
