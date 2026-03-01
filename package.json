@@ -61,6 +61,8 @@
     "evidence:parakeet-gpu:source": "bash scripts/capture-parakeet-gpu-evidence.sh --mode source",
     "evidence:parakeet-gpu:win": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/capture-parakeet-gpu-evidence.ps1 -Mode packaged",
     "evidence:parakeet-gpu:win:source": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/capture-parakeet-gpu-evidence.ps1 -Mode source",
+    "benchmark:cleanup": "node scripts/benchmark-cleanup-model.js",
+    "benchmark:cleanup:ollama": "node scripts/benchmark-cleanup-model.js --endpoint http://127.0.0.1:11434/v1",
     "download:nircmd": "node scripts/download-nircmd.js",
     "download:windows-fast-paste": "node scripts/download-windows-fast-paste.js",
     "download:windows-key-listener": "node scripts/download-windows-key-listener.js",

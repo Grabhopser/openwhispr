@@ -1,0 +1,44 @@
+[
+  {
+    "id": "filler-removal",
+    "input": "um i think we should launch on friday period",
+    "expected": "I think we should launch on Friday.",
+    "mustContain": ["launch", "Friday"],
+    "mustNotContain": [" um "]
+  },
+  {
+    "id": "self-correction",
+    "input": "send the invoice to acme no sorry to apex labs period",
+    "expected": "Send the invoice to Apex Labs.",
+    "mustContain": ["invoice", "Apex Labs"],
+    "mustNotContain": ["acme no sorry"]
+  },
+  {
+    "id": "spoken-punctuation",
+    "input": "buy milk comma eggs comma and bread period",
+    "expected": "Buy milk, eggs, and bread.",
+    "mustContain": ["milk", "eggs", "bread"],
+    "mustNotContain": ["comma"]
+  },
+  {
+    "id": "date-time-normalization",
+    "input": "the meeting is on january fifteenth twenty twenty six at five thirty pm period",
+    "expected": "The meeting is on January 15, 2026 at 5:30 PM.",
+    "mustContain": ["meeting", "2026", "5"],
+    "mustNotContain": ["fifteenth twenty twenty six"]
+  },
+  {
+    "id": "technical-term-preservation",
+    "input": "set environment variable OPENWHISPR_PARAKEET_PROVIDER equals cuda period",
+    "expected": "Set environment variable OPENWHISPR_PARAKEET_PROVIDER = cuda.",
+    "mustContain": ["OPENWHISPR_PARAKEET_PROVIDER", "cuda"],
+    "mustNotContain": []
+  },
+  {
+    "id": "stutter-cleanup",
+    "input": "this this is is only only a a test period",
+    "expected": "This is only a test.",
+    "mustContain": ["test"],
+    "mustNotContain": ["this this", "is is", "only only", "a a"]
+  }
+]

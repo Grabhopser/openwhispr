@@ -92,6 +92,8 @@ npm run validate:parakeet-cuda:packaged
 npm run validate:parakeet-cuda:win:packaged
 npm run evidence:parakeet-gpu:source
 npm run evidence:parakeet-gpu:win:source
+npm run benchmark:cleanup
+npm run benchmark:cleanup:ollama
 ```
 
 ## Star History
