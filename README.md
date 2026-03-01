@@ -506,6 +506,8 @@ open-whispr/
 - `npm run download:sherpa-onnx` - Download sherpa-onnx for Parakeet local transcription
 - `npm run download:sherpa-onnx:all` - Download sherpa-onnx for all platforms
 - `npm run download:sherpa-onnx -- --variant auto|cpu|gpu` - Select sherpa-onnx Linux variant (default: `auto`)
+- `npm run validate:parakeet-cuda` - Run strict local Parakeet CUDA runtime matrix against `resources/bin`
+- `npm run validate:parakeet-cuda:packaged` - Run the same matrix against `dist/linux-unpacked/resources/bin`
 - `npm run compile:native` - Compile native helpers (Globe key listener for macOS, key listener and fast paste for Windows, fast paste for Linux)
 - `npm run build` - Full build with signing (requires certificates)
 - `npm run build:mac` - macOS build with signing
