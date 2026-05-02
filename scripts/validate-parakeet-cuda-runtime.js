@@ -315,9 +315,13 @@ async function main() {
   if (!evaluation.allPassed) {
     process.exitCode = 1;
   }
+
+  // Some native/runtime handles can stay alive after sherpa startup tests. This
+  // validator is a short-lived CLI, so exit explicitly after writing results.
+  process.exit(process.exitCode || 0);
 }
 
 main().catch((err) => {
   console.error(JSON.stringify({ fatal: err.message }, null, 2));
-  process.exitCode = 1;
+  process.exit(1);
 });
