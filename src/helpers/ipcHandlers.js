@@ -13,6 +13,7 @@ const { i18nMain, changeLanguage } = require("./i18nMain");
 const DeepgramStreaming = require("./deepgramStreaming");
 const OpenAIRealtimeStreaming = require("./openaiRealtimeStreaming");
 const AudioStorageManager = require("./audioStorage");
+const AsrRouter = require("./asrBackends/asrRouter");
 const liveSpeakerIdentifier = require("./liveSpeakerIdentifier");
 const MeetingEchoLeakDetector = require("./meetingEchoLeakDetector");
 const {
@@ -270,6 +271,10 @@ class IPCHandlers {
     this.clipboardManager = managers.clipboardManager;
     this.whisperManager = managers.whisperManager;
     this.parakeetManager = managers.parakeetManager;
+    this.asrRouter = new AsrRouter({
+      parakeetManager: this.parakeetManager,
+      whisperManager: this.whisperManager,
+    });
     this.diarizationManager = managers.diarizationManager;
     this.windowManager = managers.windowManager;
     this.updateManager = managers.updateManager;
@@ -1337,12 +1342,7 @@ class IPCHandlers {
       const fs = require("fs");
       try {
         const audioBuffer = fs.readFileSync(filePath);
-        if (options.provider === "nvidia") {
-          const result = await this.parakeetManager.transcribeLocalParakeet(audioBuffer, options);
-          return result;
-        }
-        const result = await this.whisperManager.transcribeLocalWhisper(audioBuffer, options);
-        return result;
+        return await this.asrRouter.transcribe(audioBuffer, options);
       } catch (error) {
         debugLogger.error("Audio file transcription error", { error: error.message });
         return { success: false, error: error.message };
@@ -1488,6 +1488,10 @@ class IPCHandlers {
 
         throw error;
       }
+    });
+
+    ipcMain.handle("get-asr-backend-capabilities", async () => {
+      return this.asrRouter.getCapabilities();
     });
 
     ipcMain.handle("check-whisper-installation", async (event) => {
