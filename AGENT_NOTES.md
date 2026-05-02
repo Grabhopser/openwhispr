@@ -2,3 +2,5 @@
 
 - 2026-05-02: Source Parakeet CUDA validation passed on `WiscoCachy` with NVIDIA TITAN X (Pascal). `resources/bin` contains `sherpa-onnx-ws-linux-x64` and `libonnxruntime_providers_cuda.so`; model files exist under `~/.cache/openwhispr/parakeet-models/parakeet-tdt-0.6b-v3`.
 - 2026-05-02: Upstream latest public release is `v1.6.10`; `upstream/main` has moved package metadata to `1.7.0` but no `v1.7.0` tag was present after fetch. `v1.6.10` removes local CUDA validator/evidence scripts and has CPU-only sherpa download config, so CUDA work must be carried forward explicitly during upgrade.
+- 2026-05-02: Live dev run verified Parakeet CUDA in the app: `sherpa-onnx-ws-linux-x64 --provider=cuda` was launched by Electron on port 6006 and appeared in `nvidia-smi` using about 504 MiB. Debug log reported `providerAttempted: cuda`, `providerUsed: cuda`, no fallback.
+- 2026-05-02: Live dev run verified local cleanup GPU path via `llama-server-vulkan`: log showed `--n-gpu-layers 99`, `Vulkan0 (NVIDIA TITAN X)`, and `offloaded 37/37 layers to GPU`. This is GPU acceleration through Vulkan, separate from Parakeet CUDA.
