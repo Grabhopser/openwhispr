@@ -17,6 +17,13 @@ import { syncService } from "../services/SyncService.js";
 
 const REASONING_CACHE_TTL = 30000; // 30 seconds
 const REALTIME_MODELS = new Set(["gpt-4o-mini-transcribe", "gpt-4o-transcribe"]);
+const RECORDER_TIMESLICE_MS = 1000;
+const PREFERRED_RECORDING_MIME_TYPES = [
+  "audio/webm;codecs=opus",
+  "audio/webm",
+  "audio/ogg;codecs=opus",
+  "audio/ogg",
+];
 
 function resolveReasoningRoute(text, settings, agentName) {
   const cleanupReachable =
@@ -158,6 +165,18 @@ class AudioManager {
     this.lastAudioBlob = null;
     this.lastAudioMetadata = null;
     this._localSpeechGateState = null;
+    this.audioChunkStats = [];
+    this.recordingStopRequestedAt = null;
+  }
+
+  getSupportedRecordingMimeType() {
+    if (typeof MediaRecorder === "undefined" || !MediaRecorder.isTypeSupported) {
+      return "";
+    }
+
+    return PREFERRED_RECORDING_MIME_TYPES.find((mimeType) =>
+      MediaRecorder.isTypeSupported(mimeType)
+    ) || "";
   }
 
   getWorkletBlobUrl() {
@@ -375,13 +394,28 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         this._localSpeechGateState = null;
       }
 
-      this.mediaRecorder = new MediaRecorder(micStream);
+      const supportedMimeType = this.getSupportedRecordingMimeType();
+      const recorderOptions = supportedMimeType ? { mimeType: supportedMimeType } : undefined;
+      this.mediaRecorder = new MediaRecorder(micStream, recorderOptions);
       this.audioChunks = [];
+      this.audioChunkStats = [];
+      this.recordingStopRequestedAt = null;
       this.recordingStartTime = Date.now();
       this.recordingMimeType = this.mediaRecorder.mimeType || "audio/webm";
 
       this.mediaRecorder.ondataavailable = (event) => {
+        const size = event.data?.size || 0;
+        if (size <= 0) {
+          logger.debug("Recorder emitted empty audio chunk", {}, "audio");
+          return;
+        }
+
         this.audioChunks.push(event.data);
+        this.audioChunkStats.push({
+          index: this.audioChunkStats.length,
+          size,
+          elapsedMs: this.recordingStartTime ? Date.now() - this.recordingStartTime : null,
+        });
       };
 
       this.mediaRecorder.onstop = async () => {
@@ -399,6 +433,12 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         this.isProcessing = true;
         this.onStateChange?.({ isRecording: false, isProcessing: true });
 
+        const durationSeconds = this.recordingStartTime
+          ? (Date.now() - this.recordingStartTime) / 1000
+          : null;
+        const stopFlushDelayMs = this.recordingStopRequestedAt
+          ? Date.now() - this.recordingStopRequestedAt
+          : null;
         const audioBlob = new Blob(this.audioChunks, { type: this.recordingMimeType });
         this.lastAudioBlob = audioBlob;
 
@@ -408,20 +448,23 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
             blobSize: audioBlob.size,
             blobType: audioBlob.type,
             chunksCount: this.audioChunks.length,
+            chunkSizes: this.audioChunkStats.map((chunk) => chunk.size),
+            durationSeconds,
+            stopFlushDelayMs,
           },
           "audio"
         );
 
-        const durationSeconds = this.recordingStartTime
-          ? (Date.now() - this.recordingStartTime) / 1000
-          : null;
         this.recordingStartTime = null;
-        await this.processAudio(audioBlob, { durationSeconds });
-
-        micStream.getTracks().forEach((track) => track.stop());
+        this.recordingStopRequestedAt = null;
+        try {
+          await this.processAudio(audioBlob, { durationSeconds });
+        } finally {
+          micStream.getTracks().forEach((track) => track.stop());
+        }
       };
 
-      this.mediaRecorder.start();
+      this.mediaRecorder.start(RECORDER_TIMESLICE_MS);
       this.isRecording = true;
       this.onStateChange?.({ isRecording: true, isProcessing: false });
 
@@ -484,6 +527,12 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
 
   stopRecording() {
     if (this.mediaRecorder?.state === "recording") {
+      this.recordingStopRequestedAt = Date.now();
+      try {
+        this.mediaRecorder.requestData();
+      } catch (error) {
+        logger.debug("Recorder final data flush failed", { error: error.message }, "audio");
+      }
       this.mediaRecorder.stop();
       return true;
     }
@@ -529,8 +578,11 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
 
     const shouldUseStrongLocalWhisperGate =
       settings.useLocalWhisper && settings.localTranscriptionProvider === "whisper";
+    const isLocalParakeet =
+      settings.useLocalWhisper && settings.localTranscriptionProvider === "nvidia";
     if (
       speechGateDecision.skip &&
+      !isLocalParakeet &&
       (speechGateDecision.reason === "silence" || shouldUseStrongLocalWhisperGate)
     ) {
       logger.info(
@@ -550,6 +602,22 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       this.onStateChange?.({ isRecording: false, isProcessing: false });
       this.onTranscriptionComplete?.({ success: true, text: "" });
       return;
+    }
+
+    if (speechGateDecision.skip && isLocalParakeet) {
+      logger.info(
+        "Speech gate allowed Parakeet transcription despite local skip decision",
+        {
+          reason: speechGateDecision.reason,
+          peakRms: speechGateDecision.peakRms?.toFixed(4),
+          peakAmplitude: speechGateDecision.peakAmplitude?.toFixed(4),
+          speechWindowCount: speechGateDecision.speechWindowCount,
+          maxConsecutiveSpeechWindows: speechGateDecision.maxConsecutiveSpeechWindows,
+          audioSizeBytes: audioBlob.size,
+          durationSeconds: metadata?.durationSeconds ?? null,
+        },
+        "audio"
+      );
     }
 
     try {

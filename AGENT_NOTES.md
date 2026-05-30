@@ -31,3 +31,9 @@
 - Extracted app metadata from `dist/linux-unpacked/resources/app.asar`; package version is `1.7.2-parakeet-cuda.1`.
 - Simulated packaged resource resolution with `process.resourcesPath=dist/linux-unpacked/resources`; `OPENWHISPR_PARAKEET_PROVIDER=auto` selected CUDA and launched packaged `resources/bin/sherpa-onnx-ws-linux-x64` with `--provider=cuda`.
 - Packaged-resource simulation cleaned up the repo-launched sidecar. Existing unrelated AppImage sidecar on port 6006 was left untouched.
+
+## 2026-05-30 Recording Stability
+
+- Renderer `MediaRecorder.stop()` previously relied on a final implicit chunk only. Stabilized by calling `requestData()` before stop, using 1s recorder timeslices, filtering empty chunks, and logging chunk sizes/duration/flush delay.
+- Parakeet local mode should not trust the renderer speech gate for hard no-audio decisions. The Parakeet backend already performs RMS silence detection after FFmpeg conversion, so renderer gate now logs but allows Parakeet transcription.
+- Long Parakeet recordings previously used hard 15s cuts with no overlap. Segmentation now uses 0.75s overlap and per-segment RMS/duration/text diagnostics to expose partial-transcript failures.

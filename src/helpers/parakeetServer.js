@@ -16,6 +16,10 @@ const SAMPLE_RATE = 16000;
 const BYTES_PER_SAMPLE = 4; // float32
 const MAX_SEGMENT_SECONDS = 15;
 const MAX_SEGMENT_BYTES = MAX_SEGMENT_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE;
+const SEGMENT_OVERLAP_SECONDS = 0.75;
+const SEGMENT_OVERLAP_BYTES = SEGMENT_OVERLAP_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE;
+const MIN_SEGMENT_SECONDS = 0.25;
+const MIN_SEGMENT_BYTES = MIN_SEGMENT_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE;
 const SILENCE_RMS_THRESHOLD = 0.001;
 
 class ParakeetServerManager {
@@ -106,7 +110,12 @@ class ParakeetServerManager {
       const durationSeconds = samples.length / BYTES_PER_SAMPLE / SAMPLE_RATE;
 
       const rms = computeFloat32RMS(samples);
-      debugLogger.debug("Parakeet audio analysis", { durationSeconds, rms });
+      debugLogger.debug("Parakeet audio analysis", {
+        durationSeconds,
+        rms,
+        wavSize: wavBuffer.length,
+        samplesBytes: samples.length,
+      });
       if (rms < SILENCE_RMS_THRESHOLD) {
         return { text: "", elapsed: 0 };
       }
@@ -123,30 +132,83 @@ class ParakeetServerManager {
         return result;
       }
 
+      const segmentStepBytes = Math.max(MAX_SEGMENT_BYTES - SEGMENT_OVERLAP_BYTES, MIN_SEGMENT_BYTES);
+      const segmentCount = Math.ceil(
+        Math.max(samples.length - SEGMENT_OVERLAP_BYTES, 0) / segmentStepBytes
+      );
+
       debugLogger.debug("Parakeet segmenting long audio", {
         durationSeconds,
-        segmentCount: Math.ceil(samples.length / MAX_SEGMENT_BYTES),
+        segmentCount,
+        maxSegmentSeconds: MAX_SEGMENT_SECONDS,
+        overlapSeconds: SEGMENT_OVERLAP_SECONDS,
       });
 
       const texts = [];
       let totalElapsed = 0;
+      let segmentIndex = 0;
 
-      for (let offset = 0; offset < samples.length; offset += MAX_SEGMENT_BYTES) {
+      for (let offset = 0; offset < samples.length; offset += segmentStepBytes) {
         const end = Math.min(offset + MAX_SEGMENT_BYTES, samples.length);
         const segment = samples.subarray(offset, end);
+        const segmentDurationSeconds = segment.length / BYTES_PER_SAMPLE / SAMPLE_RATE;
+        if (segment.length < MIN_SEGMENT_BYTES) {
+          debugLogger.debug("Skipping very short Parakeet trailing segment", {
+            segmentIndex,
+            segmentDurationSeconds,
+          });
+          break;
+        }
+
+        const segmentRms = computeFloat32RMS(segment);
+        debugLogger.debug("Parakeet segment transcription starting", {
+          segmentIndex,
+          segmentCount,
+          offsetSeconds: offset / BYTES_PER_SAMPLE / SAMPLE_RATE,
+          segmentDurationSeconds,
+          segmentRms,
+        });
+
+        if (segmentRms < SILENCE_RMS_THRESHOLD) {
+          debugLogger.debug("Skipping silent Parakeet segment", {
+            segmentIndex,
+            segmentDurationSeconds,
+            segmentRms,
+          });
+          segmentIndex += 1;
+          continue;
+        }
+
         const result = await this.wsServer.transcribe(segment, SAMPLE_RATE);
         totalElapsed += result.elapsed || 0;
-        if (result.text) {
-          texts.push(result.text);
+        if (result.text?.trim()) {
+          texts.push(result.text.trim());
+          debugLogger.debug("Parakeet segment transcription complete", {
+            segmentIndex,
+            textLength: result.text.length,
+            elapsed: result.elapsed || 0,
+          });
         } else {
           debugLogger.warn("Parakeet segment returned empty text", {
-            segmentIndex: offset / MAX_SEGMENT_BYTES,
-            segmentDuration: segment.length / BYTES_PER_SAMPLE / SAMPLE_RATE,
+            segmentIndex,
+            segmentCount,
+            segmentDurationSeconds,
+            segmentRms,
           });
         }
+
+        segmentIndex += 1;
       }
 
-      return { text: texts.join(" "), elapsed: totalElapsed };
+      const text = texts.join(" ").replace(/\s+/g, " ").trim();
+      debugLogger.debug("Parakeet segmented transcription complete", {
+        segmentCount: segmentIndex,
+        nonEmptySegmentCount: texts.length,
+        textLength: text.length,
+        totalElapsed,
+      });
+
+      return { text, elapsed: totalElapsed };
     } finally {
       this._cleanupFiles(filesToCleanup);
     }
