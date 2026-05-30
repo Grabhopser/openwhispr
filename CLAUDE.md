@@ -10,11 +10,12 @@ OpenWhispr is an Electron-based desktop dictation application that uses whisper.
 
 ### Core Technologies
 - **Frontend**: React 19, TypeScript, Tailwind CSS v4, Vite
-- **Desktop Framework**: Electron 36 with context isolation
+- **Desktop Framework**: Electron 41 with context isolation
 - **Database**: better-sqlite3 for local transcription history
 - **UI Components**: shadcn/ui with Radix primitives
 - **Speech Processing**: whisper.cpp + NVIDIA Parakeet (via sherpa-onnx) + OpenAI API
 - **Audio Processing**: FFmpeg (bundled via ffmpeg-static)
+- **Node.js**: 24 (pinned in `.nvmrc` — CI uses Node 24, do NOT regenerate `package-lock.json` with a different major version)
 
 ### Key Architectural Decisions
 
@@ -27,6 +28,7 @@ OpenWhispr is an Electron-based desktop dictation application that uses whisper.
    - Main Process: Electron main, IPC handlers, database operations
    - Renderer Process: React app with context isolation
    - Preload Script: Secure bridge between processes
+   - ONNX Utility Process: hosts all `onnxruntime-node` inference (text embeddings, speaker embeddings, fbank). Lazy-spawned on first use via `src/helpers/onnxWorkerClient.js` → `src/workers/onnxWorker.js`. Native crashes (e.g., ORT `bad_alloc`) confine to the worker; main process rejects in-flight requests and respawns with backoff. Stopped in `will-quit`.
 
 3. **Audio Pipeline**:
    - MediaRecorder API → Blob → ArrayBuffer → IPC → File → whisper.cpp
@@ -42,8 +44,10 @@ OpenWhispr is an Electron-based desktop dictation application that uses whisper.
 ### Native Resources (resources/)
 
 - **windows-key-listener.c**: C source for Windows low-level keyboard hook (Push-to-Talk)
+- **windows-mic-listener.c**: C source for WASAPI mic session monitor (event-driven mic detection)
+- **macos-mic-listener.swift**: Swift source for CoreAudio mic property listener (event-driven mic detection)
 - **globe-listener.swift**: Swift source for macOS Globe/Fn key detection
-- **bin/**: Directory for compiled native binaries (whisper-cpp, nircmd, key listeners)
+- **bin/**: Directory for compiled native binaries (whisper-cpp, nircmd, key/mic listeners)
 
 ### Helper Modules (src/helpers/)
 
@@ -62,30 +66,59 @@ OpenWhispr is an Electron-based desktop dictation application that uses whisper.
   - Auto-fallback to F8/F9 if default hotkey is unavailable
   - Notifies renderer via IPC when hotkey registration fails
   - Integrates with GnomeShortcutManager for GNOME Wayland support
+  - Integrates with HyprlandShortcutManager for Hyprland Wayland support
 - **gnomeShortcut.js**: GNOME Wayland global shortcut integration
   - Uses D-Bus service to receive hotkey toggle commands
   - Registers shortcuts via gsettings (visible in GNOME Settings → Keyboard → Shortcuts)
   - Converts Electron hotkey format to GNOME keysym format
   - Only active on Linux + Wayland + GNOME desktop
+- **hyprlandShortcut.js**: Hyprland Wayland global shortcut integration
+  - Uses D-Bus service to receive hotkey toggle commands (same `com.openwhispr.App` service)
+  - Registers shortcuts via `hyprctl keyword bind` (runtime keybinding)
+  - Converts Electron hotkey format to Hyprland bind format (`MODS, key`)
+  - Only active on Linux + Wayland + Hyprland (detected via `HYPRLAND_INSTANCE_SIGNATURE`)
 - **ipcHandlers.js**: Centralized IPC handler registration
 - **windowsKeyManager.js**: Windows Push-to-Talk support with native key listener
   - Spawns native `windows-key-listener.exe` binary for low-level keyboard hooks
   - Supports compound hotkeys (e.g., `Ctrl+Shift+F11`, `CommandOrControl+Space`)
   - Emits `key-down` and `key-up` events for push-to-talk functionality
   - Graceful fallback if binary unavailable
+- **meetingDetectionEngine.js**: Orchestrates meeting detection from all sources
+  - Gates notifications during recording (tap-to-talk and push-to-talk)
+  - Post-recording cooldown (2.5s) before showing queued notifications
+  - Priority-based coalescing (process > audio) — one notification, not three
+- **meetingProcessDetector.js**: Detects running meeting apps
+  - macOS: Event-driven via `systemPreferences.subscribeWorkspaceNotification` (zero CPU)
+  - Windows/Linux: Shared `processListCache` polling (30s interval)
+- **audioActivityDetector.js**: Detects microphone usage for unscheduled meetings
+  - macOS: Event-driven via `macos-mic-listener` binary (CoreAudio property listeners)
+  - Windows: Event-driven via `windows-mic-listener.exe` (WASAPI sessions, self-PID exclusion)
+  - Linux: Event-driven via `pactl subscribe` (PulseAudio source-output events)
+  - All platforms: Graceful fallback to polling if native approach fails
+- **processListCache.js**: Shared singleton process list cache (5s TTL, `ps-list` npm)
+- **googleCalendarManager.js**: Google Calendar sync with exponential backoff
+  - 10s socket timeout on API requests
+  - Backoff: 2min → 4min → 8min → cap 30min on consecutive failures
+  - Reset to normal interval on success
 - **menuManager.js**: Application menu management
 - **tray.js**: System tray icon and menu
 - **whisper.js**: Local whisper.cpp integration and model management
 - **parakeet.js**: NVIDIA Parakeet model management via sherpa-onnx
 - **parakeetServer.js**: sherpa-onnx CLI wrapper for transcription
+- **qdrantManager.js**: Qdrant vector DB sidecar process lifecycle (spawn, health check, shutdown)
+- **localEmbeddings.js**: Local text embedding via ONNX Runtime + all-MiniLM-L6-v2 (384-dim vectors)
+- **vectorIndex.js**: Qdrant collection management — upsert, delete, search, batch reindex
 - **windowConfig.js**: Centralized window configuration
 - **windowManager.js**: Window creation and lifecycle management
+- **cliBridge.js**: Loopback HTTP server on ports 8200–8219, bearer-token auth (token at `~/.openwhispr/cli-bridge.json`), 127.0.0.1-only. Used by the unified CLI to talk to a running desktop app.
+- **postMigrationDetector.js**: Detects users returning from the pre-Gizmo bundle ID via a `.bundle-migrated` sentinel in userData; consumed by `ipcHandlers.js` to drive the `PostMigrationOnboarding` modal
 
 ### React Components (src/components/)
 
 - **App.jsx**: Main dictation interface with recording states
 - **ControlPanel.tsx**: Settings, history, model management UI
 - **OnboardingFlow.tsx**: 8-step first-time setup wizard
+- **PostMigrationOnboarding.tsx**: One-time modal for users returning from the pre-Gizmo bundle ID; reuses `PermissionsSection` to walk through re-granting Microphone, Accessibility, and System Audio. Triggered by `postMigrationDetector.js` (see Helper Modules)
 - **SettingsPage.tsx**: Comprehensive settings interface
 - **WhisperModelPicker.tsx**: Model selection and download UI
 - **ui/**: Reusable UI components (buttons, cards, inputs, etc.)
@@ -107,10 +140,10 @@ OpenWhispr is an Electron-based desktop dictation application that uses whisper.
 ### Services
 
 - **ReasoningService.ts**: AI processing for agent-addressed commands
-  - Detects when user addresses their named agent
-  - Routes to appropriate AI provider (OpenAI/Anthropic/Gemini)
-  - Removes agent name from final output
-  - Supports GPT-5, Claude Opus 4.1, and Gemini 2.5 models
+  - Detects when user addresses their named agent and removes the agent name from final output
+  - Provider implementations live in a registry at `src/services/ai/inferenceProviders/index.ts` covering 8 providers (`anthropic`, `enterprise`, `gemini`, `groq`, `lan`, `local`, `openai`, `openwhispr`), each implementing the `InferenceProvider` interface from `types.ts`
+  - Per-scope LLM config: 4 scopes (`dictationCleanup`, `dictationAgent`, `noteFormatting`, `chatIntelligence`) defined in `src/config/inferenceScopes.ts`
+  - `selectResolvedLLMConfig(state, scope)` in `settingsStore.ts` resolves provider/model per scope with fallback chains
 
 ### whisper.cpp Integration
 
@@ -132,8 +165,35 @@ OpenWhispr is an Electron-based desktop dictation application that uses whisper.
 
 - **Available Models**:
   - `parakeet-tdt-0.6b-v3`: Multilingual (25 languages), ~680MB
+  - `parakeet-unified-en-0.6b`: English-only, ~631MB, state-of-the-art EN accuracy (5.91% avg WER on Open ASR Leaderboard)
 
 - **Download URLs**: Models from sherpa-onnx ASR models release on GitHub
+
+### Local Semantic Search (Qdrant + MiniLM)
+
+Always-on offline semantic search that finds notes by meaning, not just keywords. Used by the AI agent's `search_notes` tool. Qdrant starts automatically on app launch; embedding model auto-downloads on first run if missing.
+
+**Architecture**:
+- **Qdrant sidecar**: Rust binary spawned as child process (`qdrantManager.js`), port 6333–6350
+- **Embedding model**: `all-MiniLM-L6-v2` via ONNX Runtime (`localEmbeddings.js`), 384-dim vectors
+- **Vector index**: Qdrant collection management (`vectorIndex.js`), cosine distance
+- **Hybrid search**: FTS5 + Qdrant in parallel → Reciprocal Rank Fusion (K=60) with 0.3 cosine score threshold
+
+**Pipeline**:
+1. App launches → Qdrant binary starts → collection created. Embedding model auto-downloads if missing (~22MB)
+2. Note create/update/delete → SQLite write → background vector upsert/delete via `_asyncVectorUpsert()`/`_asyncVectorDelete()`
+3. Agent searches → `db-semantic-search-notes` IPC → parallel FTS5 + vector search → RRF merge → ranked results
+
+**Search fallback chain** (in `searchNotesTool.ts`): cloud search → local semantic → FTS5 keyword
+
+**Storage**:
+- Qdrant data: `~/.cache/openwhispr/qdrant-data/`
+- Qdrant binary: `resources/bin/qdrant-{platform}-{arch}` (bundled — downloaded during `prebuild` / `predev`)
+- Embedding model: `~/.cache/openwhispr/embedding-models/all-MiniLM-L6-v2/` (auto-downloaded on first launch)
+
+**Dependencies**: `@qdrant/js-client-rest`, `onnxruntime-node`
+
+**Dev setup**: The Qdrant binary downloads automatically via `predev`/`prestart`. The embedding model auto-downloads on first app launch. To manually download: `npm run download:qdrant` and `npm run download:embedding-model`.
 
 ### Build Scripts (scripts/)
 
@@ -141,8 +201,12 @@ OpenWhispr is an Electron-based desktop dictation application that uses whisper.
 - **download-llama-server.js**: Downloads llama.cpp server for local LLM inference
 - **download-nircmd.js**: Downloads nircmd.exe for Windows clipboard operations
 - **download-windows-key-listener.js**: Downloads prebuilt Windows key listener binary
+- **download-windows-mic-listener.js**: Downloads prebuilt Windows mic listener binary
 - **download-sherpa-onnx.js**: Downloads sherpa-onnx binaries for Parakeet support
+- **download-qdrant.js**: Downloads Qdrant vector DB binary for local semantic search
+- **download-minilm.js**: Downloads all-MiniLM-L6-v2 ONNX model + tokenizer for local embeddings
 - **build-globe-listener.js**: Compiles macOS Globe key listener from Swift source
+- **build-macos-mic-listener.js**: Compiles macOS mic listener from Swift source
 - **build-windows-key-listener.js**: Compiles Windows key listener (for local development)
 - **run-electron.js**: Development script to launch Electron with proper environment
 - **lib/download-utils.js**: Shared utilities for downloading and extracting files
@@ -202,9 +266,6 @@ CREATE TABLE transcriptions (
 Settings stored in localStorage with these keys:
 - `whisperModel`: Selected Whisper model
 - `useLocalWhisper`: Boolean for local vs cloud
-- `openaiApiKey`: Encrypted API key
-- `anthropicApiKey`: Encrypted API key
-- `geminiApiKey`: Encrypted API key
 - `language`: Selected language code
 - `agentName`: User's custom agent name
 - `reasoningModel`: Selected AI model for processing
@@ -213,7 +274,9 @@ Settings stored in localStorage with these keys:
 - `hasCompletedOnboarding`: Onboarding completion flag
 - `customDictionary`: JSON array of words/phrases for improved transcription accuracy
 
-Environment variables persisted to `.env` (via `saveAllKeysToEnvFile()`):
+Secret env vars (12 total: 7 BYOK API keys + 5 enterprise cloud creds — see `SECRET_KEYS` in `environment.js`) are encrypted at rest via Electron `safeStorage` and stored as per-key files under `userData/secure-keys/`. They are loaded into `process.env` at startup by `EnvironmentManager.init()`. Renderer reads them via IPC (`get-*-key`) and writes via debounced IPC (`save-*-key`). On Linux without a keyring, secrets fall back to plaintext.
+
+Non-secret env vars persisted to `.env` (via `saveAllKeysToEnvFile()`):
 - `LOCAL_TRANSCRIPTION_PROVIDER`: Transcription engine (`nvidia` for Parakeet)
 - `PARAKEET_MODEL`: Selected Parakeet model name (e.g., `parakeet-tdt-0.6b-v3`)
 
@@ -232,25 +295,27 @@ Environment variables persisted to `.env` (via `saveAllKeysToEnvFile()`):
 - AI processes command and removes agent reference from output
 - Supports multiple AI providers (all models defined in `src/models/modelRegistryData.json`):
   - **OpenAI** (Responses API):
-    - GPT-5.2 (`gpt-5.2`) - Latest flagship reasoning model
+    - GPT-5.5 (`gpt-5.5`) - Latest flagship frontier model, 1M context
+    - GPT-5.2 (`gpt-5.2`) - Strong reasoning model
     - GPT-5 Mini (`gpt-5-mini`) - Fast and cost-efficient
     - GPT-5 Nano (`gpt-5-nano`) - Ultra-fast, low latency
     - GPT-4.1 Series (`gpt-4.1`, `gpt-4.1-mini`, `gpt-4.1-nano`) - Strong baseline with 1M context
   - **Anthropic** (Via IPC bridge to avoid CORS):
-    - Claude Sonnet 4.5 (`claude-sonnet-4-5`) - Balanced performance
+    - Claude Opus 4.7 (`claude-opus-4-7`) - Most capable Claude model, 1M context
+    - Claude Sonnet 4.6 (`claude-sonnet-4-6`) - Balanced performance
     - Claude Haiku 4.5 (`claude-haiku-4-5`) - Fast with near-frontier intelligence
-    - Claude Opus 4.5 (`claude-opus-4-5`) - Most capable Claude model
+    - Claude Opus 4.6 (`claude-opus-4-6`) - Previous Opus generation, 1M context
+    - Claude Sonnet 4.5 (`claude-sonnet-4-5`) - Previous Sonnet generation
+    - Claude Opus 4.5 (`claude-opus-4-5`) - Earlier Opus model
   - **Google Gemini** (Direct API integration):
-    - Gemini 2.5 Pro (`gemini-2.5-pro`) - Most capable Gemini model
-    - Gemini 2.5 Flash (`gemini-2.5-flash`) - High-performance with thinking
+    - Gemini 3.1 Pro (`gemini-3.1-pro-preview`) - Most capable Gemini model
+    - Gemini 3 Flash (`gemini-3-flash-preview`) - Ultra-fast, high-capability next-gen model
     - Gemini 2.5 Flash Lite (`gemini-2.5-flash-lite`) - Lowest latency and cost
-    - Gemini 2.0 Flash (`gemini-2.0-flash`) - Fast, long-context option
   - **Local**: GGUF models via llama.cpp (Qwen, Llama, Mistral, GPT-OSS)
 
 ### 8. Model Registry Architecture
 
 All AI model definitions are centralized in `src/models/modelRegistryData.json` as the single source of truth:
-
 ```json
 {
   "cloudProviders": [...],   // OpenAI, Anthropic, Gemini API models
@@ -283,11 +348,11 @@ All AI model definitions are centralized in `src/models/modelRegistryData.json` 
 **Anthropic Integration**:
 - Routes through IPC handler to avoid CORS issues in renderer process
 - Uses main process for API calls with proper error handling
-- Model IDs use alias format (e.g., `claude-sonnet-4-5` not date-suffixed versions)
+- Model IDs use alias format (e.g., `claude-sonnet-4-6` not date-suffixed versions)
 
 **Gemini Integration**:
 - Direct API calls from renderer process
-- Increased token limits for Gemini 2.5 Pro (2000 minimum)
+- Increased token limits for Gemini 3.1 Pro (2000 minimum)
 - Proper handling of thinking process in responses
 - Error handling for MAX_TOKENS finish reason
 
@@ -388,8 +453,8 @@ On GNOME Wayland, Electron's `globalShortcut` API doesn't work due to Wayland's 
 - gsettings path: `/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/openwhispr/`
 
 **IPC Integration**:
-- `get-hotkey-mode-info`: Returns `{ isUsingGnome: boolean }` to renderer
-- UI hides activation mode selector when `isUsingGnome` is true
+- `get-hotkey-mode-info`: Returns `{ isUsingGnome, isUsingHyprland, isUsingNativeShortcut }` to renderer
+- UI hides activation mode selector when `isUsingNativeShortcut` is true
 - Forces tap-to-talk mode (push-to-talk not supported)
 
 **Hotkey Format Conversion**:
@@ -397,7 +462,96 @@ On GNOME Wayland, Electron's `globalShortcut` API doesn't work due to Wayland's 
 - GNOME format: `<Alt>r`, `<Control><Shift>space`
 - Backtick (`) → `grave` in GNOME keysym format
 
+### 15. Hyprland Wayland Global Hotkeys
+
+On Hyprland (wlroots Wayland compositor), Electron's `globalShortcut` API and the `GlobalShortcutsPortal` feature don't work reliably. OpenWhispr uses native Hyprland keybindings:
+
+**Architecture**:
+1. `main.js` enables `GlobalShortcutsPortal` feature flag for Wayland (fallback)
+2. `hotkeyManager.js` detects Hyprland + Wayland and initializes `HyprlandShortcutManager`
+3. `hyprlandShortcut.js` creates D-Bus service at `com.openwhispr.App` (same as GNOME)
+4. Shortcuts registered via `hyprctl keyword bind` (runtime keybinding)
+5. Hyprland triggers `dbus-send` command which calls the D-Bus `Toggle()` method
+
+**Detection**:
+- Primary: `HYPRLAND_INSTANCE_SIGNATURE` environment variable (set by Hyprland)
+- Fallback: `XDG_CURRENT_DESKTOP` contains "hyprland"
+
+**Hotkey Format Conversion**:
+- Electron format: `Alt+R`, `CommandOrControl+Shift+Space`
+- Hyprland format: `ALT, R`, `CTRL SHIFT, space`
+- Modifier-only combos (e.g., `Control+Super`) → `CTRL, Super_L`
+
+**Bind/Unbind Commands**:
+- Register: `hyprctl keyword bind "ALT, R, exec, dbus-send --session ..."`
+- Unregister: `hyprctl keyword unbind "ALT, R"`
+- Bindings are ephemeral (don't survive Hyprland restart) but re-registered on app startup
+
+**Limitations**:
+- Push-to-talk not supported (Hyprland `bind` fires a single exec, not key-down/key-up)
+- Requires `hyprctl` on PATH (ships with Hyprland)
+
+### 16. Meeting Detection (Event-Driven)
+
+Detects meetings via three independent sources, orchestrated by `MeetingDetectionEngine`:
+
+**Architecture**:
+- `MeetingDetectionEngine` listens to events from `MeetingProcessDetector` and `AudioActivityDetector`
+- `GoogleCalendarManager` provides calendar context (imminent events, active meetings)
+- All three sources feed into a unified notification pipeline
+
+**Process Detection** (known meeting apps — Zoom, Teams, Webex, FaceTime):
+- macOS: `systemPreferences.subscribeWorkspaceNotification` — zero CPU, instant detection
+- Windows/Linux: `processListCache` shared polling (30s interval, `ps-list` npm)
+
+**Microphone Detection** (unscheduled/browser meetings like Google Meet):
+- macOS: `macos-mic-listener` binary — CoreAudio `kAudioDevicePropertyDeviceIsRunningSomewhere` property listeners with hot-plug support
+- Windows: `windows-mic-listener.exe` — WASAPI `IAudioSessionManager2` session monitoring, `--exclude-pid` for self-mic exclusion
+- Linux: `pactl subscribe` — PulseAudio source-output events
+- All platforms: Graceful fallback to polling if native binary/command unavailable
+
+**UX Rules**:
+- During recording (tap-to-talk or push-to-talk): ALL notifications suppressed
+- After recording: 2.5s cooldown before showing queued notifications
+- Multiple signals coalesced: process > audio priority, one notification shown
+- Calendar-aware: if imminent calendar event exists, notification shows event name
+- Active calendar meeting recording: all detections suppressed
+
+**Binary Distribution**:
+- macOS: Compiled from Swift source via `scripts/build-macos-mic-listener.js` during `compile:native`
+- Windows: Prebuilt binary downloaded via `scripts/download-windows-mic-listener.js` during `prebuild:win`
+- CI workflow: `.github/workflows/build-windows-mic-listener.yml` auto-builds on push to main
+
+**Calendar Sync Resilience**:
+- 10s socket timeout on all Google Calendar API requests
+- Exponential backoff on consecutive failures: 2min → 4min → 8min → cap 30min
+- Reset to normal 2min interval on any successful sync
+
 ## Development Guidelines
+
+### Internationalization (i18n) — REQUIRED
+
+All user-facing strings **must** use the i18n system. Never hardcode UI text in components.
+
+**Setup**: react-i18next (v15) with i18next (v25). Translation files in `src/locales/{lang}/translation.json`.
+
+**Supported languages**: en, es, fr, de, pt, it, ru, zh-CN, zh-TW
+
+**How to use**:
+```tsx
+import { useTranslation } from "react-i18next";
+
+const { t } = useTranslation();
+// Simple: t("notes.list.title")
+// With interpolation: t("notes.upload.using", { model: "Whisper" })
+```
+
+**Rules**:
+1. Every new UI string must have a translation key in `en/translation.json` and all other language files
+2. Use `useTranslation()` hook in components and hooks
+3. Keep `{{variable}}` interpolation syntax for dynamic values
+4. Do NOT translate: brand names (OpenWhispr, Pro), technical terms (Markdown, Signal ID), format names (MP3, WAV), AI system prompts
+5. Group keys by feature area (e.g., `notes.editor.*`, `referral.toasts.*`)
 
 ### Adding New Features
 
@@ -405,6 +559,8 @@ On GNOME Wayland, Electron's `globalShortcut` API doesn't work due to Wayland's 
 2. **New Setting**: Update useSettings.ts and SettingsPage.tsx
 3. **New UI Component**: Follow shadcn/ui patterns in src/components/ui
 4. **New Manager**: Create in src/helpers/, initialize in main.js
+5. **New UI Strings**: Add translation keys to all 10 language files (see i18n section above)
+6. **New Sidecar Binary**: Add download script in `scripts/`, add to `prebuild*` scripts in package.json, add manager in `src/helpers/`, initialize in `main.js`. Spawn the child with `detached: process.platform !== "win32"` so it has its own process group on Unix. Right after spawn call `sidecarPidFile.write(name, child.pid)` and on `close` call `sidecarPidFile.clear(name)`. Add the binary fragment to `EXPECTED_BINARY_FRAGMENTS` in `sidecarReaper.js`. Register a stop function via `sidecarRegistry.register(name, () => manager.stop())` in `registerSidecars()` — that single registration replaces the old `will-quit` line.
 
 ### Testing Checklist
 
@@ -418,7 +574,14 @@ On GNOME Wayland, Electron's `globalShortcut` API doesn't work due to Wayland's 
 - [ ] Test custom dictionary with uncommon words
 - [ ] Verify Windows Push-to-Talk with compound hotkeys
 - [ ] Test GNOME Wayland hotkeys (if on GNOME + Wayland)
-- [ ] Verify activation mode selector is hidden on GNOME Wayland
+- [ ] Test Hyprland Wayland hotkeys (if on Hyprland + Wayland)
+- [ ] Verify activation mode selector is hidden on GNOME Wayland and Hyprland Wayland
+- [ ] Verify meeting detection works with event-driven mode (check debug logs for "event-driven")
+- [ ] Test meeting notification suppression during recording
+- [ ] Test post-recording cooldown (notifications shouldn't flash immediately)
+- [ ] Create a note about "quarterly revenue projections", search via agent for "financial forecast" — should match semantically
+- [ ] Verify Qdrant starts on app launch (check debug logs for "qdrant started successfully")
+- [ ] Kill Qdrant process manually — verify FTS5 keyword search still works as fallback
 
 ### Common Issues and Solutions
 
@@ -448,12 +611,28 @@ On GNOME Wayland, Electron's `globalShortcut` API doesn't work due to Wayland's 
    - Run `npm run download:whisper-cpp` before packaging (current platform)
    - Use `npm run download:whisper-cpp:all` for multi-platform packaging
    - afterSign.js automatically skips signing when CSC_IDENTITY_AUTO_DISCOVERY=false
+   - **Lockfile**: Always use Node 24 when running `npm install` (matches CI). If your local Node version differs, use `nvm exec 24 npm install`. Running `npm install` with a different major version will produce an incompatible `package-lock.json` that breaks `npm ci` in CI.
 
 5. **Windows Push-to-Talk Binary**:
    - Prebuilt binary downloaded automatically on Windows during build
    - If download fails, push-to-talk falls back to tap mode
    - To compile locally: install Visual Studio Build Tools or MinGW-w64
    - CI workflow (`.github/workflows/build-windows-key-listener.yml`) auto-builds on push to main
+
+6. **Meeting Detection Not Working**:
+   - Check debug logs for "event-driven" vs "polling" mode
+   - macOS: Verify `macos-mic-listener` binary exists in `resources/bin/` (compiled during `npm run compile:native`)
+   - Windows: Verify `windows-mic-listener.exe` exists in `resources/bin/` (downloaded during `prebuild:win`)
+   - Linux: Verify `pactl` is installed (`pulseaudio-utils` or `pipewire-pulse` package)
+   - If event-driven binary is missing, detection falls back to polling automatically
+
+7. **Local Semantic Search Not Working**:
+   - Qdrant binary should be in `resources/bin/qdrant-{platform}-{arch}` (auto-downloaded during `predev`/`prebuild`)
+   - Embedding model should be in `~/.cache/openwhispr/embedding-models/all-MiniLM-L6-v2/model.onnx` (auto-downloaded on first app launch)
+   - Run `npm run download:qdrant` and `npm run download:embedding-model` manually if missing
+   - Check debug logs for "qdrant" entries (port, health check, errors)
+   - If Qdrant fails to start, search still works via FTS5 keyword fallback
+   - Semantic search is only available through the AI agent's `search_notes` tool, not the manual search UI
 
 ### Platform-Specific Notes
 
@@ -516,10 +695,13 @@ On GNOME Wayland, Electron's `globalShortcut` API doesn't work due to Wayland's 
 - Temporary file cleanup
 - Memory usage with large models
 - Process timeout protection (5 minutes)
+- Meeting detection uses event-driven OS APIs (near-zero CPU) with polling fallback
+- Process list cache shared between detectors to avoid duplicate `tasklist`/`pgrep` calls
+- Google Calendar sync uses exponential backoff to avoid hammering API on network failures
 
 ## Security Considerations
 
-- API keys stored in system keychain when possible
+- API keys and enterprise cloud creds (12 secrets total) encrypted at rest via Electron `safeStorage` → OS keychain (Keychain / DPAPI / libsecret), stored as per-key files in `userData/secure-keys/`. Linux without a keyring falls back to plaintext (Electron default). Closed in #629.
 - Context isolation enabled
 - No remote code execution
 - Sanitized file paths
@@ -529,7 +711,7 @@ On GNOME Wayland, Electron's `globalShortcut` API doesn't work due to Wayland's 
 
 - Streaming transcription support
 - Custom wake word detection
-- Multi-language UI
+- ~~Multi-language UI~~ (implemented — 9 languages via react-i18next)
 - Cloud model selection
 - Batch transcription
 - Export formats beyond clipboard

@@ -1,26 +1,53 @@
-import React, { useEffect, useMemo } from "react";
+import React, { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   Sliders,
   Mic,
   Brain,
-  User,
-  Sparkles,
   UserCircle,
   Wrench,
-  BookOpen,
-  ShieldCheck,
-  Lock,
+  Keyboard,
+  CreditCard,
+  Shield,
+  Users,
 } from "lucide-react";
-import SidebarModal, { SidebarItem } from "./ui/SidebarModal";
+import SidebarModal, { type SidebarItem } from "./ui/SidebarModal";
 import SettingsPage, { SettingsSectionType } from "./SettingsPage";
+import { WORKSPACES_ENABLED } from "../lib/features";
 
 export type { SettingsSectionType };
+
+// The old AI Models sidebar had four items (transcription, meetings,
+// intelligence, agentMode) — they now collapse into two: speechToText + llms.
+// Legacy deep-links land on the matching sub-tab via LEGACY_SUB_TAB.
+const SECTION_ALIASES: Record<string, SettingsSectionType> = {
+  aiModels: "llms",
+  agentConfig: "llms",
+  agentMode: "llms",
+  intelligence: "llms",
+  meetings: "llms",
+  prompts: "llms",
+  transcription: "speechToText",
+  softwareUpdates: "system",
+  privacy: "privacyData",
+  permissions: "privacyData",
+  developer: "system",
+};
+
+const LEGACY_SUB_TAB: Record<string, string> = {
+  transcription: "dictation",
+  meetings: "noteFormatting",
+  intelligence: "dictationCleanup",
+  agentMode: "chatIntelligence",
+  agentConfig: "chatIntelligence",
+  aiModels: "dictationCleanup",
+  prompts: "dictationCleanup",
+};
 
 interface SettingsModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  initialSection?: SettingsSectionType;
+  initialSection?: string;
 }
 
 export default function SettingsModal({ open, onOpenChange, initialSection }: SettingsModalProps) {
@@ -32,8 +59,26 @@ export default function SettingsModal({ open, onOpenChange, initialSection }: Se
         label: t("settingsModal.sections.account.label"),
         icon: UserCircle,
         description: t("settingsModal.sections.account.description"),
-        group: t("settingsModal.groups.profile"),
+        group: t("settingsModal.groups.account"),
       },
+      {
+        id: "plansBilling",
+        label: t("settingsModal.sections.plansBilling.label"),
+        icon: CreditCard,
+        description: t("settingsModal.sections.plansBilling.description"),
+        group: t("settingsModal.groups.account"),
+      },
+      ...(WORKSPACES_ENABLED
+        ? [
+            {
+              id: "workspace" as const,
+              label: t("settingsModal.sections.workspace.label"),
+              icon: Users,
+              description: t("settingsModal.sections.workspace.description"),
+              group: t("settingsModal.groups.account"),
+            },
+          ]
+        : []),
       {
         id: "general",
         label: t("settingsModal.sections.general.label"),
@@ -42,73 +87,72 @@ export default function SettingsModal({ open, onOpenChange, initialSection }: Se
         group: t("settingsModal.groups.app"),
       },
       {
-        id: "transcription",
-        label: t("settingsModal.sections.transcription.label"),
+        id: "hotkeys",
+        label: t("settingsModal.sections.hotkeys.label"),
+        icon: Keyboard,
+        description: t("settingsModal.sections.hotkeys.description"),
+        group: t("settingsModal.groups.app"),
+      },
+      {
+        id: "speechToText",
+        label: t("settingsModal.sections.speechToText.label"),
         icon: Mic,
-        description: t("settingsModal.sections.transcription.description"),
-        group: t("settingsModal.groups.speech"),
+        description: t("settingsModal.sections.speechToText.description"),
+        group: t("settingsModal.groups.aiModels"),
       },
       {
-        id: "dictionary",
-        label: t("settingsModal.sections.dictionary.label"),
-        icon: BookOpen,
-        description: t("settingsModal.sections.dictionary.description"),
-        group: t("settingsModal.groups.speech"),
-      },
-      {
-        id: "aiModels",
-        label: t("settingsModal.sections.aiModels.label"),
+        id: "llms",
+        label: t("settingsModal.sections.llms.label"),
         icon: Brain,
-        description: t("settingsModal.sections.aiModels.description"),
-        group: t("settingsModal.groups.intelligence"),
+        description: t("settingsModal.sections.llms.description"),
+        group: t("settingsModal.groups.aiModels"),
       },
       {
-        id: "agentConfig",
-        label: t("settingsModal.sections.agentConfig.label"),
-        icon: User,
-        description: t("settingsModal.sections.agentConfig.description"),
-        group: t("settingsModal.groups.intelligence"),
-      },
-      {
-        id: "prompts",
-        label: t("settingsModal.sections.prompts.label"),
-        icon: Sparkles,
-        description: t("settingsModal.sections.prompts.description"),
-        group: t("settingsModal.groups.intelligence"),
-      },
-      {
-        id: "privacy",
-        label: t("settingsModal.sections.privacy.label"),
-        icon: Lock,
-        description: t("settingsModal.sections.privacy.description"),
+        id: "privacyData",
+        label: t("settingsModal.sections.privacyData.label"),
+        icon: Shield,
+        description: t("settingsModal.sections.privacyData.description"),
         group: t("settingsModal.groups.system"),
       },
       {
-        id: "permissions",
-        label: t("settingsModal.sections.permissions.label"),
-        icon: ShieldCheck,
-        description: t("settingsModal.sections.permissions.description"),
-        group: t("settingsModal.groups.system"),
-      },
-      {
-        id: "developer",
-        label: t("settingsModal.sections.developer.label"),
+        id: "system",
+        label: t("settingsModal.sections.system.label"),
         icon: Wrench,
-        description: t("settingsModal.sections.developer.description"),
+        description: t("settingsModal.sections.system.description"),
         group: t("settingsModal.groups.system"),
       },
     ],
     [t]
   );
 
-  const [activeSection, setActiveSection] = React.useState<SettingsSectionType>("account");
+  const resolveSection = (section: string | undefined): SettingsSectionType => {
+    if (!section) return "account";
+    const resolved = (SECTION_ALIASES[section] ?? section) as SettingsSectionType;
+    if (resolved === "workspace" && !WORKSPACES_ENABLED) return "account";
+    return resolved;
+  };
 
-  // Navigate to initial section when modal opens
-  useEffect(() => {
-    if (open && initialSection) {
-      setActiveSection(initialSection);
-    }
-  }, [open, initialSection]);
+  const [activeSection, setActiveSection] = React.useState<SettingsSectionType>(() =>
+    resolveSection(initialSection)
+  );
+  const [initialSubTab, setInitialSubTab] = useState<string | undefined>(() =>
+    initialSection ? LEGACY_SUB_TAB[initialSection] : undefined
+  );
+  const [prevOpen, setPrevOpen] = useState(open);
+
+  if (open && !prevOpen && initialSection) {
+    setPrevOpen(open);
+    setActiveSection(resolveSection(initialSection));
+    setInitialSubTab(LEGACY_SUB_TAB[initialSection]);
+  } else if (open !== prevOpen) {
+    setPrevOpen(open);
+    if (!open) setInitialSubTab(undefined);
+  }
+
+  const handleSectionChange = (section: SettingsSectionType) => {
+    setActiveSection(section);
+    setInitialSubTab(undefined);
+  };
 
   return (
     <SidebarModal<SettingsSectionType>
@@ -117,9 +161,13 @@ export default function SettingsModal({ open, onOpenChange, initialSection }: Se
       title={t("settingsModal.title")}
       sidebarItems={sidebarItems}
       activeSection={activeSection}
-      onSectionChange={setActiveSection}
+      onSectionChange={handleSectionChange}
     >
-      <SettingsPage activeSection={activeSection} />
+      <SettingsPage
+        activeSection={activeSection}
+        onNavigateToSection={handleSectionChange}
+        initialSubTab={initialSubTab}
+      />
     </SidebarModal>
   );
 }

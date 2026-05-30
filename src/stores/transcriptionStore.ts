@@ -1,24 +1,17 @@
-import { useSyncExternalStore } from "react";
+import { create } from "zustand";
 import type { TranscriptionItem } from "../types/electron";
 
-type Listener = () => void;
+interface TranscriptionState {
+  transcriptions: TranscriptionItem[];
+}
 
-const listeners = new Set<Listener>();
-let transcriptions: TranscriptionItem[] = [];
+const useTranscriptionStore = create<TranscriptionState>()(() => ({
+  transcriptions: [],
+}));
+
 let hasBoundIpcListeners = false;
 const DEFAULT_LIMIT = 50;
 let currentLimit = DEFAULT_LIMIT;
-
-const emit = () => {
-  listeners.forEach((listener) => listener());
-};
-
-const subscribe = (listener: Listener) => {
-  listeners.add(listener);
-  return () => listeners.delete(listener);
-};
-
-const getSnapshot = () => transcriptions;
 
 function ensureIpcListeners() {
   if (hasBoundIpcListeners || typeof window === "undefined") {
@@ -47,6 +40,17 @@ function ensureIpcListeners() {
     }
   }
 
+  if (window.electronAPI?.onTranscriptionUpdated) {
+    const dispose = window.electronAPI.onTranscriptionUpdated((item) => {
+      if (item) {
+        updateTranscription(item);
+      }
+    });
+    if (typeof dispose === "function") {
+      disposers.push(dispose);
+    }
+  }
+
   if (window.electronAPI?.onTranscriptionsCleared) {
     const dispose = window.electronAPI.onTranscriptionsCleared(() => {
       clearTranscriptions();
@@ -67,32 +71,39 @@ export async function initializeTranscriptions(limit = DEFAULT_LIMIT) {
   currentLimit = limit;
   ensureIpcListeners();
   const items = await window.electronAPI.getTranscriptions(limit);
-  transcriptions = items;
-  emit();
+  useTranscriptionStore.setState({ transcriptions: items });
   return items;
 }
 
 export function addTranscription(item: TranscriptionItem) {
   if (!item) return;
+  const { transcriptions } = useTranscriptionStore.getState();
   const withoutDuplicate = transcriptions.filter((existing) => existing.id !== item.id);
-  transcriptions = [item, ...withoutDuplicate].slice(0, currentLimit);
-  emit();
+  useTranscriptionStore.setState({
+    transcriptions: [item, ...withoutDuplicate].slice(0, currentLimit),
+  });
 }
 
 export function removeTranscription(id: number) {
-  if (!id) return;
+  if (id == null) return;
+  const { transcriptions } = useTranscriptionStore.getState();
   const next = transcriptions.filter((item) => item.id !== id);
   if (next.length === transcriptions.length) return;
-  transcriptions = next;
-  emit();
+  useTranscriptionStore.setState({ transcriptions: next });
+}
+
+export function updateTranscription(item: TranscriptionItem) {
+  if (!item) return;
+  const { transcriptions } = useTranscriptionStore.getState();
+  const next = transcriptions.map((existing) => (existing.id === item.id ? item : existing));
+  useTranscriptionStore.setState({ transcriptions: next });
 }
 
 export function clearTranscriptions() {
-  if (transcriptions.length === 0) return;
-  transcriptions = [];
-  emit();
+  if (useTranscriptionStore.getState().transcriptions.length === 0) return;
+  useTranscriptionStore.setState({ transcriptions: [] });
 }
 
 export function useTranscriptions() {
-  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  return useTranscriptionStore((state) => state.transcriptions);
 }

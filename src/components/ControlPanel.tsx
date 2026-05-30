@@ -1,28 +1,13 @@
 import React, { Suspense, useState, useEffect, useRef, useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { Button } from "./ui/button";
-import {
-  Trash2,
-  Settings,
-  FileText,
-  Mic,
-  Download,
-  RefreshCw,
-  Loader2,
-  Sparkles,
-  Cloud,
-  X,
-  AlertTriangle,
-} from "lucide-react";
-import type { SettingsSectionType } from "./SettingsModal";
-import TitleBar from "./TitleBar";
-import SupportDropdown from "./ui/SupportDropdown";
-import TranscriptionItem from "./ui/TranscriptionItem";
+import { Download, RefreshCw, Loader2, AlertTriangle, Zap, ChevronLeft } from "lucide-react";
 import UpgradePrompt from "./UpgradePrompt";
+import PostMigrationOnboarding from "./PostMigrationOnboarding";
 import { ConfirmDialog, AlertDialog } from "./ui/dialog";
 import { useDialogs } from "../hooks/useDialogs";
 import { useHotkey } from "../hooks/useHotkey";
-import { useToast } from "./ui/Toast";
+import { useToast } from "./ui/useToast";
 import { useUpdater } from "../hooks/useUpdater";
 import { useSettings } from "../hooks/useSettings";
 import { useAuth } from "../hooks/useAuth";
@@ -31,11 +16,48 @@ import {
   useTranscriptions,
   initializeTranscriptions,
   removeTranscription as removeFromStore,
-  clearTranscriptions as clearStoreTranscriptions,
+  updateTranscription as updateInStore,
+  clearTranscriptions as clearStore,
 } from "../stores/transcriptionStore";
-import { formatHotkeyLabel } from "../utils/hotkeys";
+import { useSettingsStore } from "../stores/settingsStore";
+import {
+  useIsMeetingMode,
+  useIsNarrowWindow,
+  useMeetingRecordingStore,
+} from "../stores/meetingRecordingStore";
+import ControlPanelSidebar, { type ControlPanelView } from "./ControlPanelSidebar";
+import MeetingRecordingMount from "./MeetingRecordingMount";
+import MeetingRecordingPill from "./notes/MeetingRecordingPill";
+import WindowControls from "./WindowControls";
+
+import { getCachedPlatform } from "../utils/platform";
+import { isAccessibilitySkipped } from "../utils/permissions";
+import {
+  setActiveNoteId,
+  setActiveFolderId,
+  useActiveNoteId,
+  initializeNotes,
+} from "../stores/noteStore";
+import { fetchProviders as fetchStreamingProviders } from "../stores/streamingProvidersStore";
+import HistoryView from "./HistoryView";
+import BackgroundActionToastListener from "./notes/BackgroundActionToastListener";
+import { syncService } from "../services/SyncService.js";
+import AcceptInvitationModal, {
+  consumePendingInvitationToken,
+  clearPendingInvitationToken,
+} from "./AcceptInvitationModal";
+import { WORKSPACES_ENABLED } from "../lib/features";
+
+const platform = getCachedPlatform();
 
 const SettingsModal = React.lazy(() => import("./SettingsModal"));
+const ReferralModal = React.lazy(() => import("./ReferralModal"));
+const PersonalNotesView = React.lazy(() => import("./notes/PersonalNotesView"));
+const DictionaryView = React.lazy(() => import("./DictionaryView"));
+const UploadAudioView = React.lazy(() => import("./notes/UploadAudioView"));
+const IntegrationsView = React.lazy(() => import("./IntegrationsView"));
+const ChatView = React.lazy(() => import("./chat/ChatView"));
+const CommandSearch = React.lazy(() => import("./CommandSearch"));
 
 export default function ControlPanel() {
   const { t } = useTranslation();
@@ -43,18 +65,50 @@ export default function ControlPanel() {
   const [isLoading, setIsLoading] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
   const [showUpgradePrompt, setShowUpgradePrompt] = useState(false);
+  const [showPostMigration, setShowPostMigration] = useState(false);
   const [limitData, setLimitData] = useState<{ wordsUsed: number; limit: number } | null>(null);
   const hasShownUpgradePrompt = useRef(false);
-  const [settingsSection, setSettingsSection] = useState<SettingsSectionType | undefined>();
+  const [settingsSection, setSettingsSection] = useState<string | undefined>();
   const [aiCTADismissed, setAiCTADismissed] = useState(
     () => localStorage.getItem("aiCTADismissed") === "true"
   );
+  const [showReferrals, setShowReferrals] = useState(false);
+  const [invitationToken, setInvitationToken] = useState<string | null>(null);
+  const [showSearch, setShowSearch] = useState(false);
   const [showCloudMigrationBanner, setShowCloudMigrationBanner] = useState(false);
+  const [activeView, setActiveView] = useState<ControlPanelView>("home");
+  const isMeetingMode = useIsMeetingMode();
+  const isNarrowWindow = useIsNarrowWindow();
+  const activeNoteId = useActiveNoteId();
+  const isSidePanelLayout =
+    isMeetingMode || (isNarrowWindow && activeView === "personal-notes" && activeNoteId != null);
+  const recordingNoteId = useMeetingRecordingStore((s) => s.recordingNoteId);
+  const recordingFolderId = useMeetingRecordingStore((s) => s.recordingFolderId);
+  const [meetingRecordingRequest, setMeetingRecordingRequest] = useState<{
+    noteId: number;
+    folderId: number;
+    event: any;
+  } | null>(null);
+  const [gpuAccelAvailable, setGpuAccelAvailable] = useState<{ cuda: boolean; vulkan: boolean }>({
+    cuda: false,
+    vulkan: false,
+  });
+  const [gpuBannerDismissed, setGpuBannerDismissed] = useState(
+    () => localStorage.getItem("gpuBannerDismissedUnified") === "true"
+  );
   const cloudMigrationProcessed = useRef(false);
+  const updateReadyToastShown = useRef(false);
+  const updateErrorToastShown = useRef<Error | null>(null);
   const { hotkey } = useHotkey();
   const { toast } = useToast();
-  const { useReasoningModel, setUseLocalWhisper, setCloudTranscriptionMode } = useSettings();
-  const { isSignedIn, isLoaded: authLoaded } = useAuth();
+  const {
+    useLocalWhisper,
+    localTranscriptionProvider,
+    useCleanupModel,
+    setUseLocalWhisper,
+    setCloudTranscriptionMode,
+  } = useSettings();
+  const { isSignedIn, isLoaded: authLoaded, user } = useAuth();
   const usage = useUsage();
 
   const {
@@ -77,26 +131,82 @@ export default function ControlPanel() {
   } = useDialogs();
 
   useEffect(() => {
-    loadTranscriptions();
+    (async () => {
+      try {
+        setIsLoading(true);
+        await initializeTranscriptions();
+      } catch {
+        showAlertDialog({
+          title: t("controlPanel.history.couldNotLoadTitle"),
+          description: t("controlPanel.history.couldNotLoadDescription"),
+        });
+      } finally {
+        setIsLoading(false);
+      }
+    })();
+  }, [showAlertDialog, t]);
+
+  useEffect(() => {
+    const { noteFilesEnabled, noteFilesPath } = useSettingsStore.getState();
+    if (!noteFilesEnabled) return;
+    window.electronAPI?.noteFilesSetEnabled?.(true, noteFilesPath || undefined, {
+      skipRebuild: true,
+    });
+  }, []);
+
+  useEffect(() => {
+    if (platform !== "darwin") return;
+    window.electronAPI?.getPostMigrationState?.().then((state) => {
+      if (state?.justMigrated) setShowPostMigration(true);
+    });
+  }, []);
+
+  const dismissPostMigrationPermanently = useCallback(async () => {
+    await window.electronAPI?.markBundleMigrated?.();
+    setShowPostMigration(false);
+  }, []);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const mod = platform === "darwin" ? e.metaKey : e.ctrlKey;
+      if (mod && e.key === "k") {
+        e.preventDefault();
+        setShowSearch(true);
+      } else if (mod && e.key === ",") {
+        e.preventDefault();
+        setShowSettings(true);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
   }, []);
 
   useEffect(() => {
     if (updateStatus.updateDownloaded && !isDownloading) {
-      toast({
-        title: t("controlPanel.update.readyTitle"),
-        description: t("controlPanel.update.readyDescription"),
-        variant: "success",
-      });
+      if (!updateReadyToastShown.current) {
+        updateReadyToastShown.current = true;
+        toast({
+          title: t("controlPanel.update.readyTitle"),
+          description: t("controlPanel.update.readyDescription"),
+          variant: "success",
+        });
+      }
+    } else {
+      updateReadyToastShown.current = false;
     }
   }, [updateStatus.updateDownloaded, isDownloading, toast, t]);
 
   useEffect(() => {
-    if (updateError) {
+    if (updateError && updateError !== updateErrorToastShown.current) {
+      updateErrorToastShown.current = updateError;
       toast({
         title: t("controlPanel.update.problemTitle"),
         description: t("controlPanel.update.problemDescription"),
         variant: "destructive",
       });
+    }
+    if (!updateError) {
+      updateErrorToastShown.current = null;
     }
   }, [updateError, toast, t]);
 
@@ -135,6 +245,23 @@ export default function ControlPanel() {
   }, [usage?.isPastDue, usage?.hasLoaded, toast, t]);
 
   useEffect(() => {
+    if (!WORKSPACES_ENABLED) return;
+    const unsubscribe = window.electronAPI?.onWorkspaceInvitationToken?.((token) => {
+      setInvitationToken(token);
+    });
+    return () => unsubscribe?.();
+  }, []);
+
+  useEffect(() => {
+    if (!WORKSPACES_ENABLED || !authLoaded || !isSignedIn) return;
+    const pending = consumePendingInvitationToken();
+    if (pending) {
+      setInvitationToken(pending);
+      clearPendingInvitationToken();
+    }
+  }, [authLoaded, isSignedIn]);
+
+  useEffect(() => {
     if (!authLoaded || !isSignedIn || cloudMigrationProcessed.current) return;
     const isPending = localStorage.getItem("pendingCloudMigration") === "true";
     const alreadyShown = localStorage.getItem("cloudMigrationShown") === "true";
@@ -147,19 +274,107 @@ export default function ControlPanel() {
     setShowCloudMigrationBanner(true);
   }, [authLoaded, isSignedIn, setUseLocalWhisper, setCloudTranscriptionMode]);
 
-  const loadTranscriptions = async () => {
-    try {
-      setIsLoading(true);
-      await initializeTranscriptions();
-    } catch (error) {
-      showAlertDialog({
-        title: t("controlPanel.history.couldNotLoadTitle"),
-        description: t("controlPanel.history.couldNotLoadDescription"),
+  useEffect(() => {
+    if (platform === "darwin" || gpuBannerDismissed) return;
+    const detect = async () => {
+      const results = { cuda: false, vulkan: false };
+      if (useLocalWhisper && localTranscriptionProvider === "whisper") {
+        try {
+          const status = await window.electronAPI?.getCudaWhisperStatus?.();
+          if (status?.gpuInfo.hasNvidiaGpu && !status.downloaded) results.cuda = true;
+        } catch {}
+      }
+      if (useCleanupModel) {
+        try {
+          const [gpu, vulkan] = await Promise.all([
+            window.electronAPI?.detectVulkanGpu?.(),
+            window.electronAPI?.getLlamaVulkanStatus?.(),
+          ]);
+          if (gpu?.available && !vulkan?.downloaded) results.vulkan = true;
+        } catch {}
+      }
+      setGpuAccelAvailable(results);
+    };
+    detect();
+  }, [useLocalWhisper, localTranscriptionProvider, useCleanupModel, gpuBannerDismissed]);
+
+  useEffect(() => {
+    const drain = async () => {
+      const data = await window.electronAPI?.getPendingMeetingNoteNavigation?.();
+      if (!data) return;
+      setActiveFolderId(data.folderId);
+      setActiveNoteId(data.noteId);
+      setActiveView("personal-notes");
+      setMeetingRecordingRequest({
+        noteId: data.noteId,
+        folderId: data.folderId,
+        event: data.event,
       });
-    } finally {
-      setIsLoading(false);
-    }
-  };
+      initializeNotes(null, 50, data.folderId);
+      if (
+        data.trigger === "hotkey" &&
+        useSettingsStore.getState().meetingHotkeyLayoutMode === "side-panel"
+      ) {
+        window.electronAPI?.snapToMeetingMode?.();
+      }
+    };
+    drain();
+    const cleanup = window.electronAPI?.onMeetingNoteNavigationPending?.(drain);
+    return () => cleanup?.();
+  }, []);
+
+  useEffect(() => {
+    const cleanup = window.electronAPI?.onNavigateToNote?.((data) => {
+      if (data.folderId) {
+        setActiveFolderId(data.folderId);
+        initializeNotes(null, 50, data.folderId);
+      }
+      setActiveNoteId(data.noteId);
+      setActiveView("personal-notes");
+    });
+    return () => cleanup?.();
+  }, []);
+
+  useEffect(() => {
+    const cleanup = window.electronAPI?.onShowSettings?.(() => {
+      setShowSettings(true);
+    });
+    return () => cleanup?.();
+  }, []);
+
+  // When accessibility is missing on macOS, open the permissions settings page
+  useEffect(() => {
+    const cleanup = window.electronAPI?.onAccessibilityMissing?.(async () => {
+      if (isAccessibilitySkipped()) return;
+      const migration = await window.electronAPI?.getPostMigrationState?.();
+      if (migration?.justMigrated) return;
+      setSettingsSection("privacyData");
+      setShowSettings(true);
+      toast({
+        title: t("controlPanel.accessibilityMissing.title"),
+        description: t("controlPanel.accessibilityMissing.description"),
+        duration: 10000,
+      });
+    });
+    return () => cleanup?.();
+  }, [toast, t]);
+
+  useEffect(() => {
+    syncService.syncAll().catch(console.error);
+  }, []);
+
+  useEffect(() => {
+    fetchStreamingProviders();
+  }, []);
+
+  const handleMeetingRecordingRequestHandled = useCallback(
+    () => setMeetingRecordingRequest(null),
+    []
+  );
+
+  const handleExitMeetingMode = useCallback(() => {
+    window.electronAPI?.restoreFromMeetingMode?.();
+  }, []);
 
   const copyToClipboard = useCallback(
     async (text: string) => {
@@ -182,34 +397,6 @@ export default function ControlPanel() {
     [toast, t]
   );
 
-  const clearHistory = useCallback(async () => {
-    showConfirmDialog({
-      title: t("controlPanel.history.clearTitle"),
-      description: t("controlPanel.history.clearDescription"),
-      onConfirm: async () => {
-        try {
-          const result = await window.electronAPI.clearTranscriptions();
-          clearStoreTranscriptions();
-          toast({
-            title: t("controlPanel.history.clearedTitle"),
-            description: t("controlPanel.history.clearedDescription", {
-              count: result.cleared,
-            }),
-            variant: "success",
-            duration: 3000,
-          });
-        } catch (error) {
-          toast({
-            title: t("controlPanel.history.couldNotClearTitle"),
-            description: t("controlPanel.history.couldNotClearDescription"),
-            variant: "destructive",
-          });
-        }
-      },
-      variant: "destructive",
-    });
-  }, [showConfirmDialog, toast, t]);
-
   const deleteTranscription = useCallback(
     async (id: number) => {
       showConfirmDialog({
@@ -220,13 +407,14 @@ export default function ControlPanel() {
             const result = await window.electronAPI.deleteTranscription(id);
             if (result.success) {
               removeFromStore(id);
+              syncService.syncAll().catch(console.error);
             } else {
               showAlertDialog({
                 title: t("controlPanel.history.couldNotDeleteTitle"),
                 description: t("controlPanel.history.couldNotDeleteDescription"),
               });
             }
-          } catch (error) {
+          } catch {
             showAlertDialog({
               title: t("controlPanel.history.couldNotDeleteTitle"),
               description: t("controlPanel.history.couldNotDeleteDescriptionGeneric"),
@@ -237,6 +425,132 @@ export default function ControlPanel() {
       });
     },
     [showConfirmDialog, showAlertDialog, t]
+  );
+
+  const clearAllTranscriptions = useCallback(() => {
+    showConfirmDialog({
+      title: t("controlPanel.history.clearAllTitle"),
+      description: t("controlPanel.history.clearAllDescription"),
+      onConfirm: async () => {
+        try {
+          const result = await window.electronAPI.clearTranscriptions();
+          if (result.success) {
+            clearStore();
+            syncService.syncAll().catch(console.error);
+            toast({
+              title: t("controlPanel.history.clearAllSuccess"),
+              variant: "success",
+              duration: 2000,
+            });
+          } else {
+            showAlertDialog({
+              title: t("controlPanel.history.clearAllErrorTitle"),
+              description: t("controlPanel.history.clearAllErrorDescription"),
+            });
+          }
+        } catch {
+          showAlertDialog({
+            title: t("controlPanel.history.clearAllErrorTitle"),
+            description: t("controlPanel.history.clearAllErrorDescription"),
+          });
+        }
+      },
+      variant: "destructive",
+    });
+  }, [showConfirmDialog, showAlertDialog, toast, t]);
+
+  const showAudioInFolder = useCallback(
+    async (id: number) => {
+      try {
+        const result = await window.electronAPI.showAudioInFolder(id);
+        if (!result?.success) {
+          toast({
+            title: t("controlPanel.history.audioNotFound"),
+            variant: "destructive",
+          });
+        }
+      } catch {
+        toast({
+          title: t("controlPanel.history.audioNotFound"),
+          variant: "destructive",
+        });
+      }
+    },
+    [toast, t]
+  );
+
+  const retryTranscription = useCallback(
+    async (id: number) => {
+      try {
+        const s = useSettingsStore.getState();
+        const result = await window.electronAPI.retryTranscription(id, {
+          useLocalWhisper: s.useLocalWhisper,
+          localTranscriptionProvider: s.localTranscriptionProvider,
+          cloudTranscriptionMode: s.cloudTranscriptionMode,
+          cloudTranscriptionProvider: s.cloudTranscriptionProvider,
+          cloudTranscriptionModel: s.cloudTranscriptionModel,
+          cloudTranscriptionBaseUrl: s.cloudTranscriptionBaseUrl,
+          parakeetModel: s.parakeetModel,
+          whisperModel: s.whisperModel,
+          preferredLanguage: s.preferredLanguage,
+          transcriptionMode: s.transcriptionMode,
+          remoteTranscriptionType: s.remoteTranscriptionType,
+          remoteTranscriptionUrl: s.remoteTranscriptionUrl,
+        });
+        if (result.success && result.transcription) {
+          const rawText = result.transcription.text;
+          let finalTranscription = result.transcription;
+
+          // Apply AI reasoning if enabled
+          if (useCleanupModel) {
+            try {
+              const [
+                { default: ReasoningService },
+                { getEffectiveCleanupModel, isCloudCleanupMode, getSettings },
+              ] = await Promise.all([
+                import("../services/ReasoningService"),
+                import("../stores/settingsStore"),
+              ]);
+              const model = getEffectiveCleanupModel();
+              const isCloud = isCloudCleanupMode();
+              if (model || isCloud) {
+                const agentName = localStorage.getItem("agentName") || null;
+                const reasonedText = await ReasoningService.processText(rawText, model, agentName, {
+                  disableThinking: getSettings().cleanupDisableThinking,
+                });
+                if (reasonedText && reasonedText !== rawText) {
+                  const updated = await window.electronAPI.updateTranscriptionText(
+                    id,
+                    reasonedText,
+                    rawText
+                  );
+                  if (updated.success && updated.transcription) {
+                    finalTranscription = updated.transcription;
+                  }
+                }
+              }
+            } catch {
+              // Reasoning failed — keep the raw STT result
+            }
+          }
+
+          updateInStore(finalTranscription);
+          toast({ title: t("controlPanel.history.retrySuccess") });
+        } else {
+          toast({
+            title: t("controlPanel.history.retryError"),
+            description: result.error,
+            variant: "destructive",
+          });
+        }
+      } catch {
+        toast({
+          title: t("controlPanel.history.retryError"),
+          variant: "destructive",
+        });
+      }
+    },
+    [toast, t, useCleanupModel]
   );
 
   const handleUpdateClick = async () => {
@@ -306,7 +620,17 @@ export default function ControlPanel() {
   };
 
   return (
-    <div className="min-h-screen bg-background">
+    <div className="h-screen bg-background flex flex-col">
+      <MeetingRecordingMount />
+      <MeetingRecordingPill
+        activeView={activeView}
+        activeNoteId={activeNoteId}
+        onReturnToNote={() => {
+          setActiveView("personal-notes");
+          setActiveFolderId(recordingFolderId);
+          setActiveNoteId(recordingNoteId);
+        }}
+      />
       <ConfirmDialog
         open={confirmDialog.open}
         onOpenChange={hideConfirmDialog}
@@ -331,38 +655,10 @@ export default function ControlPanel() {
         limit={limitData?.limit}
       />
 
-      <TitleBar
-        actions={
-          <>
-            {!updateStatus.isDevelopment &&
-              (updateStatus.updateAvailable ||
-                updateStatus.updateDownloaded ||
-                isDownloading ||
-                isInstalling) && (
-                <Button
-                  variant={updateStatus.updateDownloaded ? "default" : "outline"}
-                  size="sm"
-                  onClick={handleUpdateClick}
-                  disabled={isInstalling || isDownloading}
-                  className="gap-1.5 text-xs"
-                >
-                  {getUpdateButtonContent()}
-                </Button>
-              )}
-            <SupportDropdown />
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={() => {
-                setSettingsSection(undefined);
-                setShowSettings(true);
-              }}
-              className="text-foreground/70 hover:text-foreground hover:bg-foreground/10"
-            >
-              <Settings size={16} />
-            </Button>
-          </>
-        }
+      <PostMigrationOnboarding
+        open={showPostMigration}
+        onOpenChange={setShowPostMigration}
+        onDone={dismissPostMigrationPermanently}
       />
 
       {showSettings && (
@@ -378,181 +674,266 @@ export default function ControlPanel() {
         </Suspense>
       )}
 
-      <div className="p-4">
-        <div className="max-w-3xl mx-auto">
-          {usage?.isPastDue && (
-            <div className="mb-3 rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/50 p-3">
-              <div className="flex items-start gap-3">
-                <div className="shrink-0 w-8 h-8 rounded-md bg-amber-100 dark:bg-amber-900/50 flex items-center justify-center">
-                  <AlertTriangle size={16} className="text-amber-600 dark:text-amber-400" />
-                </div>
-                <div className="flex-1 min-w-0">
-                  <p className="text-[13px] font-medium text-amber-900 dark:text-amber-200 mb-0.5">
-                    {t("controlPanel.billing.pastDueTitle")}
-                  </p>
-                  <p className="text-[12px] text-amber-700 dark:text-amber-300/80 mb-2">
-                    {t("controlPanel.billing.bannerDescription", {
-                      limit: usage.limit.toLocaleString(),
-                    })}
-                  </p>
-                  <Button
-                    variant="default"
-                    size="sm"
-                    className="h-7 text-[11px]"
-                    onClick={() => {
-                      setSettingsSection("account");
-                      setShowSettings(true);
-                    }}
-                  >
-                    {t("controlPanel.billing.updatePayment")}
-                  </Button>
-                </div>
-              </div>
-            </div>
-          )}
+      {showReferrals && (
+        <Suspense fallback={null}>
+          <ReferralModal open={showReferrals} onOpenChange={setShowReferrals} />
+        </Suspense>
+      )}
 
-          <div className="flex items-center justify-between mb-3 px-1">
-            <div className="flex items-center gap-2">
-              <FileText size={14} className="text-primary" />
-              <h2 className="text-sm font-semibold text-foreground">
-                {t("controlPanel.history.title")}
-              </h2>
-              {history.length > 0 && (
-                <span className="text-[11px] text-muted-foreground tabular-nums">
-                  ({history.length})
-                </span>
-              )}
-            </div>
-            {history.length > 0 && (
-              <Button
-                onClick={clearHistory}
-                variant="ghost"
-                size="sm"
-                className="h-7 px-2 text-[11px] text-muted-foreground hover:text-destructive hover:bg-destructive/10"
-              >
-                <Trash2 size={12} className="mr-1" />
-                {t("controlPanel.history.clear")}
-              </Button>
-            )}
-          </div>
+      {WORKSPACES_ENABLED && (
+        <AcceptInvitationModal
+          token={invitationToken}
+          onClose={() => setInvitationToken(null)}
+          isSignedIn={isSignedIn}
+          onSignIn={() => {
+            setInvitationToken(null);
+          }}
+        />
+      )}
 
-          {showCloudMigrationBanner && (
-            <div className="mb-3 relative rounded-lg border border-primary/20 bg-primary/5 dark:bg-primary/10 p-3">
-              <button
-                onClick={() => {
-                  setShowCloudMigrationBanner(false);
-                  localStorage.setItem("cloudMigrationShown", "true");
-                }}
-                className="absolute top-2 right-2 p-1 rounded-sm text-muted-foreground hover:text-foreground hover:bg-black/5 dark:hover:bg-white/5 transition-colors"
-              >
-                <X size={14} />
-              </button>
-              <div className="flex items-start gap-3 pr-6">
-                <div className="shrink-0 w-8 h-8 rounded-md bg-primary/10 dark:bg-primary/20 flex items-center justify-center">
-                  <Cloud size={16} className="text-primary" />
-                </div>
-                <div className="flex-1 min-w-0">
-                  <p className="text-[13px] font-medium text-foreground mb-0.5">
-                    {t("controlPanel.cloudMigration.title")}
-                  </p>
-                  <p className="text-[12px] text-muted-foreground mb-2">
-                    {t("controlPanel.cloudMigration.description")}
-                  </p>
-                  <Button
-                    variant="default"
-                    size="sm"
-                    className="h-7 text-[11px]"
-                    onClick={() => {
-                      setShowCloudMigrationBanner(false);
-                      localStorage.setItem("cloudMigrationShown", "true");
-                      setSettingsSection("transcription");
-                      setShowSettings(true);
-                    }}
-                  >
-                    {t("controlPanel.cloudMigration.viewSettings")}
-                  </Button>
-                </div>
-              </div>
-            </div>
-          )}
+      {showSearch && (
+        <Suspense fallback={null}>
+          <CommandSearch
+            open={showSearch}
+            onOpenChange={setShowSearch}
+            transcriptions={history}
+            onNoteSelect={(id, folderId) => {
+              if (folderId) setActiveFolderId(folderId);
+              setActiveNoteId(id);
+              setActiveView("personal-notes");
+            }}
+            onTranscriptSelect={() => {
+              setActiveView("home");
+            }}
+          />
+        </Suspense>
+      )}
 
-          {!useReasoningModel && !aiCTADismissed && (
-            <div className="mb-3 relative rounded-lg border border-primary/20 bg-primary/5 dark:bg-primary/10 p-3">
-              <button
-                onClick={() => {
-                  localStorage.setItem("aiCTADismissed", "true");
-                  setAiCTADismissed(true);
-                }}
-                className="absolute top-2 right-2 p-1 rounded-sm text-muted-foreground hover:text-foreground hover:bg-black/5 dark:hover:bg-white/5 transition-colors"
-              >
-                <X size={14} />
-              </button>
-              <div className="flex items-start gap-3 pr-6">
-                <div className="shrink-0 w-8 h-8 rounded-md bg-primary/10 dark:bg-primary/20 flex items-center justify-center">
-                  <Sparkles size={16} className="text-primary" />
-                </div>
-                <div className="flex-1 min-w-0">
-                  <p className="text-[13px] font-medium text-foreground mb-0.5">
-                    {t("controlPanel.aiCta.title")}
-                  </p>
-                  <p className="text-[12px] text-muted-foreground mb-2">
-                    {t("controlPanel.aiCta.description")}
-                  </p>
-                  <Button
-                    variant="default"
-                    size="sm"
-                    className="h-7 text-[11px]"
-                    onClick={() => {
-                      setSettingsSection("aiModels");
-                      setShowSettings(true);
-                    }}
-                  >
-                    {t("controlPanel.aiCta.enable")}
-                  </Button>
-                </div>
-              </div>
-            </div>
-          )}
-
-          <div className="rounded-lg border border-border bg-card/50 dark:bg-card/30 backdrop-blur-sm">
-            {isLoading ? (
-              <div className="flex items-center justify-center gap-2 py-8">
-                <Loader2 size={14} className="animate-spin text-primary" />
-                <span className="text-sm text-muted-foreground">{t("controlPanel.loading")}</span>
-              </div>
-            ) : history.length === 0 ? (
-              <div className="flex flex-col items-center justify-center py-12 px-4">
-                <div className="w-10 h-10 rounded-md bg-muted/50 dark:bg-white/4 flex items-center justify-center mb-3">
-                  <Mic size={18} className="text-muted-foreground" />
-                </div>
-                <p className="text-sm text-muted-foreground mb-3">
-                  {t("controlPanel.history.empty")}
-                </p>
-                <div className="flex items-center gap-2 text-[12px] text-muted-foreground">
-                  <span>{t("controlPanel.history.press")}</span>
-                  <kbd className="inline-flex items-center h-5 px-1.5 rounded-sm bg-surface-1 dark:bg-white/6 border border-border text-[11px] font-mono font-medium">
-                    {formatHotkeyLabel(hotkey)}
-                  </kbd>
-                  <span>{t("controlPanel.history.toStart")}</span>
-                </div>
-              </div>
-            ) : (
-              <div className="divide-y divide-border/50 max-h-[calc(100vh-180px)] overflow-y-auto">
-                {history.map((item, index) => (
-                  <TranscriptionItem
-                    key={item.id}
-                    item={item}
-                    index={index}
-                    total={history.length}
-                    onCopy={copyToClipboard}
-                    onDelete={deleteTranscription}
-                  />
-                ))}
-              </div>
-            )}
-          </div>
+      <div className="flex flex-1 overflow-hidden">
+        <div
+          className="shrink-0 overflow-hidden transition-[width] duration-300 ease-out"
+          style={{ width: isSidePanelLayout ? 0 : undefined }}
+        >
+          <ControlPanelSidebar
+            activeView={activeView}
+            onViewChange={setActiveView}
+            onOpenSearch={() => setShowSearch(true)}
+            onOpenSettings={() => {
+              setSettingsSection(undefined);
+              setShowSettings(true);
+            }}
+            onOpenReferrals={() => setShowReferrals(true)}
+            onUpgrade={() => {
+              setSettingsSection("plansBilling");
+              setShowSettings(true);
+            }}
+            isOverLimit={usage?.isOverLimit ?? false}
+            userName={user?.name}
+            userEmail={user?.email}
+            userImage={user?.image}
+            isSignedIn={isSignedIn}
+            authLoaded={authLoaded}
+            isProUser={!!(usage?.isSubscribed || usage?.isTrial)}
+            usageLoaded={usage?.hasLoaded ?? false}
+            updateAction={
+              !updateStatus.isDevelopment &&
+              (updateStatus.updateAvailable ||
+                updateStatus.updateDownloaded ||
+                isDownloading ||
+                isInstalling) ? (
+                <Button
+                  variant={updateStatus.updateDownloaded ? "default" : "outline"}
+                  size="sm"
+                  onClick={handleUpdateClick}
+                  disabled={isInstalling || isDownloading}
+                  className="gap-1.5 text-xs w-full h-7"
+                >
+                  {getUpdateButtonContent()}
+                </Button>
+              ) : undefined
+            }
+          />
         </div>
+        <main className="flex-1 flex flex-col overflow-hidden">
+          <div
+            className="flex items-center justify-between w-full h-10 shrink-0"
+            style={{ WebkitAppRegion: "drag" } as React.CSSProperties}
+          >
+            {isSidePanelLayout && (
+              <div
+                className={platform === "darwin" ? "ml-[84px] mt-[16px]" : "ml-2"}
+                style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
+              >
+                <Button
+                  variant="outline-flat"
+                  size="sm"
+                  onClick={handleExitMeetingMode}
+                  className="h-7 px-2.5 pl-1.5 gap-1"
+                >
+                  <ChevronLeft size={14} strokeWidth={1.8} />
+                  {t("controlPanel.backToNotes")}
+                </Button>
+              </div>
+            )}
+            <div className="flex-1" />
+            {platform !== "darwin" && (
+              <div className="pr-1" style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}>
+                <WindowControls />
+              </div>
+            )}
+          </div>
+          <div className="flex-1 overflow-y-auto pt-1">
+            {usage?.isPastDue && activeView === "home" && (
+              <div className="max-w-3xl mx-auto w-full mb-3">
+                <div className="rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/50 p-3">
+                  <div className="flex items-start gap-3">
+                    <div className="shrink-0 w-8 h-8 rounded-md bg-amber-100 dark:bg-amber-900/50 flex items-center justify-center">
+                      <AlertTriangle size={16} className="text-amber-600 dark:text-amber-400" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-medium text-amber-900 dark:text-amber-200 mb-0.5">
+                        {t("controlPanel.billing.pastDueTitle")}
+                      </p>
+                      <p className="text-xs text-amber-700 dark:text-amber-300/80 mb-2">
+                        {t("controlPanel.billing.bannerDescription", {
+                          limit: usage.limit.toLocaleString(),
+                        })}
+                      </p>
+                      <Button
+                        variant="default"
+                        size="sm"
+                        className="h-7 text-xs"
+                        onClick={() => {
+                          setSettingsSection("account");
+                          setShowSettings(true);
+                        }}
+                      >
+                        {t("controlPanel.billing.updatePayment")}
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+            {(gpuAccelAvailable.cuda || gpuAccelAvailable.vulkan) &&
+              activeView === "home" &&
+              !gpuBannerDismissed && (
+                <div className="max-w-3xl mx-auto w-full mb-3">
+                  <div className="rounded-lg border border-primary/20 dark:border-primary/15 bg-primary/5 p-3">
+                    <div className="flex items-start gap-3">
+                      <div className="shrink-0 w-8 h-8 rounded-md bg-primary/10 dark:bg-primary/15 flex items-center justify-center">
+                        <Zap size={16} className="text-primary" />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs font-medium text-foreground mb-0.5">
+                          {t("controlPanel.gpu.bannerTitle")}
+                        </p>
+                        <p className="text-xs text-muted-foreground mb-2">
+                          {t("controlPanel.gpu.bannerDescription")}
+                        </p>
+                        <div className="flex items-center gap-3">
+                          <Button
+                            variant="default"
+                            size="sm"
+                            className="h-7 text-xs"
+                            onClick={() => {
+                              setSettingsSection(
+                                gpuAccelAvailable.cuda ? "transcription" : "intelligence"
+                              );
+                              setShowSettings(true);
+                            }}
+                          >
+                            {t("controlPanel.gpu.enableButton")}
+                          </Button>
+                          <button
+                            onClick={() => {
+                              setGpuBannerDismissed(true);
+                              localStorage.setItem("gpuBannerDismissedUnified", "true");
+                            }}
+                            className="text-xs text-muted-foreground hover:text-foreground transition-colors"
+                          >
+                            {t("controlPanel.gpu.dismissButton")}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            {activeView === "home" && (
+              <HistoryView
+                history={history}
+                isLoading={isLoading}
+                hotkey={hotkey}
+                showCloudMigrationBanner={showCloudMigrationBanner}
+                setShowCloudMigrationBanner={setShowCloudMigrationBanner}
+                aiCTADismissed={aiCTADismissed}
+                setAiCTADismissed={setAiCTADismissed}
+                useCleanupModel={useCleanupModel}
+                copyToClipboard={copyToClipboard}
+                deleteTranscription={deleteTranscription}
+                clearAllTranscriptions={clearAllTranscriptions}
+                onShowAudioInFolder={showAudioInFolder}
+                onRetryTranscription={retryTranscription}
+                onOpenSettings={(section) => {
+                  setSettingsSection(section);
+                  setShowSettings(true);
+                }}
+              />
+            )}
+            {activeView === "chat" && (
+              <Suspense fallback={null}>
+                <ChatView />
+              </Suspense>
+            )}
+            {activeView === "personal-notes" && (
+              <Suspense fallback={null}>
+                <PersonalNotesView
+                  onOpenSettings={(section) => {
+                    setSettingsSection(section);
+                    setShowSettings(true);
+                  }}
+                  onOpenSearch={() => setShowSearch(true)}
+                  meetingRecordingRequest={meetingRecordingRequest}
+                  onMeetingRecordingRequestHandled={handleMeetingRecordingRequestHandled}
+                />
+              </Suspense>
+            )}
+            {activeView === "dictionary" && (
+              <Suspense fallback={null}>
+                <DictionaryView />
+              </Suspense>
+            )}
+            {activeView === "upload" && (
+              <Suspense fallback={null}>
+                <UploadAudioView
+                  onNoteCreated={(noteId, folderId) => {
+                    setActiveNoteId(noteId);
+                    if (folderId) setActiveFolderId(folderId);
+                    setActiveView("personal-notes");
+                  }}
+                  onOpenSettings={(section) => {
+                    setSettingsSection(section);
+                    setShowSettings(true);
+                  }}
+                />
+              </Suspense>
+            )}
+            {activeView === "integrations" && (
+              <Suspense fallback={null}>
+                <IntegrationsView
+                  isPaid={!!(usage?.isSubscribed || usage?.isTrial)}
+                  onUpgrade={() => {
+                    setSettingsSection("plansBilling");
+                    setShowSettings(true);
+                  }}
+                />
+              </Suspense>
+            )}
+          </div>
+        </main>
       </div>
+      <BackgroundActionToastListener />
     </div>
   );
 }

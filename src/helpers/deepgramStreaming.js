@@ -82,6 +82,7 @@ class DeepgramStreaming {
     this.connectionTimeout = null;
     this.accumulatedText = "";
     this.finalSegments = [];
+    this.sessionStartedAt = null;
     this.closeResolve = null;
     this.cachedToken = null;
     this.tokenFetchedAt = null;
@@ -99,11 +100,16 @@ class DeepgramStreaming {
     this.proactiveRefreshTimer = null;
     this._generation = 0;
     this.audioBytesSent = 0;
+    this.currentModel = "nova-3";
     this.resultsReceived = 0;
     this.livenessTimer = null;
     this.replayBuffer = [];
     this.replayBufferSize = 0;
     this.connectionOptions = null;
+  }
+
+  get completedSegments() {
+    return this.finalSegments;
   }
 
   setTokenRefreshFn(fn) {
@@ -116,6 +122,7 @@ class DeepgramStreaming {
     const baseLang = lang ? lang.split("-")[0].toLowerCase() : null;
     const useNova3 = !lang || NOVA3_LANGUAGES.has(lang) || NOVA3_LANGUAGES.has(baseLang);
     const model = useNova3 ? "nova-3" : "nova-2";
+    this.currentModel = model;
 
     if (!useNova3) {
       debugLogger.debug("Deepgram falling back to nova-2", { language: lang });
@@ -648,6 +655,7 @@ class DeepgramStreaming {
       // the Metadata message and jump straight to SpeechStarted/Results.
       if (this.pendingResolve) {
         this.isConnected = true;
+        this.sessionStartedAt = Date.now();
         clearTimeout(this.connectionTimeout);
         this.startKeepAlive(this.ws);
         if (message.type === "Metadata") {
@@ -683,7 +691,11 @@ class DeepgramStreaming {
             if (trimmed) {
               this.finalSegments.push(trimmed);
               this.accumulatedText = this.finalSegments.join(" ");
-              this.onFinalTranscript?.(this.accumulatedText);
+              const startedAt =
+                this.sessionStartedAt != null && typeof message.start === "number"
+                  ? this.sessionStartedAt + message.start * 1000
+                  : Date.now();
+              this.onFinalTranscript?.(this.accumulatedText, startedAt);
               debugLogger.debug("Deepgram final transcript", {
                 text: trimmed.slice(0, 100),
                 totalAccumulated: this.accumulatedText.length,
@@ -717,7 +729,15 @@ class DeepgramStreaming {
   }
 
   sendAudio(pcmBuffer) {
-    if (!this.ws) return false;
+    if (!this.ws) {
+      if (this.audioBytesSent === 0 && pcmBuffer.length > 0) {
+        debugLogger.warn("Deepgram sendAudio: ws is null, audio dropped", {
+          bufferSize: pcmBuffer.length,
+          isConnected: this.isConnected,
+        });
+      }
+      return false;
+    }
 
     if (this.ws.readyState !== WebSocket.OPEN) {
       // Buffer audio during cold start so no frames are lost while WebSocket connects

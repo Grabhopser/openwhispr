@@ -1,12 +1,15 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { Button } from "./ui/button";
 import { FolderOpen, Copy, Check } from "lucide-react";
-import { useToast } from "./ui/Toast";
+import { useToast } from "./ui/useToast";
 import { Toggle } from "./ui/toggle";
+import { useSettingsLayout } from "./ui/useSettingsLayout";
+import logger from "../utils/logger";
 
 export default function DeveloperSection() {
   const { t } = useTranslation();
+  const { isCompact } = useSettingsLayout();
   const [debugEnabled, setDebugEnabled] = useState(false);
   const [logPath, setLogPath] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -14,18 +17,14 @@ export default function DeveloperSection() {
   const [copiedPath, setCopiedPath] = useState(false);
   const { toast } = useToast();
 
-  useEffect(() => {
-    loadDebugState();
-  }, []);
-
-  const loadDebugState = async () => {
+  const loadDebugState = useCallback(async () => {
     try {
       setIsLoading(true);
       const state = await window.electronAPI.getDebugState();
       setDebugEnabled(state.enabled);
       setLogPath(state.logPath);
     } catch (error) {
-      console.error("Failed to load debug state:", error);
+      logger.error("Failed to load debug state", { error }, "developer");
       toast({
         title: t("developerSection.toasts.loadFailed.title"),
         description: t("developerSection.toasts.loadFailed.description"),
@@ -34,7 +33,11 @@ export default function DeveloperSection() {
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [t, toast]);
+
+  useEffect(() => {
+    loadDebugState();
+  }, [loadDebugState]);
 
   const handleToggleDebug = async () => {
     if (isToggling) return;
@@ -114,7 +117,7 @@ export default function DeveloperSection() {
         <h3 className="text-[15px] font-semibold text-foreground tracking-tight">
           {t("developerSection.title")}
         </h3>
-        <p className="text-[12px] text-muted-foreground mt-1 leading-relaxed">
+        <p className="text-xs text-muted-foreground mt-1 leading-relaxed">
           {t("developerSection.description")}
         </p>
       </div>
@@ -125,7 +128,7 @@ export default function DeveloperSection() {
           <div className="flex items-center justify-between gap-6">
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2">
-                <p className="text-[13px] font-medium text-foreground">
+                <p className="text-xs font-medium text-foreground">
                   {t("developerSection.debugMode.label")}
                 </p>
                 <div
@@ -134,7 +137,7 @@ export default function DeveloperSection() {
                   }`}
                 />
               </div>
-              <p className="text-[12px] text-muted-foreground mt-0.5 leading-relaxed">
+              <p className="text-xs text-muted-foreground mt-0.5 leading-relaxed">
                 {debugEnabled
                   ? t("developerSection.debugMode.enabledDescription")
                   : t("developerSection.debugMode.disabledDescription")}
@@ -153,11 +156,11 @@ export default function DeveloperSection() {
         {/* Log Path — only when active */}
         {debugEnabled && logPath && (
           <div className="px-5 py-4">
-            <p className="text-[11px] font-medium text-muted-foreground/60 uppercase tracking-wider mb-2">
+            <p className="text-xs font-medium text-muted-foreground/60 uppercase tracking-wider mb-2">
               {t("developerSection.currentLogFile")}
             </p>
             <div className="flex items-center gap-2">
-              <code className="flex-1 text-[11px] text-muted-foreground font-mono break-all leading-relaxed bg-muted/30 dark:bg-surface-raised/30 px-3 py-2 rounded-lg border border-border/30">
+              <code className="flex-1 text-xs text-muted-foreground font-mono break-all leading-relaxed bg-muted/30 dark:bg-surface-raised/30 px-3 py-2 rounded-lg border border-border/30">
                 {logPath}
               </code>
               <Button
@@ -196,7 +199,9 @@ export default function DeveloperSection() {
         </div>
         <div className="rounded-xl border border-border/60 dark:border-border-subtle bg-card dark:bg-surface-2">
           <div className="px-5 py-4">
-            <div className="grid grid-cols-2 gap-x-6 gap-y-2">
+            <div
+              className={`grid gap-y-2 ${isCompact ? "grid-cols-1 gap-x-0" : "grid-cols-2 gap-x-6"}`}
+            >
               {[
                 t("developerSection.whatGetsLogged.items.audioProcessing"),
                 t("developerSection.whatGetsLogged.items.apiRequests"),
@@ -207,7 +212,7 @@ export default function DeveloperSection() {
               ].map((item) => (
                 <div key={item} className="flex items-center gap-2">
                   <div className="h-1 w-1 rounded-full bg-muted-foreground/30 shrink-0" />
-                  <span className="text-[12px] text-muted-foreground">{item}</span>
+                  <span className="text-xs text-muted-foreground">{item}</span>
                 </div>
               ))}
             </div>
@@ -219,7 +224,7 @@ export default function DeveloperSection() {
       {debugEnabled && (
         <div className="rounded-xl border border-warning/20 bg-warning/5 dark:bg-warning/10">
           <div className="px-5 py-4">
-            <p className="text-[12px] text-muted-foreground leading-relaxed">
+            <p className="text-xs text-muted-foreground leading-relaxed">
               <span className="font-medium text-warning">
                 {t("developerSection.performanceNote.label")}
               </span>{" "}
@@ -246,14 +251,14 @@ export default function DeveloperSection() {
                   t("developerSection.sharing.steps.2"),
                 ].map((step, i) => (
                   <div key={i} className="flex items-start gap-3">
-                    <span className="shrink-0 text-[11px] font-mono text-muted-foreground/40 mt-0.5 w-4 text-right">
+                    <span className="shrink-0 text-xs font-mono text-muted-foreground/40 mt-0.5 w-4 text-right">
                       {i + 1}
                     </span>
-                    <p className="text-[12px] text-muted-foreground leading-relaxed">{step}</p>
+                    <p className="text-xs text-muted-foreground leading-relaxed">{step}</p>
                   </div>
                 ))}
               </div>
-              <p className="text-[11px] text-muted-foreground/40 mt-4 pt-3 border-t border-border/20">
+              <p className="text-xs text-muted-foreground/40 mt-4 pt-3 border-t border-border/20">
                 {t("developerSection.sharing.footer")}
               </p>
             </div>

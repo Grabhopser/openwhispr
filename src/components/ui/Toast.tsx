@@ -1,32 +1,7 @@
 import * as React from "react";
 import { X, Copy, Check } from "lucide-react";
 import { cn } from "../lib/utils";
-
-export interface ToastProps {
-  id?: string;
-  title?: string;
-  description?: string;
-  action?: React.ReactNode;
-  variant?: "default" | "destructive" | "success";
-  duration?: number;
-  onClose?: () => void;
-}
-
-export interface ToastContextType {
-  toast: (props: Omit<ToastProps, "id">) => void;
-  dismiss: (id?: string) => void;
-  toastCount: number;
-}
-
-const ToastContext = React.createContext<ToastContextType | undefined>(undefined);
-
-export const useToast = () => {
-  const context = React.useContext(ToastContext);
-  if (!context) {
-    throw new Error("useToast must be used within a ToastProvider");
-  }
-  return context;
-};
+import { ToastContext, type ToastProps } from "./useToast";
 
 interface ToastState extends ToastProps {
   id: string;
@@ -148,7 +123,7 @@ const ToastViewport: React.FC<{
   return (
     <div
       className={cn(
-        "fixed z-50 flex flex-col gap-1.5 pointer-events-none",
+        "fixed z-[100] flex flex-col gap-1.5 pointer-events-none",
         isDictationPanel ? "bottom-20 right-6" : "bottom-5 right-5"
       )}
     >
@@ -223,9 +198,7 @@ const Toast: React.FC<
       await navigator.clipboard.writeText(description);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
-    } catch {
-      // Silently fail
-    }
+    } catch {}
   };
 
   const message = title || description;
@@ -234,9 +207,9 @@ const Toast: React.FC<
   return (
     <div
       className={cn(
-        "group toast-surface pointer-events-auto relative flex w-75 overflow-hidden",
+        "group toast-surface pointer-events-auto relative flex w-75",
         "rounded-[5px]",
-        "transition-all duration-200 ease-out",
+        "transition-[opacity,transform] duration-200 ease-out",
         isExiting
           ? "opacity-0 translate-x-2 scale-[0.98]"
           : "opacity-100 translate-x-0 scale-100 animate-in slide-in-from-right-4 fade-in-0 duration-300"
@@ -246,16 +219,16 @@ const Toast: React.FC<
     >
       <div className={cn("w-0.5 shrink-0", config.accentClass)} />
 
-      <div className="flex items-start gap-2 flex-1 min-w-0 px-2.5 py-2 pr-7">
+      <div className="flex items-start gap-2 flex-1 min-w-0 px-2.5 py-2">
         <div className="flex-1 min-w-0">
           {message && (
-            <div className="text-[12px] font-medium leading-tight text-white/90">{message}</div>
+            <div className="text-xs font-medium leading-tight text-white/90">{message}</div>
           )}
           {detail &&
             (isDestructive ? (
               <div
                 className={cn(
-                  "text-[11px] leading-snug mt-1 px-1.5 py-1 rounded-[3px] font-mono",
+                  "text-xs leading-snug mt-1 px-1.5 py-1 rounded-[3px] font-mono",
                   "bg-white/4 border border-white/6",
                   "text-red-300/80"
                 )}
@@ -268,7 +241,7 @@ const Toast: React.FC<
                       "shrink-0 p-0.5 rounded-xs mt-px",
                       "text-white/30 hover:text-white/70",
                       "hover:bg-white/6",
-                      "transition-all duration-150"
+                      "transition-colors duration-150"
                     )}
                     aria-label="Copy error"
                   >
@@ -277,7 +250,7 @@ const Toast: React.FC<
                 </div>
               </div>
             ) : (
-              <div className="text-[11px] leading-snug mt-0.5 text-white/45">{detail}</div>
+              <div className="text-xs leading-snug mt-0.5 text-white/45">{detail}</div>
             ))}
         </div>
 
@@ -288,11 +261,13 @@ const Toast: React.FC<
         <button
           onClick={onClose}
           className={cn(
-            "absolute right-1 top-1 p-1 rounded-[3px]",
-            "text-white/0 group-hover:text-white/50 hover:!text-white/80",
-            "hover:bg-white/6",
+            "absolute -left-2 -top-2 size-6 rounded-full",
+            "flex items-center justify-center",
+            "bg-white/10 backdrop-blur-sm border border-white/10",
+            "text-white/70 hover:text-white hover:bg-white/20",
+            "opacity-0 scale-75 group-hover:opacity-100 group-hover:scale-100",
             "transition-all duration-150",
-            "focus:outline-none focus-visible:ring-1 focus-visible:ring-white/20"
+            "focus:outline-none focus-visible:ring-1 focus-visible:ring-white/30"
           )}
         >
           <X className="size-3" />
@@ -312,19 +287,4 @@ const Toast: React.FC<
       )}
     </div>
   );
-};
-
-export const toast = {
-  success: (message: string) => ({
-    title: message,
-    variant: "success" as const,
-  }),
-  error: (message: string) => ({
-    title: message,
-    variant: "destructive" as const,
-  }),
-  info: (message: string) => ({
-    title: message,
-    variant: "default" as const,
-  }),
 };

@@ -39,13 +39,16 @@ function fetchJson(url, redirectCount = 0) {
 
     https
       .get(url, options, (res) => {
-        if (res.statusCode === 301 || res.statusCode === 302) {
-          const redirectUrl = res.headers.location;
-          if (!redirectUrl) {
+        if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
+          const location = res.headers.location;
+          if (!location) {
             reject(new Error("Redirect without location header"));
             return;
           }
-          fetchJson(redirectUrl, redirectCount + 1).then(resolve).catch(reject);
+          const redirectUrl = location.startsWith("/") ? new URL(location, url).href : location;
+          fetchJson(redirectUrl, redirectCount + 1)
+            .then(resolve)
+            .catch(reject);
           return;
         }
 
@@ -71,25 +74,30 @@ function fetchJson(url, redirectCount = 0) {
 }
 
 /**
- * Fetch the latest release from a GitHub repository.
+ * Fetch a release from a GitHub repository.
  * @param {string} repo - Repository in "owner/repo" format
  * @param {object} options - Options
- * @param {string} [options.tagPrefix] - Only match releases with this tag prefix (e.g., "windows-key-listener-v")
- * @param {boolean} [options.includePrerelease=false] - Include prerelease versions
+ * @param {string} [options.tag] - Exact tag to fetch (works for any release age, no pagination)
+ * @param {string} [options.tagPrefix] - Latest release whose tag starts with this prefix (searches the 50 most recent only)
+ * @param {boolean} [options.includePrerelease=false] - Include prereleases (tagPrefix only)
  * @returns {Promise<{tag: string, assets: Array<{name: string, url: string}>, url: string} | null>}
  */
 async function fetchLatestRelease(repo, options = {}) {
-  const { tagPrefix, includePrerelease = false } = options;
+  const { tag, tagPrefix, includePrerelease = false } = options;
 
   try {
-    // If no tag prefix, use the simple /latest endpoint
+    if (tag) {
+      const url = `https://api.github.com/repos/${repo}/releases/tags/${encodeURIComponent(tag)}`;
+      const release = await fetchJson(url);
+      return formatRelease(release);
+    }
+
     if (!tagPrefix) {
       const url = `https://api.github.com/repos/${repo}/releases/latest`;
       const release = await fetchJson(url);
       return formatRelease(release);
     }
 
-    // Otherwise, fetch all releases and filter by prefix
     const url = `https://api.github.com/repos/${repo}/releases?per_page=50`;
     const releases = await fetchJson(url);
 
@@ -154,13 +162,16 @@ function downloadFile(url, dest, retryCount = 0) {
       }
 
       activeRequest = https.get(currentUrl, (response) => {
-        if (response.statusCode === 302 || response.statusCode === 301) {
-          const redirectUrl = response.headers.location;
-          if (!redirectUrl) {
+        if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
+          const location = response.headers.location;
+          if (!location) {
             cleanup();
             reject(new Error("Redirect without location header"));
             return;
           }
+          const redirectUrl = location.startsWith("/")
+            ? new URL(location, currentUrl).href
+            : location;
           request(redirectUrl, redirectCount + 1);
           return;
         }
@@ -211,7 +222,8 @@ function downloadFile(url, dest, retryCount = 0) {
 
     request(url);
   }).catch(async (error) => {
-    const isTransient = error.message.includes("timed out") ||
+    const isTransient =
+      error.message.includes("timed out") ||
       error.code === "ECONNRESET" ||
       error.code === "ETIMEDOUT";
 
@@ -273,9 +285,10 @@ function findBinaryInDir(dir, binaryName, maxDepth = 5, currentDepth = 0) {
 
 function parseArgs() {
   const args = process.argv;
-  let targetPlatform = process.platform;
-  let targetArch = process.arch;
+  let targetPlatform = process.env.TARGET_PLATFORM || process.platform;
+  let targetArch = process.env.TARGET_ARCH || process.arch;
 
+  // CLI args override env vars
   const platformIndex = args.indexOf("--platform");
   if (platformIndex !== -1 && args[platformIndex + 1]) {
     targetPlatform = args[platformIndex + 1];
@@ -293,7 +306,8 @@ function parseArgs() {
     isCurrent: args.includes("--current"),
     isAll: args.includes("--all"),
     isForce: args.includes("--force"),
-    shouldCleanup: args.includes("--clean") ||
+    shouldCleanup:
+      args.includes("--clean") ||
       process.env.CI === "true" ||
       process.env.GITHUB_ACTIONS === "true",
   };

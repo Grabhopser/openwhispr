@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, useRef, useMemo } from "react";
+import React, { useState, useCallback, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
@@ -6,7 +6,6 @@ import { Badge } from "./ui/badge";
 import {
   RefreshCw,
   Download,
-  Command,
   Mic,
   Shield,
   FolderOpen,
@@ -17,64 +16,108 @@ import {
   Monitor,
   Cloud,
   Key,
+  Cpu,
+  Network,
   Sparkles,
   AlertTriangle,
   Loader2,
+  Check,
+  Mail,
+  CircleCheck,
+  CircleX,
+  RotateCw,
+  BookOpen,
+  Copy,
+  Trash2,
+  Info,
+  MessageSquare,
+  FileAudio,
+  Wand2,
 } from "lucide-react";
 import { useAuth } from "../hooks/useAuth";
-import { NEON_AUTH_URL, signOut } from "../lib/neonAuth";
-import MarkdownRenderer from "./ui/MarkdownRenderer";
+import { AUTH_URL, signOut, deleteAccount } from "../lib/auth";
 import MicPermissionWarning from "./ui/MicPermissionWarning";
 import MicrophoneSettings from "./ui/MicrophoneSettings";
 import PermissionCard from "./ui/PermissionCard";
 import PasteToolsInfo from "./ui/PasteToolsInfo";
 import TranscriptionModelPicker from "./TranscriptionModelPicker";
-import { ConfirmDialog, AlertDialog } from "./ui/dialog";
+import SelfHostedPanel from "./SelfHostedPanel";
+import {
+  ConfirmDialog,
+  AlertDialog,
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from "./ui/dialog";
 import { Alert, AlertTitle, AlertDescription } from "./ui/alert";
 import { useSettings } from "../hooks/useSettings";
 import { useDialogs } from "../hooks/useDialogs";
-import { useAgentName } from "../utils/agentName";
 import { useWhisper } from "../hooks/useWhisper";
 import { usePermissions } from "../hooks/usePermissions";
+import { useSystemAudioPermission } from "../hooks/useSystemAudioPermission";
 import { useClipboard } from "../hooks/useClipboard";
 import { useUpdater } from "../hooks/useUpdater";
 
 import PromptStudio from "./ui/PromptStudio";
-import ReasoningModelSelector from "./ReasoningModelSelector";
-
+import { ProviderTabs } from "./ui/ProviderTabs";
 import { HotkeyInput } from "./ui/HotkeyInput";
-import HotkeyGuidanceAccordion from "./ui/HotkeyGuidanceAccordion";
 import { useHotkeyRegistration } from "../hooks/useHotkeyRegistration";
-import { getValidationMessage } from "../utils/hotkeyValidator";
-import { getPlatform } from "../utils/platform";
+import { useLocalStorage } from "../hooks/useLocalStorage";
+import { validateHotkeyForSlot } from "../utils/hotkeyValidation";
+import { getPlatform, getCachedPlatform } from "../utils/platform";
+import { formatHotkeyLabel } from "../utils/hotkeys";
 import { ActivationModeSelector } from "./ui/ActivationModeSelector";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
+import LinuxPttSetupInfo from "./ui/LinuxPttSetupInfo";
 import { Toggle } from "./ui/toggle";
 import DeveloperSection from "./DeveloperSection";
+import ChatAgentSettings from "./settings/ChatAgentSettings";
+import DictationAgentSettings from "./settings/DictationAgentSettings";
+import InferenceConfigEditor from "./settings/InferenceConfigEditor";
+import { MeetingTranscriptionPanel } from "./settings/MeetingSettings";
 import LanguageSelector from "./ui/LanguageSelector";
 import { Skeleton } from "./ui/skeleton";
 import { Progress } from "./ui/progress";
-import { useToast } from "./ui/Toast";
+import { useToast } from "./ui/useToast";
 import { useTheme } from "../hooks/useTheme";
-import type { LocalTranscriptionProvider } from "../types/electron";
+import type { GpuDevice, LocalTranscriptionProvider, InferenceMode } from "../types/electron";
 import logger from "../utils/logger";
-import { SettingsRow } from "./ui/SettingsSection";
+import { SettingsRow, InferenceModeSelector } from "./ui/SettingsSection";
+import type { InferenceModeOption } from "./ui/SettingsSection";
+import { useSettingsLayout } from "./ui/useSettingsLayout";
 import { useUsage } from "../hooks/useUsage";
 import { cn } from "./lib/utils";
+import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
+import { startMigration, useMigration } from "../stores/noteStore.js";
+import { syncService } from "../services/SyncService.js";
+import { formatBytes } from "../utils/formatBytes";
+import { useSettingsStore } from "../stores/settingsStore";
+import { canManageSystemAudioInApp } from "../utils/systemAudioAccess";
+import WorkspaceSection from "./settings/WorkspaceSection";
+import { WORKSPACES_ENABLED } from "../lib/features";
+
+const formatAmount = (cents: number, currency: string) =>
+  (cents / 100).toLocaleString(undefined, { style: "currency", currency });
 
 export type SettingsSectionType =
   | "account"
+  | "plansBilling"
+  | "workspace"
   | "general"
-  | "transcription"
-  | "dictionary"
-  | "aiModels"
-  | "agentConfig"
-  | "prompts"
-  | "permissions"
-  | "privacy"
-  | "developer";
+  | "hotkeys"
+  | "speechToText"
+  | "llms"
+  | "privacyData"
+  | "system";
 
 interface SettingsPageProps {
   activeSection?: SettingsSectionType;
+  onNavigateToSection?: (section: SettingsSectionType) => void;
+  /** When a legacy section ID was used (e.g. `meetings`), land on the matching sub-tab. */
+  initialSubTab?: string;
 }
 
 const UI_LANGUAGE_OPTIONS: import("./ui/LanguageSelector").LanguageOption[] = [
@@ -89,6 +132,8 @@ const UI_LANGUAGE_OPTIONS: import("./ui/LanguageSelector").LanguageOption[] = [
   { value: "zh-CN", label: "简体中文", flag: "🇨🇳" },
   { value: "zh-TW", label: "繁體中文", flag: "🇹🇼" },
 ];
+
+const noop = () => {};
 
 function SettingsPanel({
   children,
@@ -113,15 +158,19 @@ function SettingsPanelRow({
   children: React.ReactNode;
   className?: string;
 }) {
-  return <div className={`px-4 py-3 ${className}`}>{children}</div>;
+  const { isCompact } = useSettingsLayout();
+
+  return (
+    <div className={`${isCompact ? "px-3 py-2.5" : "px-4 py-3"} ${className}`}>{children}</div>
+  );
 }
 
 function SectionHeader({ title, description }: { title: string; description?: string }) {
   return (
     <div className="mb-3">
-      <h3 className="text-[13px] font-semibold text-foreground tracking-tight">{title}</h3>
+      <h3 className="text-xs font-semibold text-foreground tracking-tight">{title}</h3>
       {description && (
-        <p className="text-[11px] text-muted-foreground/80 mt-0.5 leading-relaxed">{description}</p>
+        <p className="text-xs text-muted-foreground/80 mt-0.5 leading-relaxed">{description}</p>
       )}
     </div>
   );
@@ -129,6 +178,7 @@ function SectionHeader({ title, description }: { title: string; description?: st
 
 interface TranscriptionSectionProps {
   isSignedIn: boolean;
+  startOnboarding: () => void;
   cloudTranscriptionMode: string;
   setCloudTranscriptionMode: (mode: string) => void;
   useLocalWhisper: boolean;
@@ -144,16 +194,14 @@ interface TranscriptionSectionProps {
   setWhisperModel: (model: string) => void;
   parakeetModel: string;
   setParakeetModel: (model: string) => void;
-  openaiApiKey: string;
-  setOpenaiApiKey: (key: string) => void;
-  groqApiKey: string;
-  setGroqApiKey: (key: string) => void;
-  mistralApiKey: string;
-  setMistralApiKey: (key: string) => void;
-  customTranscriptionApiKey: string;
-  setCustomTranscriptionApiKey: (key: string) => void;
   cloudTranscriptionBaseUrl?: string;
   setCloudTranscriptionBaseUrl: (url: string) => void;
+  transcriptionMode: InferenceMode;
+  setTranscriptionMode: (mode: InferenceMode) => void;
+  remoteTranscriptionUrl: string;
+  setRemoteTranscriptionUrl: (url: string) => void;
+  showTranscriptionPreview: boolean;
+  setShowTranscriptionPreview: (value: boolean) => void;
   toast: (opts: {
     title: string;
     description: string;
@@ -164,6 +212,7 @@ interface TranscriptionSectionProps {
 
 function TranscriptionSection({
   isSignedIn,
+  startOnboarding,
   cloudTranscriptionMode,
   setCloudTranscriptionMode,
   useLocalWhisper,
@@ -179,222 +228,155 @@ function TranscriptionSection({
   setWhisperModel,
   parakeetModel,
   setParakeetModel,
-  openaiApiKey,
-  setOpenaiApiKey,
-  groqApiKey,
-  setGroqApiKey,
-  mistralApiKey,
-  setMistralApiKey,
-  customTranscriptionApiKey,
-  setCustomTranscriptionApiKey,
   cloudTranscriptionBaseUrl,
   setCloudTranscriptionBaseUrl,
+  transcriptionMode,
+  setTranscriptionMode,
+  remoteTranscriptionUrl,
+  setRemoteTranscriptionUrl,
+  showTranscriptionPreview,
+  setShowTranscriptionPreview,
   toast,
 }: TranscriptionSectionProps) {
-  const { t, i18n } = useTranslation();
-  const isCustomMode = cloudTranscriptionMode === "byok" || useLocalWhisper;
-  const isCloudMode = isSignedIn && cloudTranscriptionMode === "openwhispr" && !useLocalWhisper;
+  const { t } = useTranslation();
+
+  const transcriptionModes: InferenceModeOption[] = [
+    {
+      id: "openwhispr",
+      label: t("settingsPage.transcription.modes.openwhispr"),
+      description: t("settingsPage.transcription.modes.openwhisprDesc"),
+      icon: <Cloud className="w-4 h-4" />,
+      disabled: !isSignedIn,
+      badge: !isSignedIn ? t("common.freeAccountRequired") : undefined,
+    },
+    {
+      id: "providers",
+      label: t("settingsPage.transcription.modes.providers"),
+      description: t("settingsPage.transcription.modes.providersDesc"),
+      icon: <Key className="w-4 h-4" />,
+    },
+    {
+      id: "local",
+      label: t("settingsPage.transcription.modes.local"),
+      description: t("settingsPage.transcription.modes.localDesc"),
+      icon: <Cpu className="w-4 h-4" />,
+    },
+    {
+      id: "self-hosted",
+      label: t("settingsPage.transcription.modes.selfHosted"),
+      description: t("settingsPage.transcription.modes.selfHostedDesc"),
+      icon: <Network className="w-4 h-4" />,
+    },
+  ];
+
+  const handleTranscriptionModeSelect = (mode: InferenceMode) => {
+    if (mode === "openwhispr" && !isSignedIn) {
+      startOnboarding();
+      return;
+    }
+    if (mode === transcriptionMode) return;
+    setTranscriptionMode(mode);
+    setUseLocalWhisper(mode === "local");
+    updateTranscriptionSettings({ useLocalWhisper: mode === "local" });
+    setCloudTranscriptionMode(mode === "openwhispr" ? "openwhispr" : "byok");
+
+    const toastKey = {
+      openwhispr: "switchedCloud",
+      providers: "switchedProviders",
+      local: "switchedLocal",
+      "self-hosted": "switchedSelfHosted",
+    }[mode];
+    toast({
+      title: t(`settingsPage.transcription.toasts.${toastKey}.title`),
+      description: t(`settingsPage.transcription.toasts.${toastKey}.description`),
+      variant: "success",
+      duration: 3000,
+    });
+  };
+
+  const handleLocalModelSelect = useCallback(
+    (modelId: string) => {
+      if (localTranscriptionProvider === "nvidia") {
+        setParakeetModel(modelId);
+      } else {
+        setWhisperModel(modelId);
+      }
+    },
+    [localTranscriptionProvider, setParakeetModel, setWhisperModel]
+  );
+
+  const renderPreviewToggle = () => (
+    <SettingsPanel>
+      <SettingsPanelRow>
+        <SettingsRow
+          label={t("settingsPage.transcription.transcriptionPreview")}
+          description={t("settingsPage.transcription.transcriptionPreviewDescription")}
+        >
+          <Toggle checked={showTranscriptionPreview} onChange={setShowTranscriptionPreview} />
+        </SettingsRow>
+      </SettingsPanelRow>
+    </SettingsPanel>
+  );
+
+  const renderTranscriptionPicker = (mode?: "cloud" | "local") => (
+    <TranscriptionModelPicker
+      selectedCloudProvider={cloudTranscriptionProvider}
+      onCloudProviderSelect={setCloudTranscriptionProvider}
+      selectedCloudModel={cloudTranscriptionModel}
+      onCloudModelSelect={setCloudTranscriptionModel}
+      selectedLocalModel={localTranscriptionProvider === "nvidia" ? parakeetModel : whisperModel}
+      onLocalModelSelect={handleLocalModelSelect}
+      selectedLocalProvider={localTranscriptionProvider}
+      onLocalProviderSelect={setLocalTranscriptionProvider}
+      useLocalWhisper={mode === "local" || (!mode && useLocalWhisper)}
+      onModeChange={
+        mode
+          ? noop
+          : (isLocal) => {
+              setUseLocalWhisper(isLocal);
+              updateTranscriptionSettings({ useLocalWhisper: isLocal });
+              if (isLocal) setCloudTranscriptionMode("byok");
+            }
+      }
+      mode={mode}
+      cloudTranscriptionBaseUrl={cloudTranscriptionBaseUrl}
+      setCloudTranscriptionBaseUrl={setCloudTranscriptionBaseUrl}
+      variant="settings"
+    />
+  );
 
   return (
     <div className="space-y-4">
-      <SectionHeader
-        title={t("settingsPage.transcription.title")}
-        description={t("settingsPage.transcription.description")}
+      <InferenceModeSelector
+        modes={transcriptionModes}
+        activeMode={transcriptionMode}
+        onSelect={handleTranscriptionModeSelect}
       />
 
-      {/* Mode selector */}
-      {isSignedIn && (
-        <SettingsPanel>
-          <SettingsPanelRow>
-            <button
-              onClick={() => {
-                if (!isCloudMode) {
-                  setCloudTranscriptionMode("openwhispr");
-                  setUseLocalWhisper(false);
-                  updateTranscriptionSettings({ useLocalWhisper: false });
-                  toast({
-                    title: t("settingsPage.transcription.toasts.switchedCloud.title"),
-                    description: t("settingsPage.transcription.toasts.switchedCloud.description"),
-                    variant: "success",
-                    duration: 3000,
-                  });
-                }
-              }}
-              className="w-full flex items-center gap-3 text-left cursor-pointer group"
-            >
-              <div
-                className={`w-8 h-8 rounded-md flex items-center justify-center shrink-0 transition-colors ${
-                  isCloudMode
-                    ? "bg-primary/10 dark:bg-primary/15"
-                    : "bg-muted/60 dark:bg-surface-raised group-hover:bg-muted dark:group-hover:bg-surface-3"
-                }`}
-              >
-                <Cloud
-                  className={`w-4 h-4 transition-colors ${
-                    isCloudMode ? "text-primary" : "text-muted-foreground"
-                  }`}
-                />
-              </div>
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2">
-                  <span className="text-[12px] font-medium text-foreground">
-                    {t("settingsPage.transcription.openwhisprCloud")}
-                  </span>
-                  {isCloudMode && (
-                    <span className="text-[10px] font-medium text-primary bg-primary/10 dark:bg-primary/15 px-1.5 py-px rounded-sm">
-                      {t("common.active")}
-                    </span>
-                  )}
-                </div>
-                <p className="text-[11px] text-muted-foreground/80 mt-0.5">
-                  {t("settingsPage.transcription.openwhisprCloudDescription")}
-                </p>
-              </div>
-              <div
-                className={`w-4 h-4 rounded-full border-2 shrink-0 transition-colors ${
-                  isCloudMode
-                    ? "border-primary bg-primary"
-                    : "border-border-hover dark:border-border-subtle"
-                }`}
-              >
-                {isCloudMode && (
-                  <div className="w-full h-full flex items-center justify-center">
-                    <div className="w-1.5 h-1.5 rounded-full bg-primary-foreground" />
-                  </div>
-                )}
-              </div>
-            </button>
-          </SettingsPanelRow>
-          <SettingsPanelRow>
-            <button
-              onClick={() => {
-                if (!isCustomMode) {
-                  setCloudTranscriptionMode("byok");
-                  setUseLocalWhisper(false);
-                  updateTranscriptionSettings({ useLocalWhisper: false });
-                  toast({
-                    title: t("settingsPage.transcription.toasts.switchedCustom.title"),
-                    description: t("settingsPage.transcription.toasts.switchedCustom.description"),
-                    variant: "success",
-                    duration: 3000,
-                  });
-                }
-              }}
-              className="w-full flex items-center gap-3 text-left cursor-pointer group"
-            >
-              <div
-                className={`w-8 h-8 rounded-md flex items-center justify-center shrink-0 transition-colors ${
-                  isCustomMode
-                    ? "bg-accent/10 dark:bg-accent/15"
-                    : "bg-muted/60 dark:bg-surface-raised group-hover:bg-muted dark:group-hover:bg-surface-3"
-                }`}
-              >
-                <Key
-                  className={`w-4 h-4 transition-colors ${
-                    isCustomMode ? "text-accent" : "text-muted-foreground"
-                  }`}
-                />
-              </div>
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2">
-                  <span className="text-[12px] font-medium text-foreground">
-                    {t("settingsPage.transcription.customSetup")}
-                  </span>
-                  {isCustomMode && (
-                    <span className="text-[10px] font-medium text-accent bg-accent/10 dark:bg-accent/15 px-1.5 py-px rounded-sm">
-                      {t("common.active")}
-                    </span>
-                  )}
-                </div>
-                <p className="text-[11px] text-muted-foreground/80 mt-0.5">
-                  {t("settingsPage.transcription.customSetupDescription")}
-                </p>
-              </div>
-              <div
-                className={`w-4 h-4 rounded-full border-2 shrink-0 transition-colors ${
-                  isCustomMode
-                    ? "border-accent bg-accent"
-                    : "border-border-hover dark:border-border-subtle"
-                }`}
-              >
-                {isCustomMode && (
-                  <div className="w-full h-full flex items-center justify-center">
-                    <div className="w-1.5 h-1.5 rounded-full bg-accent-foreground" />
-                  </div>
-                )}
-              </div>
-            </button>
-          </SettingsPanelRow>
-        </SettingsPanel>
+      {transcriptionMode === "providers" && renderTranscriptionPicker("cloud")}
+      {transcriptionMode === "local" && (
+        <>
+          {renderTranscriptionPicker("local")}
+          {renderPreviewToggle()}
+        </>
       )}
 
-      {/* Custom Setup model picker — shown when Custom Setup is active or not signed in */}
-      {(isCustomMode || !isSignedIn) && (
-        <TranscriptionModelPicker
-          selectedCloudProvider={cloudTranscriptionProvider}
-          onCloudProviderSelect={setCloudTranscriptionProvider}
-          selectedCloudModel={cloudTranscriptionModel}
-          onCloudModelSelect={setCloudTranscriptionModel}
-          selectedLocalModel={
-            localTranscriptionProvider === "nvidia" ? parakeetModel : whisperModel
-          }
-          onLocalModelSelect={(modelId) => {
-            if (localTranscriptionProvider === "nvidia") {
-              setParakeetModel(modelId);
-            } else {
-              setWhisperModel(modelId);
-            }
-          }}
-          selectedLocalProvider={localTranscriptionProvider}
-          onLocalProviderSelect={setLocalTranscriptionProvider}
-          useLocalWhisper={useLocalWhisper}
-          onModeChange={(isLocal) => {
-            setUseLocalWhisper(isLocal);
-            updateTranscriptionSettings({ useLocalWhisper: isLocal });
-            if (isLocal) {
-              setCloudTranscriptionMode("byok");
-            }
-          }}
-          openaiApiKey={openaiApiKey}
-          setOpenaiApiKey={setOpenaiApiKey}
-          groqApiKey={groqApiKey}
-          setGroqApiKey={setGroqApiKey}
-          mistralApiKey={mistralApiKey}
-          setMistralApiKey={setMistralApiKey}
-          customTranscriptionApiKey={customTranscriptionApiKey}
-          setCustomTranscriptionApiKey={setCustomTranscriptionApiKey}
-          cloudTranscriptionBaseUrl={cloudTranscriptionBaseUrl}
-          setCloudTranscriptionBaseUrl={setCloudTranscriptionBaseUrl}
-          variant="settings"
+      {transcriptionMode === "self-hosted" && (
+        <SelfHostedPanel
+          service="transcription"
+          url={remoteTranscriptionUrl}
+          onUrlChange={setRemoteTranscriptionUrl}
         />
       )}
+
+      <GpuDeviceSelector purpose="transcription" />
     </div>
   );
 }
 
 interface AiModelsSectionProps {
-  isSignedIn: boolean;
-  cloudReasoningMode: string;
-  setCloudReasoningMode: (mode: string) => void;
-  useReasoningModel: boolean;
-  setUseReasoningModel: (value: boolean) => void;
-  reasoningModel: string;
-  setReasoningModel: (model: string) => void;
-  reasoningProvider: string;
-  setReasoningProvider: (provider: string) => void;
-  cloudReasoningBaseUrl: string;
-  setCloudReasoningBaseUrl: (url: string) => void;
-  openaiApiKey: string;
-  setOpenaiApiKey: (key: string) => void;
-  anthropicApiKey: string;
-  setAnthropicApiKey: (key: string) => void;
-  geminiApiKey: string;
-  setGeminiApiKey: (key: string) => void;
-  groqApiKey: string;
-  setGroqApiKey: (key: string) => void;
-  customReasoningApiKey: string;
-  setCustomReasoningApiKey: (key: string) => void;
-  showAlertDialog: (dialog: { title: string; description: string }) => void;
+  useCleanupModel: boolean;
+  setUseCleanupModel: (value: boolean) => void;
   toast: (opts: {
     title: string;
     description: string;
@@ -403,209 +385,273 @@ interface AiModelsSectionProps {
   }) => void;
 }
 
-function AiModelsSection({
-  isSignedIn,
-  cloudReasoningMode,
-  setCloudReasoningMode,
-  useReasoningModel,
-  setUseReasoningModel,
-  reasoningModel,
-  setReasoningModel,
-  reasoningProvider,
-  setReasoningProvider,
-  cloudReasoningBaseUrl,
-  setCloudReasoningBaseUrl,
-  openaiApiKey,
-  setOpenaiApiKey,
-  anthropicApiKey,
-  setAnthropicApiKey,
-  geminiApiKey,
-  setGeminiApiKey,
-  groqApiKey,
-  setGroqApiKey,
-  customReasoningApiKey,
-  setCustomReasoningApiKey,
-  showAlertDialog,
-  toast,
-}: AiModelsSectionProps) {
-  const { t, i18n } = useTranslation();
-  const isCustomMode = cloudReasoningMode === "byok";
-  const isCloudMode = isSignedIn && cloudReasoningMode === "openwhispr";
+const CLEANUP_MODE_TOAST_KEY: Record<InferenceMode, string> = {
+  openwhispr: "switchedCloud",
+  providers: "switchedProviders",
+  local: "switchedLocal",
+  "self-hosted": "switchedSelfHosted",
+  enterprise: "switchedEnterprise",
+};
+
+function NoteFormattingSettings() {
+  const { t } = useTranslation();
+  const autoGenerateNoteTitle = useSettingsStore((s) => s.autoGenerateNoteTitle);
+  const setAutoGenerateNoteTitle = useSettingsStore((s) => s.setAutoGenerateNoteTitle);
 
   return (
     <div className="space-y-4">
-      <SectionHeader
-        title={t("settingsPage.aiModels.title")}
-        description={t("settingsPage.aiModels.description")}
-      />
+      <SettingsPanel>
+        <SettingsPanelRow>
+          <SettingsRow
+            label={t("settingsPage.noteFormatting.autoGenerateTitle")}
+            description={t("settingsPage.noteFormatting.autoGenerateTitleDescription")}
+          >
+            <Toggle checked={autoGenerateNoteTitle} onChange={setAutoGenerateNoteTitle} />
+          </SettingsRow>
+        </SettingsPanelRow>
+      </SettingsPanel>
+      <InferenceConfigEditor scope="noteFormatting" />
+    </div>
+  );
+}
 
-      {/* Enable toggle — always at top */}
+function AiModelsSection({ useCleanupModel, setUseCleanupModel, toast }: AiModelsSectionProps) {
+  const { t } = useTranslation();
+
+  const handleCleanupModeChange = (mode: InferenceMode) => {
+    const toastKey = CLEANUP_MODE_TOAST_KEY[mode];
+    toast({
+      title: t(`settingsPage.aiModels.toasts.${toastKey}.title`),
+      description: t(`settingsPage.aiModels.toasts.${toastKey}.description`),
+      variant: "success",
+      duration: 3000,
+    });
+  };
+
+  return (
+    <div className="space-y-4">
       <SettingsPanel>
         <SettingsPanelRow>
           <SettingsRow
             label={t("settingsPage.aiModels.enableTextCleanup")}
             description={t("settingsPage.aiModels.enableTextCleanupDescription")}
           >
-            <Toggle checked={useReasoningModel} onChange={setUseReasoningModel} />
+            <Toggle checked={useCleanupModel} onChange={setUseCleanupModel} />
           </SettingsRow>
         </SettingsPanelRow>
       </SettingsPanel>
 
-      {useReasoningModel && (
+      {useCleanupModel && (
         <>
-          {/* Mode selector */}
-          {isSignedIn && (
-            <SettingsPanel>
-              <SettingsPanelRow>
-                <button
-                  onClick={() => {
-                    if (!isCloudMode) {
-                      setCloudReasoningMode("openwhispr");
-                      toast({
-                        title: t("settingsPage.aiModels.toasts.switchedCloud.title"),
-                        description: t("settingsPage.aiModels.toasts.switchedCloud.description"),
-                        variant: "success",
-                        duration: 3000,
-                      });
-                    }
-                  }}
-                  className="w-full flex items-center gap-3 text-left cursor-pointer group"
-                >
-                  <div
-                    className={`w-8 h-8 rounded-md flex items-center justify-center shrink-0 transition-colors ${
-                      isCloudMode
-                        ? "bg-primary/10 dark:bg-primary/15"
-                        : "bg-muted/60 dark:bg-surface-raised group-hover:bg-muted dark:group-hover:bg-surface-3"
-                    }`}
-                  >
-                    <Cloud
-                      className={`w-4 h-4 transition-colors ${
-                        isCloudMode ? "text-primary" : "text-muted-foreground"
-                      }`}
-                    />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2">
-                      <span className="text-[12px] font-medium text-foreground">
-                        {t("settingsPage.aiModels.openwhisprCloud")}
-                      </span>
-                      {isCloudMode && (
-                        <span className="text-[10px] font-medium text-primary bg-primary/10 dark:bg-primary/15 px-1.5 py-px rounded-sm">
-                          {t("common.active")}
-                        </span>
-                      )}
-                    </div>
-                    <p className="text-[11px] text-muted-foreground/80 mt-0.5">
-                      {t("settingsPage.aiModels.openwhisprCloudDescription")}
-                    </p>
-                  </div>
-                  <div
-                    className={`w-4 h-4 rounded-full border-2 shrink-0 transition-colors ${
-                      isCloudMode
-                        ? "border-primary bg-primary"
-                        : "border-border-hover dark:border-border-subtle"
-                    }`}
-                  >
-                    {isCloudMode && (
-                      <div className="w-full h-full flex items-center justify-center">
-                        <div className="w-1.5 h-1.5 rounded-full bg-primary-foreground" />
-                      </div>
-                    )}
-                  </div>
-                </button>
-              </SettingsPanelRow>
-              <SettingsPanelRow>
-                <button
-                  onClick={() => {
-                    if (!isCustomMode) {
-                      setCloudReasoningMode("byok");
-                      toast({
-                        title: t("settingsPage.aiModels.toasts.switchedCustom.title"),
-                        description: t("settingsPage.aiModels.toasts.switchedCustom.description"),
-                        variant: "success",
-                        duration: 3000,
-                      });
-                    }
-                  }}
-                  className="w-full flex items-center gap-3 text-left cursor-pointer group"
-                >
-                  <div
-                    className={`w-8 h-8 rounded-md flex items-center justify-center shrink-0 transition-colors ${
-                      isCustomMode
-                        ? "bg-accent/10 dark:bg-accent/15"
-                        : "bg-muted/60 dark:bg-surface-raised group-hover:bg-muted dark:group-hover:bg-surface-3"
-                    }`}
-                  >
-                    <Key
-                      className={`w-4 h-4 transition-colors ${
-                        isCustomMode ? "text-accent" : "text-muted-foreground"
-                      }`}
-                    />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2">
-                      <span className="text-[12px] font-medium text-foreground">
-                        {t("settingsPage.aiModels.customSetup")}
-                      </span>
-                      {isCustomMode && (
-                        <span className="text-[10px] font-medium text-accent bg-accent/10 dark:bg-accent/15 px-1.5 py-px rounded-sm">
-                          {t("common.active")}
-                        </span>
-                      )}
-                    </div>
-                    <p className="text-[11px] text-muted-foreground/80 mt-0.5">
-                      {t("settingsPage.aiModels.customSetupDescription")}
-                    </p>
-                  </div>
-                  <div
-                    className={`w-4 h-4 rounded-full border-2 shrink-0 transition-colors ${
-                      isCustomMode
-                        ? "border-accent bg-accent"
-                        : "border-border-hover dark:border-border-subtle"
-                    }`}
-                  >
-                    {isCustomMode && (
-                      <div className="w-full h-full flex items-center justify-center">
-                        <div className="w-1.5 h-1.5 rounded-full bg-accent-foreground" />
-                      </div>
-                    )}
-                  </div>
-                </button>
-              </SettingsPanelRow>
-            </SettingsPanel>
-          )}
-
-          {/* Custom Setup model picker — shown when Custom Setup is active or not signed in */}
-          {(isCustomMode || !isSignedIn) && (
-            <ReasoningModelSelector
-              useReasoningModel={useReasoningModel}
-              setUseReasoningModel={setUseReasoningModel}
-              reasoningModel={reasoningModel}
-              setReasoningModel={setReasoningModel}
-              localReasoningProvider={reasoningProvider}
-              setLocalReasoningProvider={setReasoningProvider}
-              cloudReasoningBaseUrl={cloudReasoningBaseUrl}
-              setCloudReasoningBaseUrl={setCloudReasoningBaseUrl}
-              openaiApiKey={openaiApiKey}
-              setOpenaiApiKey={setOpenaiApiKey}
-              anthropicApiKey={anthropicApiKey}
-              setAnthropicApiKey={setAnthropicApiKey}
-              geminiApiKey={geminiApiKey}
-              setGeminiApiKey={setGeminiApiKey}
-              groqApiKey={groqApiKey}
-              setGroqApiKey={setGroqApiKey}
-              customReasoningApiKey={customReasoningApiKey}
-              setCustomReasoningApiKey={setCustomReasoningApiKey}
-              showAlertDialog={showAlertDialog}
-            />
-          )}
+          <InferenceConfigEditor scope="dictationCleanup" onModeChange={handleCleanupModeChange} />
+          <GpuDeviceSelector purpose="intelligence" />
         </>
       )}
     </div>
   );
 }
 
-export default function SettingsPage({ activeSection = "general" }: SettingsPageProps) {
+type SpeechTab = "dictation" | "noteRecording";
+type LlmTab = "dictationCleanup" | "dictationAgent" | "noteFormatting" | "chatIntelligence";
+
+const SPEECH_TABS: SpeechTab[] = ["dictation", "noteRecording"];
+const LLM_TABS: LlmTab[] = [
+  "dictationCleanup",
+  "dictationAgent",
+  "noteFormatting",
+  "chatIntelligence",
+];
+
+function useSubTab<T extends string>(storageKey: string, options: readonly T[], initial?: T) {
+  const [tab, setTab] = useLocalStorage<T>(storageKey, initial ?? options[0]);
+  useEffect(() => {
+    if (initial && initial !== tab) setTab(initial);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initial]);
+  const safeTab = options.includes(tab) ? tab : options[0];
+  return [safeTab, setTab] as const;
+}
+
+function VADLabelWithInfo({ label, description }: { label: string; description: string }) {
+  return (
+    <div className="inline-flex items-center gap-1.5 text-xs font-medium text-foreground">
+      <span>{label}</span>
+      <Popover>
+        <PopoverTrigger asChild>
+          <button
+            type="button"
+            className="inline-flex items-center justify-center rounded-sm text-muted-foreground hover:text-foreground transition-colors"
+            aria-label={label}
+          >
+            <Info className="h-3.5 w-3.5" />
+          </button>
+        </PopoverTrigger>
+        <PopoverContent side="top" align="start" className="max-w-sm p-3">
+          <p className="text-xs leading-relaxed text-muted-foreground">{description}</p>
+        </PopoverContent>
+      </Popover>
+    </div>
+  );
+}
+
+function SpeechToTextTabs({
+  initialTab,
+  renderDictation,
+  renderNoteRecording,
+}: {
+  initialTab?: SpeechTab;
+  renderDictation: () => React.ReactNode;
+  renderNoteRecording: () => React.ReactNode;
+}) {
+  const { t } = useTranslation();
+  const [tab, setTab] = useSubTab<SpeechTab>("settings.speechToTextTab", SPEECH_TABS, initialTab);
+
+  const subTabs = [
+    { id: "dictation", name: t("settingsPage.speechToText.tabs.dictation") },
+    { id: "noteRecording", name: t("settingsPage.speechToText.tabs.noteRecording") },
+  ];
+
+  return (
+    <div className="space-y-4">
+      <SectionHeader
+        title={t("settingsPage.speechToText.title")}
+        description={t("settingsPage.speechToText.description")}
+      />
+      <ProviderTabs
+        providers={subTabs}
+        selectedId={tab}
+        onSelect={(id) => setTab(id as SpeechTab)}
+        renderIcon={(id) =>
+          id === "dictation" ? (
+            <Mic className="w-3.5 h-3.5" />
+          ) : (
+            <FileAudio className="w-3.5 h-3.5" />
+          )
+        }
+      />
+      {tab === "dictation" ? renderDictation() : renderNoteRecording()}
+    </div>
+  );
+}
+
+function LlmsTabs({
+  initialTab,
+  renderDictationCleanup,
+  renderDictationAgent,
+  renderNoteFormatting,
+  renderChatIntelligence,
+}: {
+  initialTab?: LlmTab;
+  renderDictationCleanup: () => React.ReactNode;
+  renderDictationAgent: () => React.ReactNode;
+  renderNoteFormatting: () => React.ReactNode;
+  renderChatIntelligence: () => React.ReactNode;
+}) {
+  const { t } = useTranslation();
+  const [tab, setTab] = useSubTab<LlmTab>("settings.llmsTab", LLM_TABS, initialTab);
+
+  const subTabs = [
+    { id: "dictationCleanup", name: t("settingsPage.llms.tabs.dictationCleanup") },
+    { id: "dictationAgent", name: t("settingsPage.llms.tabs.dictationAgent") },
+    { id: "noteFormatting", name: t("settingsPage.llms.tabs.noteFormatting") },
+    { id: "chatIntelligence", name: t("settingsPage.llms.tabs.chatIntelligence") },
+  ];
+
+  return (
+    <div className="space-y-4">
+      <SectionHeader
+        title={t("settingsPage.llms.title")}
+        description={t("settingsPage.llms.description")}
+      />
+      <ProviderTabs
+        providers={subTabs}
+        selectedId={tab}
+        onSelect={(id) => setTab(id as LlmTab)}
+        renderIcon={(id) => {
+          if (id === "dictationCleanup") return <Wand2 className="w-3.5 h-3.5" />;
+          if (id === "dictationAgent") return <Sparkles className="w-3.5 h-3.5" />;
+          if (id === "noteFormatting") return <BookOpen className="w-3.5 h-3.5" />;
+          return <MessageSquare className="w-3.5 h-3.5" />;
+        }}
+      />
+      {tab === "dictationCleanup" && renderDictationCleanup()}
+      {tab === "dictationAgent" && renderDictationAgent()}
+      {tab === "noteFormatting" && renderNoteFormatting()}
+      {tab === "chatIntelligence" && renderChatIntelligence()}
+    </div>
+  );
+}
+
+function GpuDeviceSelector({ purpose }: { purpose: "transcription" | "intelligence" }) {
+  const { t } = useTranslation();
+  const [gpus, setGpus] = useState<GpuDevice[]>([]);
+  const [selectedIndex, setSelectedIndex] = useState("0");
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    Promise.all([
+      window.electronAPI?.listGpus?.() ?? Promise.resolve([]),
+      window.electronAPI?.getGpuDeviceIndex?.(purpose) ?? Promise.resolve("0"),
+    ])
+      .then(([gpuList, idx]) => {
+        setGpus(gpuList);
+        setSelectedIndex(idx);
+        setLoaded(true);
+      })
+      .catch(() => setLoaded(true));
+  }, [purpose]);
+
+  if (!loaded || gpus.length < 2) return null;
+
+  return (
+    <div className="border-t border-border/40 pt-4 mt-4">
+      <SectionHeader
+        title={t(`settingsPage.${purpose}.gpuDevice.title`)}
+        description={t(`settingsPage.${purpose}.gpuDevice.description`)}
+      />
+      <SettingsPanel>
+        <SettingsPanelRow>
+          <div className="relative w-full">
+            <select
+              value={selectedIndex}
+              onChange={async (e) => {
+                const idx = e.target.value;
+                setSelectedIndex(idx);
+                await window.electronAPI?.setGpuDeviceIndex?.(purpose, Number(idx));
+              }}
+              className="w-full appearance-none rounded-md border border-border bg-background px-3 pr-10 py-2 text-sm"
+            >
+              {gpus.map((gpu) => (
+                <option key={gpu.index} value={String(gpu.index)}>
+                  GPU {gpu.index}: {gpu.name} ({Math.round(gpu.vramMb / 1024)}GB)
+                </option>
+              ))}
+            </select>
+            <svg
+              className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground"
+              xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="m6 9 6 6 6-6" />
+            </svg>
+          </div>
+        </SettingsPanelRow>
+      </SettingsPanel>
+    </div>
+  );
+}
+
+export default function SettingsPage({
+  activeSection = "general",
+  onNavigateToSection,
+  initialSubTab,
+}: SettingsPageProps) {
+  const { isCompact } = useSettingsLayout();
   const {
     confirmDialog,
     alertDialog,
@@ -625,16 +671,7 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
     cloudTranscriptionProvider,
     cloudTranscriptionModel,
     cloudTranscriptionBaseUrl,
-    cloudReasoningBaseUrl,
-    customDictionary,
-    useReasoningModel,
-    reasoningModel,
-    reasoningProvider,
-    openaiApiKey,
-    anthropicApiKey,
-    geminiApiKey,
-    groqApiKey,
-    mistralApiKey,
+    useCleanupModel,
     dictationKey,
     activationMode,
     setActivationMode,
@@ -650,36 +687,76 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
     setCloudTranscriptionProvider,
     setCloudTranscriptionModel,
     setCloudTranscriptionBaseUrl,
-    setCloudReasoningBaseUrl,
-    setCustomDictionary,
-    setUseReasoningModel,
-    setReasoningModel,
-    setReasoningProvider,
-    setOpenaiApiKey,
-    setAnthropicApiKey,
-    setGeminiApiKey,
-    setGroqApiKey,
-    setMistralApiKey,
-    customTranscriptionApiKey,
-    setCustomTranscriptionApiKey,
-    customReasoningApiKey,
-    setCustomReasoningApiKey,
+    setUseCleanupModel,
     setDictationKey,
+    meetingKey,
+    setMeetingKey,
+    meetingHotkeyLayoutMode,
+    setMeetingHotkeyLayoutMode,
+    autoLearnCorrections,
+    setAutoLearnCorrections,
     updateTranscriptionSettings,
-    updateReasoningSettings,
+    updateCleanupSettings,
     cloudTranscriptionMode,
     setCloudTranscriptionMode,
-    cloudReasoningMode,
-    setCloudReasoningMode,
+    transcriptionMode,
+    setTranscriptionMode,
+    remoteTranscriptionUrl,
+    setRemoteTranscriptionUrl,
     audioCuesEnabled,
     setAudioCuesEnabled,
+    pauseMediaOnDictation,
+    setPauseMediaOnDictation,
+    showTranscriptionPreview,
+    setShowTranscriptionPreview,
+    autoPasteEnabled,
+    setAutoPasteEnabled,
+    keepTranscriptionInClipboard,
+    setKeepTranscriptionInClipboard,
     floatingIconAutoHide,
     setFloatingIconAutoHide,
+    startMinimized,
+    setStartMinimized,
+    panelStartPosition,
+    setPanelStartPosition,
     cloudBackupEnabled,
     setCloudBackupEnabled,
     telemetryEnabled,
     setTelemetryEnabled,
+    audioRetentionDays,
+    setAudioRetentionDays,
+    dataRetentionEnabled,
+    setDataRetentionEnabled,
+    customDictionary,
+    setCustomDictionary,
+    noteFilesEnabled,
+    setNoteFilesEnabled,
+    noteFilesPath,
+    setNoteFilesPath,
+    dictationSileroEnabled,
+    setDictationSileroEnabled,
+    noteRecordingSileroEnabled,
+    setNoteRecordingSileroEnabled,
+    meetingSileroEnabled,
+    setMeetingSileroEnabled,
+    whisperVadThreshold,
+    setWhisperVadThreshold,
+    whisperVadMinSpeechDurationMs,
+    setWhisperVadMinSpeechDurationMs,
+    whisperVadMinSilenceDurationMs,
+    setWhisperVadMinSilenceDurationMs,
+    whisperVadMaxSpeechDurationS,
+    setWhisperVadMaxSpeechDurationS,
+    whisperVadSpeechPadMs,
+    setWhisperVadSpeechPadMs,
+    whisperVadSamplesOverlap,
+    setWhisperVadSamplesOverlap,
   } = useSettings();
+
+  const chatAgentKey = useSettingsStore((s) => s.chatAgentKey);
+  const setChatAgentKey = useSettingsStore((s) => s.setChatAgentKey);
+  const meetingAudioDetection = useSettingsStore((s) => s.meetingAudioDetection);
+  const setMeetingAudioDetection = useSettingsStore((s) => s.setMeetingAudioDetection);
 
   const { t, i18n } = useTranslation();
   const { toast } = useToast();
@@ -703,16 +780,73 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
     installUpdate: installUpdateAction,
     getAppVersion,
     error: updateError,
+    clearError: clearUpdateError,
   } = useUpdater();
 
   const isUpdateAvailable =
     !updateStatus.isDevelopment && (updateStatus.updateAvailable || updateStatus.updateDownloaded);
 
-  const whisperHook = useWhisper();
+  const migration = useMigration();
+
+  const { checkWhisperInstallation } = useWhisper();
   const permissionsHook = usePermissions(showAlertDialog);
+  const systemAudio = useSystemAudioPermission();
   useClipboard(showAlertDialog);
-  const { agentName, setAgentName } = useAgentName();
-  const [agentNameInput, setAgentNameInput] = useState(agentName);
+  const [audioStorageUsage, setAudioStorageUsage] = useState<{
+    fileCount: number;
+    totalBytes: number;
+  }>({ fileCount: 0, totalBytes: 0 });
+
+  useEffect(() => {
+    if (activeSection !== "privacyData") return;
+    window.electronAPI
+      ?.getAudioStorageUsage?.()
+      .then((usage: { fileCount: number; totalBytes: number }) => {
+        if (usage) setAudioStorageUsage(usage);
+      })
+      .catch(() => {});
+  }, [activeSection]);
+
+  const handleClearAllAudio = async () => {
+    if (!window.electronAPI?.deleteAllAudio) return;
+    try {
+      await window.electronAPI.deleteAllAudio();
+      setAudioStorageUsage({ fileCount: 0, totalBytes: 0 });
+      toast({ title: t("settingsPage.privacy.clearAllAudio"), variant: "default" });
+    } catch {
+      // silent fail
+    }
+  };
+
+  // ydotool status for Wayland paste diagnostics
+  const [ydotoolStatus, setYdotoolStatus] = useState<{
+    isLinux: boolean;
+    isWayland: boolean;
+    hasYdotool: boolean;
+    hasYdotoold: boolean;
+    daemonRunning: boolean;
+    hasService: boolean;
+    hasUinput: boolean;
+    hasUdevRule: boolean;
+    hasGroup: boolean;
+    allGood: boolean;
+    isKde?: boolean;
+    hasXclip?: boolean;
+    hasXsel?: boolean;
+  } | null>(null);
+  const [ydotoolGuideKey, setYdotoolGuideKey] = useState<string | null>(null);
+
+  const refreshYdotoolStatus = useCallback(async () => {
+    try {
+      const status = await window.electronAPI?.getYdotoolStatus?.();
+      if (status) setYdotoolStatus(status);
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    refreshYdotoolStatus();
+  }, [refreshYdotoolStatus]);
+
   const { theme, setTheme } = useTheme();
   const usage = useUsage();
   const hasShownApproachingToast = useRef(false);
@@ -741,37 +875,66 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
     showAlert: showAlertDialog,
   });
 
-  const validateHotkeyForInput = useCallback(
-    (hotkey: string) => getValidationMessage(hotkey, getPlatform()),
-    []
-  );
-
-  const [isUsingGnomeHotkeys, setIsUsingGnomeHotkeys] = useState(false);
-
-  const platform = useMemo(() => {
-    if (typeof window !== "undefined" && window.electronAPI?.getPlatform) {
-      return window.electronAPI.getPlatform();
-    }
-    return "linux";
+  const meetingRegisterFn = useCallback(async (hotkey: string) => {
+    const result = await window.electronAPI?.registerMeetingHotkey?.(hotkey);
+    return result ?? { success: false, message: "Electron API unavailable" };
   }, []);
 
-  const [newDictionaryWord, setNewDictionaryWord] = useState("");
+  const { registerHotkey: registerMeetingHotkey, isRegistering: isMeetingHotkeyRegistering } =
+    useHotkeyRegistration({
+      onSuccess: (registeredHotkey) => {
+        setMeetingKey(registeredHotkey);
+      },
+      showSuccessToast: false,
+      showErrorToast: true,
+      showAlert: showAlertDialog,
+      registerFn: meetingRegisterFn,
+    });
 
-  const handleAddDictionaryWord = useCallback(() => {
-    const word = newDictionaryWord.trim();
-    if (word && !customDictionary.includes(word)) {
-      setCustomDictionary([...customDictionary, word]);
-      setNewDictionaryWord("");
-    }
-  }, [newDictionaryWord, customDictionary, setCustomDictionary]);
-
-  const handleRemoveDictionaryWord = useCallback(
-    (wordToRemove: string) => {
-      if (wordToRemove === agentName) return;
-      setCustomDictionary(customDictionary.filter((word) => word !== wordToRemove));
-    },
-    [customDictionary, setCustomDictionary, agentName]
+  const validateDictationHotkey = useCallback(
+    (hotkey: string) =>
+      validateHotkeyForSlot(
+        hotkey,
+        {
+          "settingsPage.general.meetingHotkey.title": meetingKey,
+          "agentMode.settings.hotkey": chatAgentKey,
+        },
+        t
+      ),
+    [meetingKey, chatAgentKey, t]
   );
+
+  const validateMeetingHotkey = useCallback(
+    (hotkey: string) =>
+      validateHotkeyForSlot(
+        hotkey,
+        {
+          "settingsPage.general.hotkey.title": dictationKey,
+          "agentMode.settings.hotkey": chatAgentKey,
+        },
+        t
+      ),
+    [dictationKey, chatAgentKey, t]
+  );
+
+  const validateAgentHotkey = useCallback(
+    (hotkey: string) =>
+      validateHotkeyForSlot(
+        hotkey,
+        {
+          "settingsPage.general.hotkey.title": dictationKey,
+          "settingsPage.general.meetingHotkey.title": meetingKey,
+        },
+        t
+      ),
+    [dictationKey, meetingKey, t]
+  );
+
+  const [isUsingNativeShortcut, setIsUsingNativeShortcut] = useState(false);
+  const [effectiveDefaultHotkey, setEffectiveDefaultHotkey] = useState<string | null>(null);
+  const [linuxPttAvailable, setLinuxPttAvailable] = useState(true);
+
+  const platform = getCachedPlatform();
 
   const [autoStartEnabled, setAutoStartEnabled] = useState(false);
   const [autoStartLoading, setAutoStartLoading] = useState(true);
@@ -811,6 +974,47 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
     }
   };
 
+  const [noteFilesDefaultPath, setNoteFilesDefaultPath] = useState("");
+  const [noteFilesRebuilding, setNoteFilesRebuilding] = useState(false);
+
+  useEffect(() => {
+    if (!noteFilesEnabled) return;
+    window.electronAPI?.noteFilesGetDefaultPath?.().then((p) => {
+      if (p) setNoteFilesDefaultPath(p);
+    });
+  }, [noteFilesEnabled]);
+
+  const handleNoteFilesToggle = useCallback(
+    async (enabled: boolean) => {
+      setNoteFilesEnabled(enabled);
+      await window.electronAPI?.noteFilesSetEnabled?.(enabled, noteFilesPath || undefined);
+    },
+    [setNoteFilesEnabled, noteFilesPath]
+  );
+
+  const handleNoteFilesChangePath = useCallback(async () => {
+    const result = await window.electronAPI?.noteFilesPickFolder?.();
+    if (result?.canceled || !result?.path) return;
+    setNoteFilesPath(result.path);
+    await window.electronAPI?.noteFilesSetPath?.(result.path);
+  }, [setNoteFilesPath]);
+
+  const handleNoteFilesRebuild = useCallback(async () => {
+    setNoteFilesRebuilding(true);
+    try {
+      const result = await window.electronAPI?.noteFilesRebuild?.();
+      if (result && !result.success) {
+        toast({
+          title: t("settings.noteFiles.rebuildError.title"),
+          description: result.error || t("settings.noteFiles.rebuildError.description"),
+          variant: "destructive",
+        });
+      }
+    } finally {
+      setNoteFilesRebuilding(false);
+    }
+  }, [toast, t]);
+
   useEffect(() => {
     let mounted = true;
 
@@ -821,7 +1025,7 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
       if (version && mounted) setCurrentVersion(version);
 
       if (mounted) {
-        whisperHook.checkWhisperInstallation();
+        checkWhisperInstallation();
       }
     }, 100);
 
@@ -829,22 +1033,44 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
       mounted = false;
       clearTimeout(timer);
     };
-  }, [whisperHook, getAppVersion]);
+  }, [checkWhisperInstallation, getAppVersion]);
 
   useEffect(() => {
     const checkHotkeyMode = async () => {
       try {
         const info = await window.electronAPI?.getHotkeyModeInfo();
-        if (info?.isUsingGnome) {
-          setIsUsingGnomeHotkeys(true);
-          setActivationMode("tap");
+        if (info?.isUsingNativeShortcut) {
+          setIsUsingNativeShortcut(true);
+          if (!info.supportsPushToTalk) {
+            setActivationMode("tap");
+          }
         }
       } catch (error) {
         logger.error("Failed to check hotkey mode", error, "settings");
       }
+      try {
+        const key = await window.electronAPI?.getEffectiveDefaultHotkey?.();
+        if (key) setEffectiveDefaultHotkey(key);
+      } catch (error) {
+        logger.error("Failed to get effective default hotkey", error, "settings");
+      }
     };
     checkHotkeyMode();
   }, [setActivationMode]);
+
+  useEffect(() => {
+    const cleanup = window.electronAPI?.onLinuxPttPermissionDenied?.(() => {
+      setLinuxPttAvailable(false);
+      toast({
+        title: t("settingsPage.general.hotkey.linuxPttPermissionTitle"),
+        description: t("settingsPage.general.hotkey.linuxPttPermissionDescription"),
+        variant: "destructive",
+        duration: 15000,
+      });
+      setActivationMode("tap");
+    });
+    return () => cleanup?.();
+  }, [toast, t, setActivationMode]);
 
   useEffect(() => {
     if (updateError) {
@@ -852,8 +1078,9 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
         title: t("settingsPage.general.updates.dialogs.updateError.title"),
         description: t("settingsPage.general.updates.dialogs.updateError.description"),
       });
+      clearUpdateError();
     }
-  }, [updateError, showAlertDialog, t]);
+  }, [updateError, showAlertDialog, clearUpdateError, t]);
 
   useEffect(() => {
     if (installInitiated) {
@@ -886,7 +1113,7 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
       title: t("settingsPage.permissions.resetAccessibility.title"),
       description: message,
       onConfirm: () => {
-        permissionsHook.openAccessibilitySettings();
+        permissionsHook.requestAccessibilityPermission();
       },
     });
   };
@@ -939,7 +1166,103 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
 
   const { isSignedIn, isLoaded, user } = useAuth();
   const [isSigningOut, setIsSigningOut] = useState(false);
+  const [isDeletingAccount, setIsDeletingAccount] = useState(false);
   const [isOpeningBilling, setIsOpeningBilling] = useState(false);
+  const [billingState, setBillingState] = useState<Record<string, boolean>>({
+    pro: true,
+    business: true,
+  });
+  const [checkoutTier, setCheckoutTier] = useState<string | null>(null);
+  const [switchPreview, setSwitchPreview] = useState<{
+    plan: "monthly" | "annual";
+    tier: "pro" | "business";
+    immediateAmount: number;
+    currency: string;
+    newPriceAmount: number;
+    newInterval: string;
+    nextBillingDate: string | null;
+  } | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+
+  const startOnboarding = useCallback(() => {
+    localStorage.setItem("pendingCloudMigration", "true");
+    localStorage.setItem("onboardingCurrentStep", "0");
+    localStorage.removeItem("onboardingCompleted");
+    window.location.reload();
+  }, []);
+
+  const handleBillingPortal = useCallback(async () => {
+    const result = await usage.openBillingPortal();
+    if (!result.success) {
+      toast({
+        title: t("settingsPage.account.checkout.couldNotOpenTitle"),
+        description: t("settingsPage.account.checkout.couldNotOpenDescription"),
+      });
+    }
+  }, [usage, toast, t]);
+
+  const handleSwitchPlan = useCallback(
+    async (plan: "monthly" | "annual", tier: "pro" | "business") => {
+      setPreviewLoading(true);
+      try {
+        const preview = await usage.previewSwitchPlan({ plan, tier });
+        if (!preview.success) {
+          toast({
+            title: t("settingsPage.account.checkout.couldNotOpenTitle"),
+            description:
+              preview.error || t("settingsPage.account.checkout.couldNotOpenDescription"),
+          });
+          return;
+        }
+        if (preview.alreadyOnPlan) {
+          toast({ title: t("settingsPage.account.pricing.planSwitched") });
+          return;
+        }
+        setSwitchPreview({
+          plan,
+          tier,
+          immediateAmount: preview.immediateAmount ?? 0,
+          currency: preview.currency ?? "usd",
+          newPriceAmount: preview.newPriceAmount ?? 0,
+          newInterval: preview.newInterval ?? "month",
+          nextBillingDate: preview.nextBillingDate ?? null,
+        });
+      } finally {
+        setPreviewLoading(false);
+      }
+    },
+    [usage, toast, t]
+  );
+
+  const confirmSwitchPlan = useCallback(async () => {
+    if (!switchPreview) return;
+    const { plan, tier } = switchPreview;
+    setSwitchPreview(null);
+    const result = await usage.switchPlan({ plan, tier });
+    if (result.success) {
+      toast({ title: t("settingsPage.account.pricing.planSwitched") });
+    } else {
+      toast({
+        title: t("settingsPage.account.checkout.couldNotOpenTitle"),
+        description: result.error || t("settingsPage.account.checkout.couldNotOpenDescription"),
+      });
+    }
+  }, [switchPreview, usage, toast, t]);
+
+  const handleCheckout = useCallback(
+    async (plan: "monthly" | "annual", tier: "pro" | "business") => {
+      setCheckoutTier(tier);
+      const result = await usage.openCheckout({ plan, tier });
+      setCheckoutTier(null);
+      if (!result.success) {
+        toast({
+          title: t("settingsPage.account.checkout.couldNotOpenTitle"),
+          description: t("settingsPage.account.checkout.couldNotOpenDescription"),
+        });
+      }
+    },
+    [usage, toast, t]
+  );
 
   const handleSignOut = useCallback(async () => {
     setIsSigningOut(true);
@@ -957,12 +1280,178 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
     }
   }, [showAlertDialog, t]);
 
+  const handleDeleteAccount = useCallback(() => {
+    showConfirmDialog({
+      title: t("settingsPage.account.deleteAccount.title"),
+      description: t("settingsPage.account.deleteAccount.description"),
+      onConfirm: async () => {
+        setIsDeletingAccount(true);
+        try {
+          // Best-effort cloud cleanup (needs session cookies before sign-out)
+          try {
+            const { NotesService } = await import("../services/NotesService");
+            await NotesService.deleteAll();
+          } catch {}
+
+          const result = await deleteAccount();
+          if (result.error) {
+            logger.error("Server account deletion failed", result.error, "auth");
+          }
+
+          try {
+            await signOut();
+          } catch {}
+          await window.electronAPI?.cleanupApp();
+
+          showAlertDialog({
+            title: t("settingsPage.account.deleteAccount.successTitle"),
+            description: t("settingsPage.account.deleteAccount.successDescription"),
+          });
+          setTimeout(() => window.location.reload(), 1000);
+        } catch (error) {
+          logger.error("Account deletion failed", error, "auth");
+          showAlertDialog({
+            title: t("settingsPage.account.deleteAccount.failedTitle"),
+            description: t("settingsPage.account.deleteAccount.failedDescription"),
+          });
+        } finally {
+          setIsDeletingAccount(false);
+        }
+      },
+      variant: "destructive",
+      confirmText: t("settingsPage.account.deleteAccount.confirmText"),
+    });
+  }, [showConfirmDialog, showAlertDialog, t]);
+
+  const renderWhisperVadSettings = () => (
+    <div>
+      <SectionHeader
+        title={t("settingsPage.transcription.vad.title")}
+        description={t("settingsPage.transcription.vad.description")}
+      />
+      <SettingsPanel>
+        <SettingsPanelRow>
+          <SettingsRow
+            label={t("settingsPage.transcription.vad.toggles.dictation.title")}
+            description={t("settingsPage.transcription.vad.toggles.dictation.description")}
+          >
+            <Toggle checked={dictationSileroEnabled} onChange={setDictationSileroEnabled} />
+          </SettingsRow>
+        </SettingsPanelRow>
+        <SettingsPanelRow>
+          <SettingsRow
+            label={t("settingsPage.transcription.vad.toggles.noteRecording.title")}
+            description={t("settingsPage.transcription.vad.toggles.noteRecording.description")}
+          >
+            <Toggle checked={noteRecordingSileroEnabled} onChange={setNoteRecordingSileroEnabled} />
+          </SettingsRow>
+        </SettingsPanelRow>
+        <SettingsPanelRow>
+          <SettingsRow
+            label={t("settingsPage.transcription.vad.toggles.meeting.title")}
+            description={t("settingsPage.transcription.vad.toggles.meeting.description")}
+          >
+            <Toggle checked={meetingSileroEnabled} onChange={setMeetingSileroEnabled} />
+          </SettingsRow>
+        </SettingsPanelRow>
+        <SettingsPanelRow>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full">
+            <div className="space-y-1.5">
+              <VADLabelWithInfo
+                label={t("settingsPage.transcription.vad.fields.threshold.label")}
+                description={t("settingsPage.transcription.vad.fields.threshold.info")}
+              />
+              <Input
+                type="number"
+                step="0.01"
+                min="0.1"
+                max="0.95"
+                value={whisperVadThreshold}
+                onChange={(e) => setWhisperVadThreshold(Number(e.target.value))}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <VADLabelWithInfo
+                label={t("settingsPage.transcription.vad.fields.minSpeechDurationMs.label")}
+                description={t("settingsPage.transcription.vad.fields.minSpeechDurationMs.info")}
+              />
+              <Input
+                type="number"
+                step="10"
+                min="50"
+                max="2000"
+                value={whisperVadMinSpeechDurationMs}
+                onChange={(e) => setWhisperVadMinSpeechDurationMs(Number(e.target.value))}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <VADLabelWithInfo
+                label={t("settingsPage.transcription.vad.fields.minSilenceDurationMs.label")}
+                description={t("settingsPage.transcription.vad.fields.minSilenceDurationMs.info")}
+              />
+              <Input
+                type="number"
+                step="10"
+                min="50"
+                max="2000"
+                value={whisperVadMinSilenceDurationMs}
+                onChange={(e) => setWhisperVadMinSilenceDurationMs(Number(e.target.value))}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <VADLabelWithInfo
+                label={t("settingsPage.transcription.vad.fields.maxSpeechDurationS.label")}
+                description={t("settingsPage.transcription.vad.fields.maxSpeechDurationS.info")}
+              />
+              <Input
+                type="number"
+                step="1"
+                min="5"
+                max="120"
+                value={whisperVadMaxSpeechDurationS}
+                onChange={(e) => setWhisperVadMaxSpeechDurationS(Number(e.target.value))}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <VADLabelWithInfo
+                label={t("settingsPage.transcription.vad.fields.speechPadMs.label")}
+                description={t("settingsPage.transcription.vad.fields.speechPadMs.info")}
+              />
+              <Input
+                type="number"
+                step="10"
+                min="0"
+                max="1000"
+                value={whisperVadSpeechPadMs}
+                onChange={(e) => setWhisperVadSpeechPadMs(Number(e.target.value))}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <VADLabelWithInfo
+                label={t("settingsPage.transcription.vad.fields.samplesOverlap.label")}
+                description={t("settingsPage.transcription.vad.fields.samplesOverlap.info")}
+              />
+              <Input
+                type="number"
+                step="0.01"
+                min="0"
+                max="0.95"
+                value={whisperVadSamplesOverlap}
+                onChange={(e) => setWhisperVadSamplesOverlap(Number(e.target.value))}
+              />
+            </div>
+          </div>
+        </SettingsPanelRow>
+      </SettingsPanel>
+    </div>
+  );
+
   const renderSectionContent = () => {
     switch (activeSection) {
       case "account":
         return (
           <div className="space-y-5">
-            {!NEON_AUTH_URL ? (
+            {!AUTH_URL ? (
               <>
                 <SectionHeader
                   title={t("settingsPage.account.title")}
@@ -997,223 +1486,15 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                         )}
                       </div>
                       <div className="min-w-0 flex-1">
-                        <p className="text-[13px] font-medium text-foreground truncate">
+                        <p className="text-xs font-medium text-foreground truncate">
                           {user.name || t("settingsPage.account.user")}
                         </p>
-                        <p className="text-[11px] text-muted-foreground truncate">{user.email}</p>
+                        <p className="text-xs text-muted-foreground truncate">{user.email}</p>
                       </div>
                       <Badge variant="success">{t("settingsPage.account.signedIn")}</Badge>
                     </div>
                   </SettingsPanelRow>
                 </SettingsPanel>
-
-                <SectionHeader title={t("settingsPage.account.planTitle")} />
-                {!usage || !usage.hasLoaded ? (
-                  <SettingsPanel>
-                    <SettingsPanelRow>
-                      <div className="flex items-center justify-between">
-                        <Skeleton className="h-4 w-24" />
-                        <Skeleton className="h-5 w-16 rounded-full" />
-                      </div>
-                    </SettingsPanelRow>
-                    <SettingsPanelRow>
-                      <div className="space-y-2">
-                        <Skeleton className="h-3 w-48" />
-                        <Skeleton className="h-8 w-full rounded" />
-                      </div>
-                    </SettingsPanelRow>
-                  </SettingsPanel>
-                ) : (
-                  <SettingsPanel>
-                    {usage.isPastDue && (
-                      <SettingsPanelRow>
-                        <Alert
-                          variant="warning"
-                          className="dark:bg-amber-950/50 dark:border-amber-800 dark:text-amber-200 dark:[&>svg]:text-amber-400"
-                        >
-                          <AlertTriangle className="h-4 w-4" />
-                          <AlertTitle>{t("settingsPage.account.pastDue.title")}</AlertTitle>
-                          <AlertDescription>
-                            {t("settingsPage.account.pastDue.description")}
-                          </AlertDescription>
-                        </Alert>
-                      </SettingsPanelRow>
-                    )}
-
-                    <SettingsPanelRow>
-                      <SettingsRow
-                        label={
-                          usage.isTrial
-                            ? t("settingsPage.account.planLabels.trial")
-                            : usage.isPastDue
-                              ? t("settingsPage.account.planLabels.free")
-                              : usage.isSubscribed
-                                ? t("settingsPage.account.planLabels.pro")
-                                : t("settingsPage.account.planLabels.free")
-                        }
-                        description={
-                          usage.isTrial
-                            ? t("settingsPage.account.planDescriptions.trial", {
-                                days: usage.trialDaysLeft,
-                              })
-                            : usage.isPastDue
-                              ? t("settingsPage.account.planDescriptions.pastDue", {
-                                  used: usage.wordsUsed.toLocaleString(i18n.language),
-                                  limit: usage.limit.toLocaleString(i18n.language),
-                                })
-                              : usage.isSubscribed
-                                ? usage.currentPeriodEnd
-                                  ? t("settingsPage.account.planDescriptions.nextBilling", {
-                                      date: new Date(usage.currentPeriodEnd).toLocaleDateString(
-                                        i18n.language,
-                                        { month: "short", day: "numeric", year: "numeric" }
-                                      ),
-                                    })
-                                  : t("settingsPage.account.planDescriptions.unlimited")
-                                : t("settingsPage.account.planDescriptions.freeUsage", {
-                                    used: usage.wordsUsed.toLocaleString(i18n.language),
-                                    limit: usage.limit.toLocaleString(i18n.language),
-                                  })
-                        }
-                      >
-                        {usage.isTrial ? (
-                          <Badge variant="info">{t("settingsPage.account.badges.trial")}</Badge>
-                        ) : usage.isPastDue ? (
-                          <Badge variant="destructive">
-                            {t("settingsPage.account.badges.pastDue")}
-                          </Badge>
-                        ) : usage.isSubscribed ? (
-                          <Badge variant="success">{t("settingsPage.account.badges.pro")}</Badge>
-                        ) : usage.isOverLimit ? (
-                          <Badge variant="warning">
-                            {t("settingsPage.account.badges.limitReached")}
-                          </Badge>
-                        ) : (
-                          <Badge variant="outline">{t("settingsPage.account.badges.free")}</Badge>
-                        )}
-                      </SettingsRow>
-                    </SettingsPanelRow>
-
-                    {!usage.isSubscribed && !usage.isTrial && (
-                      <SettingsPanelRow>
-                        <div className="space-y-1.5">
-                          <Progress
-                            value={
-                              usage.limit > 0
-                                ? Math.min(100, (usage.wordsUsed / usage.limit) * 100)
-                                : 0
-                            }
-                            className={cn(
-                              "h-1.5",
-                              usage.isOverLimit
-                                ? "[&>div]:bg-destructive"
-                                : usage.isApproachingLimit
-                                  ? "[&>div]:bg-warning"
-                                  : "[&>div]:bg-primary"
-                            )}
-                          />
-                          <div className="flex items-center justify-between text-[11px] text-muted-foreground">
-                            <span className="tabular-nums">
-                              {usage.wordsUsed.toLocaleString(i18n.language)} /{" "}
-                              {usage.limit.toLocaleString(i18n.language)}
-                            </span>
-                            {usage.isApproachingLimit && (
-                              <span className="text-warning">
-                                {t("settingsPage.account.wordsRemaining", {
-                                  remaining: usage.wordsRemaining.toLocaleString(i18n.language),
-                                })}
-                              </span>
-                            )}
-                            {!usage.isApproachingLimit && !usage.isOverLimit && (
-                              <span>{t("settingsPage.account.rollingWeeklyLimit")}</span>
-                            )}
-                          </div>
-                        </div>
-                      </SettingsPanelRow>
-                    )}
-
-                    <SettingsPanelRow>
-                      {usage.isPastDue ? (
-                        <Button
-                          onClick={async () => {
-                            setIsOpeningBilling(true);
-                            try {
-                              const result = await usage.openBillingPortal();
-                              if (!result.success) {
-                                toast({
-                                  title: t("settingsPage.account.billing.couldNotOpenTitle"),
-                                  description: t(
-                                    "settingsPage.account.billing.couldNotOpenDescription"
-                                  ),
-                                  variant: "destructive",
-                                });
-                              }
-                            } finally {
-                              setIsOpeningBilling(false);
-                            }
-                          }}
-                          disabled={isOpeningBilling}
-                          size="sm"
-                          className="w-full"
-                        >
-                          {isOpeningBilling ? (
-                            <>
-                              <Loader2 size={14} className="animate-spin" />
-                              {t("settingsPage.account.billing.opening")}
-                            </>
-                          ) : (
-                            t("settingsPage.account.billing.updatePaymentMethod")
-                          )}
-                        </Button>
-                      ) : usage.isSubscribed && !usage.isTrial ? (
-                        <Button
-                          onClick={async () => {
-                            const result = await usage.openBillingPortal();
-                            if (!result.success) {
-                              toast({
-                                title: t("settingsPage.account.billing.couldNotOpenTitle"),
-                                description: t(
-                                  "settingsPage.account.billing.couldNotOpenDescription"
-                                ),
-                                variant: "destructive",
-                              });
-                            }
-                          }}
-                          variant="outline"
-                          size="sm"
-                          className="w-full"
-                          disabled={usage.checkoutLoading}
-                        >
-                          {usage.checkoutLoading
-                            ? t("settingsPage.account.billing.opening")
-                            : t("settingsPage.account.billing.manageBilling")}
-                        </Button>
-                      ) : (
-                        <Button
-                          onClick={async () => {
-                            const result = await usage.openCheckout();
-                            if (!result.success) {
-                              toast({
-                                title: t("settingsPage.account.checkout.couldNotOpenTitle"),
-                                description: t(
-                                  "settingsPage.account.checkout.couldNotOpenDescription"
-                                ),
-                                variant: "destructive",
-                              });
-                            }
-                          }}
-                          size="sm"
-                          className="w-full"
-                          disabled={usage.checkoutLoading}
-                        >
-                          {usage.checkoutLoading
-                            ? t("settingsPage.account.checkout.opening")
-                            : t("settingsPage.account.checkout.upgradeToPro")}
-                        </Button>
-                      )}
-                    </SettingsPanelRow>
-                  </SettingsPanel>
-                )}
 
                 <SettingsPanel>
                   <SettingsPanelRow>
@@ -1229,6 +1510,28 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                         ? t("settingsPage.account.signOut.signingOut")
                         : t("settingsPage.account.signOut.signOut")}
                     </Button>
+                  </SettingsPanelRow>
+                </SettingsPanel>
+
+                <SettingsPanel>
+                  <SettingsPanelRow>
+                    <SettingsRow
+                      label={t("settingsPage.account.deleteAccount.label")}
+                      description={t("settingsPage.account.deleteAccount.labelDescription")}
+                    >
+                      <Button
+                        onClick={handleDeleteAccount}
+                        variant="outline"
+                        disabled={isDeletingAccount}
+                        size="sm"
+                        className="text-destructive border-destructive/30 hover:bg-destructive/10 hover:border-destructive"
+                      >
+                        <Trash2 className="mr-1.5 h-3.5 w-3.5" />
+                        {isDeletingAccount
+                          ? t("settingsPage.account.deleteAccount.deleting")
+                          : t("settingsPage.account.deleteAccount.button")}
+                      </Button>
+                    </SettingsRow>
                   </SettingsPanelRow>
                 </SettingsPanel>
               </>
@@ -1253,23 +1556,14 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                     </div>
                     <div className="min-w-0 flex-1 space-y-2.5">
                       <div>
-                        <p className="text-[13px] font-medium text-foreground">
+                        <p className="text-xs font-medium text-foreground">
                           {t("settingsPage.account.trialCta.title")}
                         </p>
-                        <p className="text-[11px] text-muted-foreground leading-relaxed mt-0.5">
+                        <p className="text-xs text-muted-foreground leading-relaxed mt-0.5">
                           {t("settingsPage.account.trialCta.description")}
                         </p>
                       </div>
-                      <Button
-                        onClick={() => {
-                          localStorage.setItem("pendingCloudMigration", "true");
-                          localStorage.setItem("onboardingCurrentStep", "0");
-                          localStorage.removeItem("onboardingCompleted");
-                          window.location.reload();
-                        }}
-                        size="sm"
-                        className="w-full"
-                      >
+                      <Button onClick={startOnboarding} size="sm" className="w-full">
                         <UserCircle className="mr-1.5 h-3.5 w-3.5" />
                         {t("settingsPage.account.trialCta.button")}
                       </Button>
@@ -1293,202 +1587,674 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
           </div>
         );
 
-      case "general":
+      case "plansBilling":
         return (
-          <div className="space-y-6">
-            {/* Updates */}
-            <div>
-              <SectionHeader title={t("settingsPage.general.updates.title")} />
-              <SettingsPanel>
-                <SettingsPanelRow>
-                  <SettingsRow
-                    label={t("settingsPage.general.updates.currentVersion")}
-                    description={
-                      updateStatus.isDevelopment
-                        ? t("settingsPage.general.updates.devMode")
-                        : isUpdateAvailable
-                          ? t("settingsPage.general.updates.newVersionAvailable")
-                          : t("settingsPage.general.updates.latestVersion")
-                    }
-                  >
-                    <div className="flex items-center gap-2.5">
-                      <span className="text-[13px] tabular-nums text-muted-foreground font-mono">
-                        {currentVersion || t("settingsPage.general.updates.versionPlaceholder")}
-                      </span>
-                      {updateStatus.isDevelopment ? (
-                        <Badge variant="warning">
-                          {t("settingsPage.general.updates.badges.dev")}
-                        </Badge>
-                      ) : isUpdateAvailable ? (
-                        <Badge variant="success">
-                          {t("settingsPage.general.updates.badges.update")}
-                        </Badge>
-                      ) : (
-                        <Badge variant="outline">
-                          {t("settingsPage.general.updates.badges.latest")}
-                        </Badge>
-                      )}
-                    </div>
-                  </SettingsRow>
-                </SettingsPanelRow>
-
-                <SettingsPanelRow>
-                  <div className="space-y-2.5">
-                    <Button
-                      onClick={async () => {
-                        try {
-                          const result = await checkForUpdates();
-                          if (result?.updateAvailable) {
-                            showAlertDialog({
-                              title: t(
-                                "settingsPage.general.updates.dialogs.updateAvailable.title"
-                              ),
-                              description: t(
-                                "settingsPage.general.updates.dialogs.updateAvailable.description",
-                                {
-                                  version:
-                                    result.version || t("settingsPage.general.updates.newVersion"),
-                                }
-                              ),
-                            });
-                          } else {
-                            showAlertDialog({
-                              title: t("settingsPage.general.updates.dialogs.noUpdates.title"),
-                              description:
-                                result?.message ||
-                                t("settingsPage.general.updates.dialogs.noUpdates.description"),
-                            });
-                          }
-                        } catch (error: any) {
-                          showAlertDialog({
-                            title: t("settingsPage.general.updates.dialogs.checkFailed.title"),
-                            description: t(
-                              "settingsPage.general.updates.dialogs.checkFailed.description"
-                            ),
-                          });
-                        }
-                      }}
-                      disabled={checkingForUpdates || updateStatus.isDevelopment}
-                      variant="outline"
-                      className="w-full"
-                      size="sm"
+          <div className="space-y-5">
+            {!AUTH_URL ? (
+              <>
+                <SectionHeader
+                  title={t("settingsPage.account.pricing.title")}
+                  description={t("settingsPage.account.notConfigured")}
+                />
+                <SettingsPanel>
+                  <SettingsPanelRow>
+                    <SettingsRow
+                      label={t("settingsPage.account.featuresDisabled")}
+                      description={t("settingsPage.account.featuresDisabledDescription")}
                     >
-                      <RefreshCw
-                        size={13}
-                        className={`mr-1.5 ${checkingForUpdates ? "animate-spin" : ""}`}
-                      />
-                      {checkingForUpdates
-                        ? t("settingsPage.general.updates.checking")
-                        : t("settingsPage.general.updates.checkForUpdates")}
-                    </Button>
-
-                    {isUpdateAvailable && !updateStatus.updateDownloaded && (
-                      <div className="space-y-2">
-                        <Button
-                          onClick={async () => {
-                            try {
-                              await downloadUpdate();
-                            } catch (error: any) {
-                              showAlertDialog({
-                                title: t(
-                                  "settingsPage.general.updates.dialogs.downloadFailed.title"
-                                ),
-                                description: t(
-                                  "settingsPage.general.updates.dialogs.downloadFailed.description"
-                                ),
-                              });
-                            }
-                          }}
-                          disabled={downloadingUpdate}
-                          variant="success"
-                          className="w-full"
-                          size="sm"
-                        >
-                          <Download
-                            size={13}
-                            className={`mr-1.5 ${downloadingUpdate ? "animate-pulse" : ""}`}
-                          />
-                          {downloadingUpdate
-                            ? t("settingsPage.general.updates.downloading", {
-                                progress: Math.round(updateDownloadProgress),
-                              })
-                            : t("settingsPage.general.updates.downloadUpdate", {
-                                version: updateInfo?.version || "",
-                              })}
-                        </Button>
-
-                        {downloadingUpdate && (
-                          <div className="h-1 w-full overflow-hidden rounded-full bg-muted/50">
-                            <div
-                              className="h-full bg-success transition-all duration-200 rounded-full"
-                              style={{
-                                width: `${Math.min(100, Math.max(0, updateDownloadProgress))}%`,
-                              }}
-                            />
-                          </div>
-                        )}
+                      <Badge variant="warning">{t("settingsPage.account.disabled")}</Badge>
+                    </SettingsRow>
+                  </SettingsPanelRow>
+                </SettingsPanel>
+              </>
+            ) : isLoaded ? (
+              <>
+                <SectionHeader title={t("settingsPage.account.pricing.title")} />
+                <div className={`grid gap-1.5 ${isCompact ? "grid-cols-2" : "grid-cols-4"}`}>
+                  {/* Free */}
+                  <div
+                    className={cn(
+                      "rounded-md p-2.5 flex flex-col",
+                      !usage?.isSubscribed && !usage?.isTrial
+                        ? "border-2 border-primary/30 bg-primary/3 dark:border-primary/20 dark:bg-primary/5"
+                        : "border border-border/50 dark:border-border-subtle/60 bg-card/30 dark:bg-surface-2/30"
+                    )}
+                  >
+                    <p className="text-xs font-semibold text-foreground">
+                      {t("settingsPage.account.pricing.free.name")}
+                    </p>
+                    <div className="flex items-baseline gap-0.5 mt-0.5">
+                      <span className="text-lg font-bold text-foreground">
+                        {t("settingsPage.account.pricing.free.price")}
+                      </span>
+                      <span className="text-[9px] text-muted-foreground">
+                        / {t("settingsPage.account.pricing.free.period")}
+                      </span>
+                    </div>
+                    <ul className="space-y-0.5 mt-2 flex-1">
+                      {(
+                        t("settingsPage.account.pricing.free.features", {
+                          returnObjects: true,
+                        }) as string[]
+                      ).map((feature, i) =>
+                        feature.startsWith("## ") ? (
+                          <li
+                            key={i}
+                            className={`text-[8px] font-semibold uppercase tracking-wide text-muted-foreground/60 ${i > 0 ? "pt-1.5" : ""}`}
+                          >
+                            {feature.slice(3)}
+                          </li>
+                        ) : (
+                          <li
+                            key={i}
+                            className="flex items-start gap-1 text-[10px] text-muted-foreground leading-tight"
+                          >
+                            <Check size={9} className="mt-[2px] text-primary/70 shrink-0" />
+                            {feature}
+                          </li>
+                        )
+                      )}
+                    </ul>
+                    {!isSignedIn ? (
+                      <Button
+                        onClick={startOnboarding}
+                        variant="outline"
+                        size="sm"
+                        className="mt-2 w-full h-6 text-[10px]"
+                      >
+                        {t("settingsPage.account.signedOutPlans.button")}
+                      </Button>
+                    ) : usage?.isSubscribed && !usage?.isTrial ? (
+                      <Button
+                        onClick={handleBillingPortal}
+                        variant="outline"
+                        size="sm"
+                        className="mt-2 w-full h-6 text-[10px]"
+                      >
+                        {t("settingsPage.account.pricing.downgrade")}
+                      </Button>
+                    ) : (
+                      <div className="mt-2 text-center">
+                        <span className="text-[9px] font-medium text-primary/70">
+                          {t("settingsPage.account.pricing.currentPlan")}
+                        </span>
                       </div>
                     )}
+                  </div>
 
-                    {updateStatus.updateDownloaded && (
-                      <Button
-                        onClick={() => {
-                          showConfirmDialog({
-                            title: t("settingsPage.general.updates.dialogs.installUpdate.title"),
-                            description: t(
-                              "settingsPage.general.updates.dialogs.installUpdate.description",
-                              { version: updateInfo?.version || "" }
-                            ),
-                            confirmText: t(
-                              "settingsPage.general.updates.dialogs.installUpdate.confirmText"
-                            ),
-                            onConfirm: async () => {
-                              try {
-                                await installUpdateAction();
-                              } catch (error: any) {
-                                showAlertDialog({
-                                  title: t(
-                                    "settingsPage.general.updates.dialogs.installFailed.title"
-                                  ),
-                                  description: t(
-                                    "settingsPage.general.updates.dialogs.installFailed.description"
-                                  ),
-                                });
-                              }
-                            },
-                          });
-                        }}
-                        disabled={installInitiated}
-                        className="w-full"
-                        size="sm"
+                  {/* Pro */}
+                  <div
+                    className={cn(
+                      "rounded-md border-2 p-2.5 flex flex-col",
+                      usage?.isSubscribed && usage?.plan === "pro"
+                        ? "border-primary/40 bg-primary/5 dark:border-primary/30 dark:bg-primary/8"
+                        : "border-primary/20 bg-primary/2 dark:border-primary/15 dark:bg-primary/3"
+                    )}
+                  >
+                    <p className="text-xs font-semibold text-foreground">
+                      {t("settingsPage.account.pricing.pro.name")}
+                    </p>
+                    <button
+                      onClick={() => setBillingState((prev) => ({ ...prev, pro: !prev.pro }))}
+                      role="switch"
+                      aria-checked={billingState.pro}
+                      className="flex items-center gap-1.5 mt-1"
+                    >
+                      <div
+                        className={`relative w-7 h-4 rounded-full transition-colors ${billingState.pro ? "bg-primary" : "bg-muted"}`}
                       >
-                        <RefreshCw
-                          size={14}
-                          className={`mr-2 ${installInitiated ? "animate-spin" : ""}`}
+                        <div
+                          className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform ${billingState.pro ? "translate-x-3" : ""}`}
                         />
-                        {installInitiated
-                          ? t("settingsPage.general.updates.restarting")
-                          : t("settingsPage.general.updates.installAndRestart")}
+                      </div>
+                      <span className="text-[9px] text-muted-foreground">
+                        {t("settingsPage.account.pricing.billedYearly")}
+                      </span>
+                    </button>
+                    <div className="flex items-baseline gap-0.5 mt-1">
+                      <span className="text-lg font-bold text-foreground">
+                        {billingState.pro
+                          ? t("settingsPage.account.pricing.pro.annualEquivalent")
+                          : t("settingsPage.account.pricing.pro.monthlyPrice")}
+                      </span>
+                      <span className="text-[9px] text-muted-foreground">
+                        {t("settingsPage.account.pricing.pro.monthlyPeriod")}
+                      </span>
+                    </div>
+                    <p className="text-[9px] text-muted-foreground/70 mt-1.5">
+                      {t("settingsPage.account.pricing.pro.includesPrefix")}
+                    </p>
+                    <ul className="space-y-0.5 mt-1 flex-1">
+                      {(
+                        t("settingsPage.account.pricing.pro.features", {
+                          returnObjects: true,
+                        }) as string[]
+                      ).map((feature, i) => (
+                        <li
+                          key={i}
+                          className="flex items-start gap-1 text-[10px] text-muted-foreground leading-tight"
+                        >
+                          <Check size={9} className="mt-[2px] text-primary shrink-0" />
+                          {feature}
+                        </li>
+                      ))}
+                    </ul>
+                    {(usage?.isSubscribed && usage?.plan === "pro" && !usage?.isTrial) ||
+                    usage?.isTrial ? (
+                      <div className="mt-2 text-center">
+                        <span className="text-[9px] font-medium text-primary">
+                          {t("settingsPage.account.pricing.currentPlan")}
+                        </span>
+                      </div>
+                    ) : usage?.isSubscribed && usage?.plan === "business" ? (
+                      <Button
+                        onClick={() =>
+                          handleSwitchPlan(billingState.pro ? "annual" : "monthly", "pro")
+                        }
+                        disabled={previewLoading || usage.checkoutLoading}
+                        variant="outline"
+                        size="sm"
+                        className="mt-2 w-full h-6 text-[10px]"
+                      >
+                        {previewLoading ? (
+                          <Loader2 size={10} className="animate-spin" />
+                        ) : (
+                          t("settingsPage.account.pricing.downgrade")
+                        )}
+                      </Button>
+                    ) : (
+                      <Button
+                        onClick={() =>
+                          handleCheckout(billingState.pro ? "annual" : "monthly", "pro")
+                        }
+                        disabled={checkoutTier === "pro"}
+                        size="sm"
+                        className="mt-2 w-full h-6 text-[10px]"
+                      >
+                        {checkoutTier === "pro" ? (
+                          <Loader2 size={10} className="animate-spin" />
+                        ) : (
+                          t("settingsPage.account.pricing.pro.cta")
+                        )}
                       </Button>
                     )}
                   </div>
 
-                  {updateInfo?.releaseNotes && (
-                    <div className="mt-4 pt-4 border-t border-border/30">
-                      <p className="text-[11px] font-medium text-muted-foreground uppercase tracking-wider mb-2">
-                        {t("settingsPage.general.updates.whatsNew", {
-                          version: updateInfo.version,
-                        })}
-                      </p>
-                      <div className="text-[12px] text-muted-foreground">
-                        <MarkdownRenderer content={updateInfo.releaseNotes} />
+                  {/* Business */}
+                  <div className="rounded-md border-2 border-primary/50 bg-primary/8 dark:border-primary/40 dark:bg-primary/10 p-2.5 flex flex-col relative">
+                    <span className="absolute -top-2.5 left-1/2 -translate-x-1/2 bg-primary text-primary-foreground text-[8px] font-semibold px-2.5 py-0.5 rounded-full whitespace-nowrap shadow-sm">
+                      {t("settingsPage.account.pricing.business.badge")}
+                    </span>
+                    <p className="text-xs font-semibold text-foreground">
+                      {t("settingsPage.account.pricing.business.name")}
+                    </p>
+                    <button
+                      onClick={() =>
+                        setBillingState((prev) => ({ ...prev, business: !prev.business }))
+                      }
+                      role="switch"
+                      aria-checked={billingState.business}
+                      className="flex items-center gap-1.5 mt-1"
+                    >
+                      <div
+                        className={`relative w-7 h-4 rounded-full transition-colors ${billingState.business ? "bg-primary" : "bg-muted"}`}
+                      >
+                        <div
+                          className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform ${billingState.business ? "translate-x-3" : ""}`}
+                        />
                       </div>
+                      <span className="text-[9px] text-muted-foreground">
+                        {t("settingsPage.account.pricing.billedYearly")}
+                      </span>
+                    </button>
+                    <div className="flex items-baseline gap-0.5 mt-1">
+                      <span className="text-lg font-bold text-foreground">
+                        {billingState.business
+                          ? t("settingsPage.account.pricing.business.annualEquivalent")
+                          : t("settingsPage.account.pricing.business.monthlyPrice")}
+                      </span>
+                      <span className="text-[9px] text-muted-foreground">
+                        {t("settingsPage.account.pricing.business.monthlyPeriod")}
+                      </span>
                     </div>
-                  )}
-                </SettingsPanelRow>
-              </SettingsPanel>
-            </div>
+                    <p className="text-[9px] text-muted-foreground/70 mt-1.5">
+                      {t("settingsPage.account.pricing.business.includesPrefix")}
+                    </p>
+                    <ul className="space-y-0.5 mt-1 flex-1">
+                      {(
+                        t("settingsPage.account.pricing.business.features", {
+                          returnObjects: true,
+                        }) as string[]
+                      ).map((feature, i) => (
+                        <li
+                          key={i}
+                          className="flex items-start gap-1 text-[10px] text-muted-foreground leading-tight"
+                        >
+                          <Check size={9} className="mt-[2px] text-primary shrink-0" />
+                          {feature}
+                        </li>
+                      ))}
+                    </ul>
+                    {usage?.isSubscribed && usage?.plan === "business" && !usage?.isTrial ? (
+                      <div className="mt-2 text-center">
+                        <span className="text-[9px] font-medium text-primary">
+                          {t("settingsPage.account.pricing.currentPlan")}
+                        </span>
+                      </div>
+                    ) : usage?.isSubscribed && usage?.plan === "pro" && !usage?.isTrial ? (
+                      <Button
+                        onClick={() =>
+                          handleSwitchPlan(billingState.business ? "annual" : "monthly", "business")
+                        }
+                        disabled={previewLoading || usage.checkoutLoading}
+                        size="sm"
+                        className="mt-2 w-full h-6 text-[10px]"
+                      >
+                        {previewLoading ? (
+                          <Loader2 size={10} className="animate-spin" />
+                        ) : (
+                          t("settingsPage.account.pricing.upgrade")
+                        )}
+                      </Button>
+                    ) : (
+                      <Button
+                        onClick={() =>
+                          handleCheckout(billingState.business ? "annual" : "monthly", "business")
+                        }
+                        disabled={checkoutTier === "business"}
+                        size="sm"
+                        className="mt-2 w-full h-6 text-[10px]"
+                      >
+                        {checkoutTier === "business" ? (
+                          <Loader2 size={10} className="animate-spin" />
+                        ) : (
+                          t("settingsPage.account.pricing.business.cta")
+                        )}
+                      </Button>
+                    )}
+                  </div>
 
+                  {/* Enterprise */}
+                  <div className="rounded-md border border-border/50 dark:border-border-subtle/60 bg-card/30 dark:bg-surface-2/30 p-2.5 flex flex-col">
+                    <p className="text-xs font-semibold text-foreground">
+                      {t("settingsPage.account.pricing.enterprise.name")}
+                    </p>
+                    <p className="text-[9px] text-muted-foreground mt-1">
+                      {t("settingsPage.account.pricing.enterprise.subtitle")}
+                    </p>
+                    <div className="flex items-baseline gap-0.5 mt-1">
+                      <span className="text-lg font-bold text-foreground">
+                        {t("settingsPage.account.pricing.enterprise.price")}
+                      </span>
+                    </div>
+                    <p className="text-[9px] text-muted-foreground/70 mt-1.5">
+                      {t("settingsPage.account.pricing.enterprise.includesPrefix")}
+                    </p>
+                    <ul className="space-y-0.5 mt-1 flex-1">
+                      {(
+                        t("settingsPage.account.pricing.enterprise.features", {
+                          returnObjects: true,
+                        }) as string[]
+                      ).map((feature, i) => (
+                        <li
+                          key={i}
+                          className="flex items-start gap-1 text-[10px] text-muted-foreground leading-tight"
+                        >
+                          <Check
+                            size={9}
+                            className="mt-[2px] text-purple-500 dark:text-purple-400 shrink-0"
+                          />
+                          {feature}
+                        </li>
+                      ))}
+                    </ul>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="mt-2 w-full h-6 text-[10px]"
+                      onClick={() =>
+                        window.electronAPI?.openExternal?.("https://openwhispr.com/contact-sales")
+                      }
+                    >
+                      <Mail size={10} />
+                      {t("settingsPage.account.pricing.enterprise.cta")}
+                    </Button>
+                  </div>
+                </div>
+
+                <Dialog
+                  open={!!switchPreview}
+                  onOpenChange={(open) => !open && setSwitchPreview(null)}
+                >
+                  <DialogContent className="sm:max-w-90">
+                    <DialogHeader>
+                      <DialogTitle>
+                        {t("settingsPage.account.pricing.confirmSwitch.title")}
+                      </DialogTitle>
+                      <DialogDescription>
+                        {switchPreview &&
+                          t("settingsPage.account.pricing.confirmSwitch.description", {
+                            plan: switchPreview.tier === "pro" ? "Pro" : "Business",
+                            interval:
+                              switchPreview.plan === "annual"
+                                ? t("settingsPage.account.pricing.confirmSwitch.yearly")
+                                : t("settingsPage.account.pricing.confirmSwitch.monthly"),
+                          })}
+                      </DialogDescription>
+                    </DialogHeader>
+                    {switchPreview && (
+                      <div className="rounded-lg border border-border/50 dark:border-border-subtle/60 overflow-hidden">
+                        <div className="flex justify-between items-center px-3 py-2.5 bg-muted/40 dark:bg-surface-2/50">
+                          <span className="text-xs text-muted-foreground">
+                            {switchPreview.immediateAmount < 0
+                              ? t("settingsPage.account.pricing.confirmSwitch.accountCredit")
+                              : t("settingsPage.account.pricing.confirmSwitch.chargeToday")}
+                          </span>
+                          <span
+                            className={cn(
+                              "text-sm font-semibold",
+                              switchPreview.immediateAmount < 0
+                                ? "text-emerald-600 dark:text-emerald-400"
+                                : "text-foreground"
+                            )}
+                          >
+                            {formatAmount(
+                              Math.abs(switchPreview.immediateAmount),
+                              switchPreview.currency
+                            )}
+                          </span>
+                        </div>
+                        <div className="divide-y divide-border/40">
+                          <div className="flex justify-between items-center px-3 py-2">
+                            <span className="text-xs text-muted-foreground">
+                              {t("settingsPage.account.pricing.confirmSwitch.newPrice")}
+                            </span>
+                            <span className="text-xs font-medium text-foreground">
+                              {formatAmount(switchPreview.newPriceAmount, switchPreview.currency)}/
+                              {switchPreview.newInterval === "year"
+                                ? t("settingsPage.account.pricing.confirmSwitch.yr")
+                                : t("settingsPage.account.pricing.confirmSwitch.mo")}
+                            </span>
+                          </div>
+                          {switchPreview.nextBillingDate && (
+                            <div className="flex justify-between items-center px-3 py-2">
+                              <span className="text-xs text-muted-foreground">
+                                {t("settingsPage.account.pricing.confirmSwitch.nextBilling")}
+                              </span>
+                              <span className="text-xs font-medium text-foreground">
+                                {new Date(switchPreview.nextBillingDate).toLocaleDateString()}
+                              </span>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                    <DialogFooter>
+                      <Button variant="outline" size="sm" onClick={() => setSwitchPreview(null)}>
+                        {t("settingsPage.account.pricing.confirmSwitch.cancel")}
+                      </Button>
+                      <Button
+                        size="sm"
+                        onClick={confirmSwitchPlan}
+                        disabled={usage?.checkoutLoading}
+                      >
+                        {usage?.checkoutLoading ? (
+                          <Loader2 size={14} className="animate-spin" />
+                        ) : (
+                          t("settingsPage.account.pricing.confirmSwitch.confirm")
+                        )}
+                      </Button>
+                    </DialogFooter>
+                  </DialogContent>
+                </Dialog>
+
+                {isSignedIn ? (
+                  <>
+                    <SectionHeader title={t("settingsPage.account.planTitle")} />
+                    {!usage || !usage.hasLoaded ? (
+                      <SettingsPanel>
+                        <SettingsPanelRow>
+                          <div className="flex items-center justify-between">
+                            <Skeleton className="h-4 w-24" />
+                            <Skeleton className="h-5 w-16 rounded-full" />
+                          </div>
+                        </SettingsPanelRow>
+                        <SettingsPanelRow>
+                          <div className="space-y-2">
+                            <Skeleton className="h-3 w-48" />
+                            <Skeleton className="h-8 w-full rounded" />
+                          </div>
+                        </SettingsPanelRow>
+                      </SettingsPanel>
+                    ) : (
+                      <SettingsPanel>
+                        {usage.isPastDue && (
+                          <SettingsPanelRow>
+                            <Alert
+                              variant="warning"
+                              className="dark:bg-amber-950/50 dark:border-amber-800 dark:text-amber-200 dark:[&>svg]:text-amber-400"
+                            >
+                              <AlertTriangle className="h-4 w-4" />
+                              <AlertTitle>{t("settingsPage.account.pastDue.title")}</AlertTitle>
+                              <AlertDescription>
+                                {t("settingsPage.account.pastDue.description")}
+                              </AlertDescription>
+                            </Alert>
+                          </SettingsPanelRow>
+                        )}
+
+                        <SettingsPanelRow>
+                          <SettingsRow
+                            label={
+                              usage.isTrial
+                                ? t("settingsPage.account.planLabels.trial")
+                                : usage.isPastDue
+                                  ? t("settingsPage.account.planLabels.free")
+                                  : usage.isSubscribed
+                                    ? usage.plan === "business"
+                                      ? t("settingsPage.account.planLabels.business")
+                                      : t("settingsPage.account.planLabels.pro")
+                                    : t("settingsPage.account.planLabels.free")
+                            }
+                            description={
+                              usage.isTrial
+                                ? t("settingsPage.account.planDescriptions.trial", {
+                                    days: usage.trialDaysLeft,
+                                  })
+                                : usage.isPastDue
+                                  ? t("settingsPage.account.planDescriptions.pastDue", {
+                                      used: usage.wordsUsed.toLocaleString(i18n.language),
+                                      limit: usage.limit.toLocaleString(i18n.language),
+                                    })
+                                  : usage.isSubscribed
+                                    ? usage.currentPeriodEnd
+                                      ? t("settingsPage.account.planDescriptions.nextBilling", {
+                                          date: new Date(usage.currentPeriodEnd).toLocaleDateString(
+                                            i18n.language,
+                                            { month: "short", day: "numeric", year: "numeric" }
+                                          ),
+                                        })
+                                      : t("settingsPage.account.planDescriptions.unlimited")
+                                    : t("settingsPage.account.planDescriptions.freeUsage", {
+                                        used: usage.wordsUsed.toLocaleString(i18n.language),
+                                        limit: usage.limit.toLocaleString(i18n.language),
+                                      })
+                            }
+                          >
+                            {usage.isTrial ? (
+                              <Badge variant="info">{t("settingsPage.account.badges.trial")}</Badge>
+                            ) : usage.isPastDue ? (
+                              <Badge variant="destructive">
+                                {t("settingsPage.account.badges.pastDue")}
+                              </Badge>
+                            ) : usage.isSubscribed ? (
+                              <Badge variant="success">
+                                {usage.plan === "business"
+                                  ? t("settingsPage.account.badges.business")
+                                  : t("settingsPage.account.badges.pro")}
+                              </Badge>
+                            ) : usage.isOverLimit ? (
+                              <Badge variant="warning">
+                                {t("settingsPage.account.badges.limitReached")}
+                              </Badge>
+                            ) : (
+                              <Badge variant="outline">
+                                {t("settingsPage.account.badges.free")}
+                              </Badge>
+                            )}
+                          </SettingsRow>
+                        </SettingsPanelRow>
+
+                        {!usage.isSubscribed && !usage.isTrial && (
+                          <SettingsPanelRow>
+                            <div className="space-y-1.5">
+                              <Progress
+                                value={
+                                  usage.limit > 0
+                                    ? Math.min(100, (usage.wordsUsed / usage.limit) * 100)
+                                    : 0
+                                }
+                                className={cn(
+                                  "h-1.5",
+                                  usage.isOverLimit
+                                    ? "[&>div]:bg-destructive"
+                                    : usage.isApproachingLimit
+                                      ? "[&>div]:bg-warning"
+                                      : "[&>div]:bg-primary"
+                                )}
+                              />
+                              <div className="flex items-center justify-between text-xs text-muted-foreground">
+                                <span className="tabular-nums">
+                                  {usage.wordsUsed.toLocaleString(i18n.language)} /{" "}
+                                  {usage.limit.toLocaleString(i18n.language)}
+                                </span>
+                                {usage.isApproachingLimit && (
+                                  <span className="text-warning">
+                                    {t("settingsPage.account.wordsRemaining", {
+                                      remaining: usage.wordsRemaining.toLocaleString(i18n.language),
+                                    })}
+                                  </span>
+                                )}
+                                {!usage.isApproachingLimit && !usage.isOverLimit && (
+                                  <span>{t("settingsPage.account.rollingWeeklyLimit")}</span>
+                                )}
+                              </div>
+                            </div>
+                          </SettingsPanelRow>
+                        )}
+
+                        <SettingsPanelRow>
+                          {usage.isPastDue ? (
+                            <Button
+                              onClick={async () => {
+                                setIsOpeningBilling(true);
+                                try {
+                                  const result = await usage.openBillingPortal();
+                                  if (!result.success) {
+                                    toast({
+                                      title: t("settingsPage.account.billing.couldNotOpenTitle"),
+                                      description: t(
+                                        "settingsPage.account.billing.couldNotOpenDescription"
+                                      ),
+                                      variant: "destructive",
+                                    });
+                                  }
+                                } finally {
+                                  setIsOpeningBilling(false);
+                                }
+                              }}
+                              disabled={isOpeningBilling}
+                              size="sm"
+                              className="w-full"
+                            >
+                              {isOpeningBilling ? (
+                                <>
+                                  <Loader2 size={14} className="animate-spin" />
+                                  {t("settingsPage.account.billing.opening")}
+                                </>
+                              ) : (
+                                t("settingsPage.account.billing.updatePaymentMethod")
+                              )}
+                            </Button>
+                          ) : usage.isSubscribed && !usage.isTrial ? (
+                            <Button
+                              onClick={async () => {
+                                const result = await usage.openBillingPortal();
+                                if (!result.success) {
+                                  toast({
+                                    title: t("settingsPage.account.billing.couldNotOpenTitle"),
+                                    description: t(
+                                      "settingsPage.account.billing.couldNotOpenDescription"
+                                    ),
+                                    variant: "destructive",
+                                  });
+                                }
+                              }}
+                              variant="outline"
+                              size="sm"
+                              className="w-full"
+                              disabled={usage.checkoutLoading}
+                            >
+                              {usage.checkoutLoading
+                                ? t("settingsPage.account.billing.opening")
+                                : t("settingsPage.account.billing.manageBilling")}
+                            </Button>
+                          ) : (
+                            <Button
+                              onClick={async () => {
+                                setCheckoutTier("plan-upgrade");
+                                const result = await usage.openCheckout({
+                                  plan: billingState.pro ? "annual" : "monthly",
+                                  tier: "pro",
+                                });
+                                setCheckoutTier(null);
+                                if (!result.success) {
+                                  toast({
+                                    title: t("settingsPage.account.checkout.couldNotOpenTitle"),
+                                    description: t(
+                                      "settingsPage.account.checkout.couldNotOpenDescription"
+                                    ),
+                                    variant: "destructive",
+                                  });
+                                }
+                              }}
+                              size="sm"
+                              className="w-full"
+                              disabled={checkoutTier === "plan-upgrade"}
+                            >
+                              {checkoutTier === "plan-upgrade"
+                                ? t("settingsPage.account.checkout.opening")
+                                : t("settingsPage.account.checkout.upgradeToPro")}
+                            </Button>
+                          )}
+                        </SettingsPanelRow>
+                      </SettingsPanel>
+                    )}
+                  </>
+                ) : null}
+              </>
+            ) : (
+              <>
+                <SectionHeader title={t("settingsPage.account.pricing.title")} />
+                <SettingsPanel>
+                  <SettingsPanelRow>
+                    <div className="flex items-center justify-between">
+                      <Skeleton className="h-4 w-32" />
+                      <Skeleton className="h-5 w-16 rounded-full" />
+                    </div>
+                  </SettingsPanelRow>
+                </SettingsPanel>
+              </>
+            )}
+          </div>
+        );
+
+      case "workspace":
+        return WORKSPACES_ENABLED ? <WorkspaceSection initialSubTab={initialSubTab} /> : null;
+
+      case "general":
+        return (
+          <div className="space-y-6">
             {/* Appearance */}
             <div>
               <SectionHeader
@@ -1528,8 +2294,8 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                             key={option.value}
                             onClick={() => setTheme(option.value)}
                             className={`
-                              flex items-center gap-1 px-2.5 py-1 rounded-[5px] text-[11px] font-medium
-                              transition-all duration-100
+                              flex items-center gap-1 px-2.5 py-1 rounded-[5px] text-xs font-medium
+                              transition-colors duration-100
                               ${
                                 isSelected
                                   ? "bg-background dark:bg-surface-raised text-foreground shadow-sm"
@@ -1560,6 +2326,120 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                     <Toggle checked={audioCuesEnabled} onChange={setAudioCuesEnabled} />
                   </SettingsRow>
                 </SettingsPanelRow>
+                <SettingsPanelRow>
+                  <SettingsRow
+                    label={t("settingsPage.general.soundEffects.pauseMedia")}
+                    description={t("settingsPage.general.soundEffects.pauseMediaDescription")}
+                  >
+                    <Toggle checked={pauseMediaOnDictation} onChange={setPauseMediaOnDictation} />
+                  </SettingsRow>
+                </SettingsPanelRow>
+              </SettingsPanel>
+            </div>
+
+            {/* Meeting Detection */}
+            <div>
+              <SectionHeader
+                title={t("calendar.detection.title")}
+                description={t("calendar.detection.description")}
+              />
+              <SettingsPanel>
+                <SettingsPanelRow>
+                  <SettingsRow
+                    label={t("calendar.detection.audioDetection")}
+                    description={t("calendar.detection.audioDescription")}
+                  >
+                    <Toggle
+                      checked={meetingAudioDetection}
+                      onChange={(value) => {
+                        setMeetingAudioDetection(value);
+                        window.electronAPI?.meetingDetectionSetPreferences?.({
+                          audioDetection: value,
+                        });
+                      }}
+                    />
+                  </SettingsRow>
+                </SettingsPanelRow>
+              </SettingsPanel>
+            </div>
+
+            {/* Clipboard */}
+            <div>
+              <SectionHeader title={t("settingsPage.general.clipboard.title")} />
+              <SettingsPanel>
+                <SettingsPanelRow>
+                  <SettingsRow
+                    label={t("settingsPage.general.clipboard.autoPaste")}
+                    description={t("settingsPage.general.clipboard.autoPasteDescription")}
+                  >
+                    <Toggle checked={autoPasteEnabled} onChange={setAutoPasteEnabled} />
+                  </SettingsRow>
+                </SettingsPanelRow>
+                <SettingsPanelRow>
+                  <SettingsRow
+                    label={t("settingsPage.general.clipboard.keepInClipboard")}
+                    description={t("settingsPage.general.clipboard.keepInClipboardDescription")}
+                  >
+                    <Toggle
+                      checked={keepTranscriptionInClipboard}
+                      onChange={setKeepTranscriptionInClipboard}
+                    />
+                  </SettingsRow>
+                </SettingsPanelRow>
+              </SettingsPanel>
+            </div>
+
+            {/* Save Notes as Files */}
+            <div>
+              <SectionHeader title={t("settings.noteFiles.title")} />
+              <SettingsPanel>
+                <SettingsPanelRow>
+                  <SettingsRow
+                    label={t("settings.noteFiles.title")}
+                    description={t("settings.noteFiles.description")}
+                  >
+                    <Toggle checked={noteFilesEnabled} onChange={handleNoteFilesToggle} />
+                  </SettingsRow>
+                </SettingsPanelRow>
+                {noteFilesEnabled && (
+                  <>
+                    <SettingsPanelRow>
+                      <SettingsRow
+                        label={t("settings.noteFiles.path")}
+                        description={noteFilesPath || noteFilesDefaultPath || "..."}
+                      >
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-7 text-xs"
+                          onClick={handleNoteFilesChangePath}
+                        >
+                          {t("settings.noteFiles.changePath")}
+                        </Button>
+                      </SettingsRow>
+                    </SettingsPanelRow>
+                    <SettingsPanelRow>
+                      <SettingsRow
+                        label={t("settings.noteFiles.rebuild")}
+                        description={t("settings.noteFiles.rebuildDescription")}
+                      >
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-7 text-xs"
+                          disabled={noteFilesRebuilding}
+                          onClick={handleNoteFilesRebuild}
+                        >
+                          {noteFilesRebuilding ? (
+                            <Loader2 className="h-3 w-3 animate-spin" />
+                          ) : (
+                            t("settings.noteFiles.rebuild")
+                          )}
+                        </Button>
+                      </SettingsRow>
+                    </SettingsPanelRow>
+                  </>
+                )}
               </SettingsPanel>
             </div>
 
@@ -1576,6 +2456,32 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                     description={t("settingsPage.general.floatingIcon.autoHideDescription")}
                   >
                     <Toggle checked={floatingIconAutoHide} onChange={setFloatingIconAutoHide} />
+                  </SettingsRow>
+                </SettingsPanelRow>
+                <SettingsPanelRow>
+                  <SettingsRow
+                    label={t("settingsPage.general.floatingIcon.startPosition")}
+                    description={t("settingsPage.general.floatingIcon.startPositionDescription")}
+                  >
+                    <select
+                      value={panelStartPosition}
+                      onChange={(e) =>
+                        setPanelStartPosition(
+                          e.target.value as "bottom-right" | "center" | "bottom-left"
+                        )
+                      }
+                      className="h-7 rounded border border-border/70 bg-surface-1/80 px-2.5 text-xs font-medium text-foreground shadow-sm backdrop-blur-sm hover:border-border-hover hover:bg-surface-2/70 focus:outline-none focus:ring-2 focus:ring-ring/30 focus:ring-offset-1 transition-colors duration-200"
+                    >
+                      <option value="bottom-right">
+                        {t("settingsPage.general.floatingIcon.bottomRight")}
+                      </option>
+                      <option value="center">
+                        {t("settingsPage.general.floatingIcon.center")}
+                      </option>
+                      <option value="bottom-left">
+                        {t("settingsPage.general.floatingIcon.bottomLeft")}
+                      </option>
+                    </select>
                   </SettingsRow>
                 </SettingsPanelRow>
               </SettingsPanel>
@@ -1617,40 +2523,14 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
               </SettingsPanel>
             </div>
 
-            {/* Dictation Hotkey */}
+            {/* Startup */}
             <div>
               <SectionHeader
-                title={t("settingsPage.general.hotkey.title")}
-                description={t("settingsPage.general.hotkey.description")}
+                title={t("settingsPage.general.startup.title")}
+                description={t("settingsPage.general.startup.description")}
               />
               <SettingsPanel>
-                <SettingsPanelRow>
-                  <HotkeyInput
-                    value={dictationKey}
-                    onChange={async (newHotkey) => {
-                      await registerHotkey(newHotkey);
-                    }}
-                    disabled={isHotkeyRegistering}
-                    validate={validateHotkeyForInput}
-                  />
-                </SettingsPanelRow>
-
-                {!isUsingGnomeHotkeys && (
-                  <SettingsPanelRow>
-                    <p className="text-[11px] font-medium text-muted-foreground/80 mb-2">
-                      {t("settingsPage.general.hotkey.activationMode")}
-                    </p>
-                    <ActivationModeSelector value={activationMode} onChange={setActivationMode} />
-                  </SettingsPanelRow>
-                )}
-              </SettingsPanel>
-            </div>
-
-            {/* Startup */}
-            {platform !== "linux" && (
-              <div>
-                <SectionHeader title={t("settingsPage.general.startup.title")} />
-                <SettingsPanel>
+                {platform !== "linux" && (
                   <SettingsPanelRow>
                     <SettingsRow
                       label={t("settingsPage.general.startup.launchAtLogin")}
@@ -1663,9 +2543,17 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                       />
                     </SettingsRow>
                   </SettingsPanelRow>
-                </SettingsPanel>
-              </div>
-            )}
+                )}
+                <SettingsPanelRow>
+                  <SettingsRow
+                    label={t("settingsPage.general.startup.startMinimized")}
+                    description={t("settingsPage.general.startup.startMinimizedDescription")}
+                  >
+                    <Toggle checked={startMinimized} onChange={setStartMinimized} />
+                  </SettingsRow>
+                </SettingsPanelRow>
+              </SettingsPanel>
+            </div>
 
             {/* Microphone */}
             <div>
@@ -1684,472 +2572,1163 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                 </SettingsPanelRow>
               </SettingsPanel>
             </div>
-          </div>
-        );
 
-      case "transcription":
-        return (
-          <TranscriptionSection
-            isSignedIn={isSignedIn ?? false}
-            cloudTranscriptionMode={cloudTranscriptionMode}
-            setCloudTranscriptionMode={setCloudTranscriptionMode}
-            useLocalWhisper={useLocalWhisper}
-            setUseLocalWhisper={setUseLocalWhisper}
-            updateTranscriptionSettings={updateTranscriptionSettings}
-            cloudTranscriptionProvider={cloudTranscriptionProvider}
-            setCloudTranscriptionProvider={setCloudTranscriptionProvider}
-            cloudTranscriptionModel={cloudTranscriptionModel}
-            setCloudTranscriptionModel={setCloudTranscriptionModel}
-            localTranscriptionProvider={localTranscriptionProvider}
-            setLocalTranscriptionProvider={setLocalTranscriptionProvider}
-            whisperModel={whisperModel}
-            setWhisperModel={setWhisperModel}
-            parakeetModel={parakeetModel}
-            setParakeetModel={setParakeetModel}
-            openaiApiKey={openaiApiKey}
-            setOpenaiApiKey={setOpenaiApiKey}
-            groqApiKey={groqApiKey}
-            setGroqApiKey={setGroqApiKey}
-            mistralApiKey={mistralApiKey}
-            setMistralApiKey={setMistralApiKey}
-            customTranscriptionApiKey={customTranscriptionApiKey}
-            setCustomTranscriptionApiKey={setCustomTranscriptionApiKey}
-            cloudTranscriptionBaseUrl={cloudTranscriptionBaseUrl}
-            setCloudTranscriptionBaseUrl={setCloudTranscriptionBaseUrl}
-            toast={toast}
-          />
-        );
-
-      case "dictionary":
-        return (
-          <div className="space-y-5">
-            <SectionHeader
-              title={t("settingsPage.dictionary.title")}
-              description={t("settingsPage.dictionary.description")}
-            />
-
-            {/* Add Words */}
-            <SettingsPanel>
-              <SettingsPanelRow>
-                <div className="space-y-2">
-                  <p className="text-[12px] font-medium text-foreground">
-                    {t("settingsPage.dictionary.addWordOrPhrase")}
-                  </p>
-                  <div className="flex gap-2">
-                    <Input
-                      placeholder={t("settingsPage.dictionary.placeholder")}
-                      value={newDictionaryWord}
-                      onChange={(e) => setNewDictionaryWord(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") {
-                          handleAddDictionaryWord();
-                        }
-                      }}
-                      className="flex-1 h-8 text-[12px]"
-                    />
-                    <Button
-                      onClick={handleAddDictionaryWord}
-                      disabled={!newDictionaryWord.trim()}
-                      size="sm"
-                      className="h-8"
-                    >
-                      {t("settingsPage.dictionary.add")}
-                    </Button>
-                  </div>
-                  <p className="text-[10px] text-muted-foreground/50">
-                    {t("settingsPage.dictionary.pressEnterToAdd")}
-                  </p>
-                </div>
-              </SettingsPanelRow>
-            </SettingsPanel>
-
-            {/* Word List */}
+            {/* Dictionary */}
             <div>
-              <div className="flex items-center justify-between mb-2">
-                <p className="text-[12px] font-medium text-foreground">
-                  {t("settingsPage.dictionary.yourWords")}
-                  {customDictionary.length > 0 && (
-                    <span className="ml-1.5 text-muted-foreground/50 font-normal text-[11px]">
-                      {customDictionary.length}
-                    </span>
-                  )}
-                </p>
-                {customDictionary.length > 0 && (
-                  <button
-                    onClick={() => {
-                      showConfirmDialog({
-                        title: t("settingsPage.dictionary.clearDictionaryTitle"),
-                        description: t("settingsPage.dictionary.clearDictionaryDescription"),
-                        confirmText: t("settingsPage.dictionary.clearAll"),
-                        variant: "destructive",
-                        onConfirm: () =>
-                          setCustomDictionary(customDictionary.filter((w) => w === agentName)),
-                      });
-                    }}
-                    className="text-[10px] text-muted-foreground/40 hover:text-destructive transition-colors"
-                  >
-                    {t("settingsPage.dictionary.clearAll")}
-                  </button>
-                )}
-              </div>
-
-              {customDictionary.length > 0 ? (
-                <SettingsPanel>
-                  <SettingsPanelRow>
-                    <div className="flex flex-wrap gap-1">
-                      {customDictionary.map((word) => {
-                        const isAgentName = word === agentName;
-                        return (
-                          <span
-                            key={word}
-                            className={`group inline-flex items-center gap-0.5 py-0.5 rounded-[5px] text-[11px] border transition-all ${
-                              isAgentName
-                                ? "pl-2 pr-2 bg-primary/10 dark:bg-primary/15 text-primary border-primary/20 dark:border-primary/30"
-                                : "pl-2 pr-1 bg-primary/5 dark:bg-primary/10 text-foreground border-border/30 dark:border-border-subtle hover:border-destructive/40 hover:bg-destructive/5"
-                            }`}
-                            title={
-                              isAgentName
-                                ? t("settingsPage.dictionary.agentNameAutoManaged")
-                                : undefined
-                            }
-                          >
-                            {word}
-                            {!isAgentName && (
-                              <button
-                                onClick={() => handleRemoveDictionaryWord(word)}
-                                className="ml-0.5 p-0.5 rounded-sm text-muted-foreground/40 hover:text-destructive transition-colors"
-                                title={t("settingsPage.dictionary.removeWord")}
-                              >
-                                <svg
-                                  width="9"
-                                  height="9"
-                                  viewBox="0 0 24 24"
-                                  fill="none"
-                                  stroke="currentColor"
-                                  strokeWidth="2.5"
-                                  strokeLinecap="round"
-                                >
-                                  <path d="M18 6L6 18M6 6l12 12" />
-                                </svg>
-                              </button>
-                            )}
-                          </span>
-                        );
-                      })}
-                    </div>
-                  </SettingsPanelRow>
-                </SettingsPanel>
-              ) : (
-                <div className="rounded-lg border border-dashed border-border/40 dark:border-border-subtle py-6 flex flex-col items-center justify-center text-center">
-                  <p className="text-[11px] text-muted-foreground/50">
-                    {t("settingsPage.dictionary.noWords")}
-                  </p>
-                  <p className="text-[10px] text-muted-foreground/40 mt-0.5">
-                    {t("settingsPage.dictionary.wordsAppearHere")}
-                  </p>
-                </div>
-              )}
-            </div>
-
-            {/* How it works */}
-            <div>
-              <SectionHeader title={t("settingsPage.dictionary.howItWorksTitle")} />
-              <SettingsPanel>
-                <SettingsPanelRow>
-                  <p className="text-[12px] text-muted-foreground leading-relaxed">
-                    {t("settingsPage.dictionary.howItWorksDescription")}
-                  </p>
-                </SettingsPanelRow>
-                <SettingsPanelRow>
-                  <p className="text-[12px] text-muted-foreground leading-relaxed">
-                    <span className="font-medium text-foreground">
-                      {t("settingsPage.dictionary.tipLabel")}
-                    </span>{" "}
-                    {t("settingsPage.dictionary.tipDescription")}
-                  </p>
-                </SettingsPanelRow>
-              </SettingsPanel>
-            </div>
-          </div>
-        );
-
-      case "aiModels":
-        return (
-          <AiModelsSection
-            isSignedIn={isSignedIn ?? false}
-            cloudReasoningMode={cloudReasoningMode}
-            setCloudReasoningMode={setCloudReasoningMode}
-            useReasoningModel={useReasoningModel}
-            setUseReasoningModel={(value) => {
-              setUseReasoningModel(value);
-              updateReasoningSettings({ useReasoningModel: value });
-            }}
-            reasoningModel={reasoningModel}
-            setReasoningModel={setReasoningModel}
-            reasoningProvider={reasoningProvider}
-            setReasoningProvider={setReasoningProvider}
-            cloudReasoningBaseUrl={cloudReasoningBaseUrl}
-            setCloudReasoningBaseUrl={setCloudReasoningBaseUrl}
-            openaiApiKey={openaiApiKey}
-            setOpenaiApiKey={setOpenaiApiKey}
-            anthropicApiKey={anthropicApiKey}
-            setAnthropicApiKey={setAnthropicApiKey}
-            geminiApiKey={geminiApiKey}
-            setGeminiApiKey={setGeminiApiKey}
-            groqApiKey={groqApiKey}
-            setGroqApiKey={setGroqApiKey}
-            customReasoningApiKey={customReasoningApiKey}
-            setCustomReasoningApiKey={setCustomReasoningApiKey}
-            showAlertDialog={showAlertDialog}
-            toast={toast}
-          />
-        );
-
-      case "agentConfig":
-        return (
-          <div className="space-y-5">
-            <SectionHeader
-              title={t("settingsPage.agentConfig.title")}
-              description={t("settingsPage.agentConfig.description")}
-            />
-
-            {/* Agent Name */}
-            <div>
-              <p className="text-[13px] font-medium text-foreground mb-3">
-                {t("settingsPage.agentConfig.agentName")}
-              </p>
-              <SettingsPanel>
-                <SettingsPanelRow>
-                  <div className="space-y-3">
-                    <div className="flex gap-2">
-                      <Input
-                        placeholder={t("settingsPage.agentConfig.placeholder")}
-                        value={agentNameInput}
-                        onChange={(e) => setAgentNameInput(e.target.value)}
-                        className="flex-1 text-center text-base font-mono"
-                      />
-                      <Button
-                        onClick={() => {
-                          const trimmed = agentNameInput.trim();
-                          setAgentName(trimmed);
-                          setAgentNameInput(trimmed);
-                          showAlertDialog({
-                            title: t("settingsPage.agentConfig.dialogs.updatedTitle"),
-                            description: t("settingsPage.agentConfig.dialogs.updatedDescription", {
-                              name: trimmed,
-                            }),
-                          });
-                        }}
-                        disabled={!agentNameInput.trim()}
-                        size="sm"
-                      >
-                        {t("settingsPage.agentConfig.save")}
-                      </Button>
-                    </div>
-                    <p className="text-[11px] text-muted-foreground/60">
-                      {t("settingsPage.agentConfig.helper")}
-                    </p>
-                  </div>
-                </SettingsPanelRow>
-              </SettingsPanel>
-            </div>
-
-            {/* How it works */}
-            <div>
-              <SectionHeader title={t("settingsPage.agentConfig.howItWorksTitle")} />
-              <SettingsPanel>
-                <SettingsPanelRow>
-                  <p className="text-[12px] text-muted-foreground leading-relaxed">
-                    {t("settingsPage.agentConfig.howItWorksDescription", { agentName })}
-                  </p>
-                </SettingsPanelRow>
-              </SettingsPanel>
-            </div>
-
-            {/* Examples */}
-            <div>
-              <SectionHeader title={t("settingsPage.agentConfig.examplesTitle")} />
-              <SettingsPanel>
-                <SettingsPanelRow>
-                  <div className="space-y-2.5">
-                    {[
-                      {
-                        input: `Hey ${agentName}, write a formal email about the budget`,
-                        mode: t("settingsPage.agentConfig.instructionMode"),
-                      },
-                      {
-                        input: `Hey ${agentName}, make this more professional`,
-                        mode: t("settingsPage.agentConfig.instructionMode"),
-                      },
-                      {
-                        input: `Hey ${agentName}, convert this to bullet points`,
-                        mode: t("settingsPage.agentConfig.instructionMode"),
-                      },
-                      {
-                        input: t("settingsPage.agentConfig.cleanupExample"),
-                        mode: t("settingsPage.agentConfig.cleanupMode"),
-                      },
-                    ].map((example, i) => (
-                      <div key={i} className="flex items-start gap-3">
-                        <span
-                          className={`shrink-0 mt-0.5 text-[10px] font-medium uppercase tracking-wider px-1.5 py-px rounded ${
-                            example.mode === t("settingsPage.agentConfig.instructionMode")
-                              ? "bg-primary/10 text-primary dark:bg-primary/15"
-                              : "bg-muted text-muted-foreground"
-                          }`}
-                        >
-                          {example.mode}
-                        </span>
-                        <p className="text-[12px] text-muted-foreground leading-relaxed">
-                          "{example.input}"
-                        </p>
-                      </div>
-                    ))}
-                  </div>
-                </SettingsPanelRow>
-              </SettingsPanel>
-            </div>
-          </div>
-        );
-
-      case "prompts":
-        return (
-          <div className="space-y-5">
-            <SectionHeader
-              title={t("settingsPage.prompts.title")}
-              description={t("settingsPage.prompts.description")}
-            />
-
-            <PromptStudio />
-          </div>
-        );
-
-      case "privacy":
-        return (
-          <div className="space-y-6">
-            <div>
-              <h3 className="text-lg font-semibold text-foreground mb-2">
-                {t("settingsPage.privacy.title")}
-              </h3>
-              <p className="text-sm text-muted-foreground mb-6">
-                {t("settingsPage.privacy.description")}
-              </p>
-            </div>
-
-            {isSignedIn && (
+              <SectionHeader
+                title={t("settingsPage.dictionary.autoLearnTitle", {
+                  defaultValue: "Auto-learn from corrections",
+                })}
+              />
               <SettingsPanel>
                 <SettingsPanelRow>
                   <SettingsRow
-                    label={t("settingsPage.privacy.cloudBackup")}
-                    description={t("settingsPage.privacy.cloudBackupDescription")}
+                    label={t("settingsPage.dictionary.autoLearnTitle", {
+                      defaultValue: "Auto-learn from corrections",
+                    })}
+                    description={t("settingsPage.dictionary.autoLearnDescription", {
+                      defaultValue:
+                        "When you correct a transcription in the target app, the corrected word is automatically added to your dictionary.",
+                    })}
                   >
-                    <Toggle checked={cloudBackupEnabled} onChange={setCloudBackupEnabled} />
+                    <Toggle checked={autoLearnCorrections} onChange={setAutoLearnCorrections} />
                   </SettingsRow>
                 </SettingsPanelRow>
               </SettingsPanel>
-            )}
-
-            <SettingsPanel>
-              <SettingsPanelRow>
-                <SettingsRow
-                  label={t("settingsPage.privacy.usageAnalytics")}
-                  description={t("settingsPage.privacy.usageAnalyticsDescription")}
-                >
-                  <Toggle checked={telemetryEnabled} onChange={setTelemetryEnabled} />
-                </SettingsRow>
-              </SettingsPanelRow>
-            </SettingsPanel>
-          </div>
-        );
-
-      case "permissions":
-        return (
-          <div className="space-y-5">
-            <SectionHeader
-              title={t("settingsPage.permissions.title")}
-              description={t("settingsPage.permissions.description")}
-            />
-
-            {/* Permission Cards - matching onboarding style */}
-            <div className="space-y-3">
-              <PermissionCard
-                icon={Mic}
-                title={t("settingsPage.permissions.microphoneTitle")}
-                description={t("settingsPage.permissions.microphoneDescription")}
-                granted={permissionsHook.micPermissionGranted}
-                onRequest={permissionsHook.requestMicPermission}
-                buttonText={t("settingsPage.permissions.test")}
-                onOpenSettings={permissionsHook.openMicPrivacySettings}
-              />
-
-              {platform === "darwin" && (
-                <PermissionCard
-                  icon={Shield}
-                  title={t("settingsPage.permissions.accessibilityTitle")}
-                  description={t("settingsPage.permissions.accessibilityDescription")}
-                  granted={permissionsHook.accessibilityPermissionGranted}
-                  onRequest={permissionsHook.testAccessibilityPermission}
-                  buttonText={t("settingsPage.permissions.testAndGrant")}
-                  onOpenSettings={permissionsHook.openAccessibilitySettings}
-                />
-              )}
             </div>
 
-            {/* Error state for microphone */}
-            {!permissionsHook.micPermissionGranted && permissionsHook.micPermissionError && (
-              <MicPermissionWarning
-                error={permissionsHook.micPermissionError}
-                onOpenSoundSettings={permissionsHook.openSoundInputSettings}
-                onOpenPrivacySettings={permissionsHook.openMicPrivacySettings}
-              />
-            )}
-
-            {/* Linux paste tools info */}
-            {platform === "linux" &&
-              permissionsHook.pasteToolsInfo &&
-              !permissionsHook.pasteToolsInfo.available && (
-                <PasteToolsInfo
-                  pasteToolsInfo={permissionsHook.pasteToolsInfo}
-                  isChecking={permissionsHook.isCheckingPasteTools}
-                  onCheck={permissionsHook.checkPasteToolsAvailability}
-                />
-              )}
-
-            {/* Troubleshooting section for macOS */}
-            {platform === "darwin" && (
+            {/* Wayland Paste Diagnostics — only on Linux + Wayland */}
+            {ydotoolStatus?.isLinux && ydotoolStatus?.isWayland && (
               <div>
-                <p className="text-[13px] font-medium text-foreground mb-3">
-                  {t("settingsPage.permissions.troubleshootingTitle")}
-                </p>
-                <SettingsPanel>
-                  <SettingsPanelRow>
-                    <SettingsRow
-                      label={t("settingsPage.permissions.resetAccessibility.label")}
-                      description={t("settingsPage.permissions.resetAccessibility.rowDescription")}
-                    >
-                      <Button
-                        onClick={resetAccessibilityPermissions}
-                        variant="ghost"
-                        size="sm"
-                        className="text-foreground/70 hover:text-foreground"
+                <SectionHeader
+                  title={t("settingsPage.general.waylandPaste.title", {
+                    defaultValue: "Wayland Paste Setup",
+                  })}
+                  description={t("settingsPage.general.waylandPaste.description", {
+                    defaultValue:
+                      "Auto-paste on Wayland requires ydotool. Check the status of each component below.",
+                  })}
+                />
+                {(() => {
+                  const checks = [
+                    {
+                      key: "hasYdotool",
+                      label: "ydotool",
+                      ok: ydotoolStatus.hasYdotool,
+                      desc: t("settingsPage.general.waylandPaste.ydotoolDesc", {
+                        defaultValue: "Input automation tool for Wayland",
+                      }),
+                      steps: [
+                        {
+                          title: t("settingsPage.general.waylandPaste.guide.ydotool.step1Title", {
+                            defaultValue: "Install ydotool",
+                          }),
+                          desc: t("settingsPage.general.waylandPaste.guide.ydotool.step1Desc", {
+                            defaultValue:
+                              "Use your distribution's package manager to install ydotool.",
+                          }),
+                          cmds: [
+                            { label: "Ubuntu / Pop!_OS / Debian", cmd: "sudo apt install ydotool" },
+                            { label: "Fedora", cmd: "sudo dnf install ydotool" },
+                            { label: "Arch Linux", cmd: "sudo pacman -S ydotool" },
+                            { label: "openSUSE", cmd: "sudo zypper install ydotool" },
+                          ],
+                        },
+                        {
+                          title: t("settingsPage.general.waylandPaste.guide.ydotool.step2Title", {
+                            defaultValue: "Verify installation",
+                          }),
+                          desc: t("settingsPage.general.waylandPaste.guide.ydotool.step2Desc", {
+                            defaultValue: "Check that ydotool is available in your PATH.",
+                          }),
+                          cmds: [{ cmd: "which ydotool" }],
+                        },
+                      ],
+                    },
+                    {
+                      key: "hasYdotoold",
+                      label: "ydotoold",
+                      ok: ydotoolStatus.hasYdotoold,
+                      desc: t("settingsPage.general.waylandPaste.ydotooldDesc", {
+                        defaultValue: "Daemon for ydotool (separate package on Ubuntu/Pop!_OS)",
+                      }),
+                      steps: [
+                        {
+                          title: t("settingsPage.general.waylandPaste.guide.ydotoold.step1Title", {
+                            defaultValue: "Install ydotoold",
+                          }),
+                          desc: t("settingsPage.general.waylandPaste.guide.ydotoold.step1Desc", {
+                            defaultValue:
+                              "On Ubuntu and Pop!_OS, ydotoold is a separate package. On Fedora, it's included with ydotool.",
+                          }),
+                          cmds: [
+                            {
+                              label: "Ubuntu / Pop!_OS / Debian",
+                              cmd: "sudo apt install ydotoold",
+                            },
+                            { label: "Fedora", cmd: "# Already included in the ydotool package" },
+                            { label: "Arch Linux", cmd: "# Included in the ydotool package" },
+                          ],
+                        },
+                      ],
+                    },
+                    {
+                      key: "hasUinput",
+                      label: "/dev/uinput",
+                      ok: ydotoolStatus.hasUinput,
+                      desc: t("settingsPage.general.waylandPaste.uinputDesc", {
+                        defaultValue: "Kernel input device access",
+                      }),
+                      note: !ydotoolStatus.hasUinput
+                        ? ydotoolStatus.hasUdevRule
+                          ? t("settingsPage.general.waylandPaste.uinputRuleFound", {
+                              defaultValue: "Rule present but not active. A reboot should fix it.",
+                            })
+                          : t("settingsPage.general.waylandPaste.uinputRuleMissing", {
+                              defaultValue: "no udev rule found",
+                            })
+                        : undefined,
+                      steps:
+                        ydotoolStatus.hasUdevRule && !ydotoolStatus.hasUinput
+                          ? [
+                              {
+                                title: t(
+                                  "settingsPage.general.waylandPaste.guide.uinput.ruleFoundTitle",
+                                  {
+                                    defaultValue: "udev rule already configured",
+                                  }
+                                ),
+                                desc: t(
+                                  "settingsPage.general.waylandPaste.guide.uinput.ruleFoundDesc",
+                                  {
+                                    defaultValue:
+                                      "The udev rule for /dev/uinput is already on your system but hasn't taken effect. Try reloading:",
+                                  }
+                                ),
+                                cmds: [
+                                  {
+                                    cmd: "sudo udevadm control --reload-rules && sudo udevadm trigger /dev/uinput",
+                                  },
+                                ],
+                              },
+                              {
+                                title: t(
+                                  "settingsPage.general.waylandPaste.guide.uinput.rebootTitle",
+                                  {
+                                    defaultValue: "If reloading didn't help, reboot",
+                                  }
+                                ),
+                                desc: t(
+                                  "settingsPage.general.waylandPaste.guide.uinput.rebootDesc",
+                                  {
+                                    defaultValue:
+                                      "On some distros, udev changes only apply after a full reboot. Restart your computer and come back to re-check.",
+                                  }
+                                ),
+                              },
+                            ]
+                          : [
+                              {
+                                title: t(
+                                  "settingsPage.general.waylandPaste.guide.uinput.step1Title",
+                                  {
+                                    defaultValue: "Create a udev rule",
+                                  }
+                                ),
+                                desc: t(
+                                  "settingsPage.general.waylandPaste.guide.uinput.step1Desc",
+                                  {
+                                    defaultValue:
+                                      "This rule grants access to /dev/uinput for users in the input group.",
+                                  }
+                                ),
+                                cmds: [
+                                  {
+                                    cmd: 'echo \'KERNEL=="uinput", GROUP="input", MODE="0660", TAG+="uaccess"\' | sudo tee /etc/udev/rules.d/70-uinput.rules',
+                                  },
+                                ],
+                              },
+                              {
+                                title: t(
+                                  "settingsPage.general.waylandPaste.guide.uinput.step2Title",
+                                  {
+                                    defaultValue: "Reload udev rules",
+                                  }
+                                ),
+                                desc: t(
+                                  "settingsPage.general.waylandPaste.guide.uinput.step2Desc",
+                                  {
+                                    defaultValue: "Apply the new rule without rebooting.",
+                                  }
+                                ),
+                                cmds: [
+                                  {
+                                    cmd: "sudo udevadm control --reload-rules && sudo udevadm trigger /dev/uinput",
+                                  },
+                                ],
+                              },
+                            ],
+                    },
+                    {
+                      key: "hasGroup",
+                      label: t("settingsPage.general.waylandPaste.inputGroup", {
+                        defaultValue: "input group",
+                      }),
+                      ok: ydotoolStatus.hasGroup,
+                      desc: t("settingsPage.general.waylandPaste.inputGroupDesc", {
+                        defaultValue: "User must be in the input group (requires re-login)",
+                      }),
+                      steps: [
+                        {
+                          title: t("settingsPage.general.waylandPaste.guide.group.step1Title", {
+                            defaultValue: "Add your user to the input group",
+                          }),
+                          cmds: [{ cmd: "sudo usermod -aG input $USER" }],
+                        },
+                        {
+                          title: t("settingsPage.general.waylandPaste.guide.group.step2Title", {
+                            defaultValue: "Log out and back in",
+                          }),
+                          desc: t("settingsPage.general.waylandPaste.guide.group.step2Desc", {
+                            defaultValue:
+                              "Group changes only take effect after a new login session. Log out of your desktop and log back in, then reopen OpenWhispr.",
+                          }),
+                        },
+                      ],
+                    },
+                    {
+                      key: "hasService",
+                      label: t("settingsPage.general.waylandPaste.service", {
+                        defaultValue: "systemd service",
+                      }),
+                      ok: ydotoolStatus.hasService,
+                      desc: t("settingsPage.general.waylandPaste.serviceDesc", {
+                        defaultValue: "User service file for auto-starting ydotoold",
+                      }),
+                      steps: [
+                        {
+                          title: t("settingsPage.general.waylandPaste.guide.service.step1Title", {
+                            defaultValue: "Create the service directory",
+                          }),
+                          cmds: [{ cmd: "mkdir -p ~/.config/systemd/user" }],
+                        },
+                        {
+                          title: t("settingsPage.general.waylandPaste.guide.service.step2Title", {
+                            defaultValue: "Create the service file",
+                          }),
+                          desc: t("settingsPage.general.waylandPaste.guide.service.step2Desc", {
+                            defaultValue:
+                              "This creates a user-level systemd service that starts ydotoold automatically when you log in.",
+                          }),
+                          cmds: [
+                            {
+                              cmd: `cat > ~/.config/systemd/user/ydotoold.service << 'EOF'
+[Unit]
+Description=ydotoold - ydotool daemon
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/ydotoold
+Restart=on-failure
+RestartSec=1s
+
+[Install]
+WantedBy=graphical-session.target
+EOF`,
+                            },
+                          ],
+                        },
+                        {
+                          title: t("settingsPage.general.waylandPaste.guide.service.step3Title", {
+                            defaultValue: "Reload and enable",
+                          }),
+                          cmds: [
+                            {
+                              cmd: "systemctl --user daemon-reload && systemctl --user enable ydotoold",
+                            },
+                          ],
+                        },
+                      ],
+                    },
+                    {
+                      key: "daemonRunning",
+                      label: t("settingsPage.general.waylandPaste.daemon", {
+                        defaultValue: "ydotoold daemon",
+                      }),
+                      ok: ydotoolStatus.daemonRunning,
+                      desc: t("settingsPage.general.waylandPaste.daemonDesc", {
+                        defaultValue: "Background service must be running",
+                      }),
+                      steps: [
+                        {
+                          title: t("settingsPage.general.waylandPaste.guide.daemon.step1Title", {
+                            defaultValue: "Start the daemon",
+                          }),
+                          desc: t("settingsPage.general.waylandPaste.guide.daemon.step1Desc", {
+                            defaultValue: "Start ydotoold and enable it so it runs on every login.",
+                          }),
+                          cmds: [
+                            {
+                              cmd: "systemctl --user enable ydotoold && systemctl --user start ydotoold",
+                            },
+                            {
+                              label: "Arch Linux (service is named ydotool.service)",
+                              cmd: "systemctl --user enable --now ydotool.service",
+                            },
+                          ],
+                        },
+                        {
+                          title: t("settingsPage.general.waylandPaste.guide.daemon.step2Title", {
+                            defaultValue: "Verify it's running",
+                          }),
+                          cmds: [
+                            { cmd: "systemctl --user status ydotoold" },
+                            {
+                              label: "Arch Linux",
+                              cmd: "systemctl --user status ydotool.service",
+                            },
+                          ],
+                        },
+                      ],
+                    },
+                  ];
+
+                  if (ydotoolStatus.isKde) {
+                    checks.push({
+                      key: "hasXclip",
+                      label: "xclip",
+                      ok: ydotoolStatus.hasXclip || ydotoolStatus.hasXsel || false,
+                      desc: t("settingsPage.general.waylandPaste.xclipDesc", {
+                        defaultValue: "Clipboard tool for KDE Wayland paste (xclip or xsel)",
+                      }),
+                      steps: [
+                        {
+                          title: t("settingsPage.general.waylandPaste.guide.xclip.step1Title", {
+                            defaultValue: "Install xclip",
+                          }),
+                          cmds: [
+                            { cmd: "sudo dnf install xclip  # Fedora" },
+                            { cmd: "sudo apt install xclip  # Debian/Ubuntu" },
+                          ],
+                        },
+                      ],
+                    });
+                  }
+
+                  const allOk = checks.every((c) => c.ok);
+                  const activeGuide = checks.find((c) => c.key === ydotoolGuideKey);
+
+                  return (
+                    <>
+                      {allOk ? (
+                        <SettingsPanel>
+                          <SettingsPanelRow>
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center gap-2">
+                                <CircleCheck className="h-4 w-4 text-emerald-500" />
+                                <span className="text-sm">
+                                  {t("settingsPage.general.waylandPaste.allGoodDesc", {
+                                    defaultValue: "Auto-paste is ready to go.",
+                                  })}
+                                </span>
+                              </div>
+                              <button
+                                onClick={refreshYdotoolStatus}
+                                className="shrink-0 text-muted-foreground hover:text-foreground transition-colors"
+                              >
+                                <RotateCw className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          </SettingsPanelRow>
+                        </SettingsPanel>
+                      ) : (
+                        <>
+                          <div className="rounded-xl border border-border overflow-hidden">
+                            <div className="divide-y divide-border">
+                              {checks.map((item) => (
+                                <div key={item.key} className="px-4 py-3">
+                                  <div className="flex items-center gap-2.5">
+                                    {item.ok ? (
+                                      <CircleCheck className="h-4 w-4 shrink-0 text-emerald-500" />
+                                    ) : (
+                                      <CircleX className="h-4 w-4 shrink-0 text-red-500" />
+                                    )}
+                                    <div className="flex-1 min-w-0">
+                                      <span className="text-sm font-medium">{item.label}</span>
+                                      <span className="text-xs text-muted-foreground ml-2">
+                                        {item.desc}
+                                      </span>
+                                      {item.note && (
+                                        <p className="text-[11px] text-amber-600 dark:text-amber-400 mt-0.5">
+                                          {item.note}
+                                        </p>
+                                      )}
+                                    </div>
+                                    {!item.ok && (
+                                      <button
+                                        onClick={() => setYdotoolGuideKey(item.key)}
+                                        className="shrink-0 flex items-center gap-1 text-xs px-2.5 py-1 rounded-md border border-border hover:bg-muted transition-colors text-foreground"
+                                      >
+                                        <BookOpen className="w-3 h-3" />
+                                        {t("settingsPage.general.waylandPaste.guide.open", {
+                                          defaultValue: "Guide",
+                                        })}
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                          <button
+                            onClick={refreshYdotoolStatus}
+                            className="flex items-center gap-1.5 mt-3 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                          >
+                            <RotateCw className="w-3 h-3" />
+                            {t("settingsPage.general.waylandPaste.recheck", {
+                              defaultValue: "Re-check",
+                            })}
+                          </button>
+                        </>
+                      )}
+
+                      {/* Step-by-step guide dialog */}
+                      <Dialog
+                        open={!!activeGuide}
+                        onOpenChange={(open) => !open && setYdotoolGuideKey(null)}
                       >
-                        {t("settingsPage.permissions.troubleshoot")}
-                      </Button>
-                    </SettingsRow>
-                  </SettingsPanelRow>
-                </SettingsPanel>
+                        <DialogContent className="sm:max-w-lg max-h-[80vh] overflow-y-auto">
+                          {activeGuide && (
+                            <>
+                              <DialogHeader>
+                                <DialogTitle className="flex items-center gap-2">
+                                  <BookOpen className="w-4 h-4" />
+                                  {activeGuide.label}
+                                </DialogTitle>
+                                <DialogDescription>{activeGuide.desc}</DialogDescription>
+                              </DialogHeader>
+                              <div className="space-y-5 mt-2">
+                                {activeGuide.steps.map((step, i) => (
+                                  <div key={i}>
+                                    <div className="flex items-start gap-3">
+                                      <span className="shrink-0 w-6 h-6 rounded-full bg-primary text-primary-foreground flex items-center justify-center text-xs font-semibold">
+                                        {i + 1}
+                                      </span>
+                                      <div className="flex-1 min-w-0">
+                                        <p className="text-sm font-medium">{step.title}</p>
+                                        {step.desc && (
+                                          <p className="text-xs text-muted-foreground mt-0.5">
+                                            {step.desc}
+                                          </p>
+                                        )}
+                                        {step.cmds && step.cmds.length > 0 && (
+                                          <div className="mt-2 space-y-2">
+                                            {step.cmds.map((c, j) => (
+                                              <div key={j}>
+                                                {c.label && (
+                                                  <p className="text-[11px] text-muted-foreground mb-1">
+                                                    {c.label}
+                                                  </p>
+                                                )}
+                                                <div className="flex items-start gap-1.5">
+                                                  <pre className="flex-1 text-[11px] bg-muted/60 rounded-md px-3 py-2 font-mono whitespace-pre-wrap break-all select-all overflow-x-auto">
+                                                    {c.cmd}
+                                                  </pre>
+                                                  <button
+                                                    onClick={() =>
+                                                      navigator.clipboard.writeText(c.cmd)
+                                                    }
+                                                    className="shrink-0 p-1.5 rounded-md hover:bg-muted transition-colors text-muted-foreground hover:text-foreground"
+                                                    title={t(
+                                                      "settingsPage.general.waylandPaste.copy",
+                                                      { defaultValue: "Copy" }
+                                                    )}
+                                                  >
+                                                    <Copy className="w-3.5 h-3.5" />
+                                                  </button>
+                                                </div>
+                                              </div>
+                                            ))}
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            </>
+                          )}
+                        </DialogContent>
+                      </Dialog>
+                    </>
+                  );
+                })()}
               </div>
             )}
           </div>
         );
 
-      case "developer":
+      case "hotkeys":
         return (
           <div className="space-y-6">
-            <DeveloperSection />
+            {/* Dictation Hotkey */}
+            <div>
+              <SectionHeader
+                title={t("settingsPage.general.hotkey.title")}
+                description={t("settingsPage.general.hotkey.description")}
+              />
+              <SettingsPanel>
+                <SettingsPanelRow>
+                  <HotkeyInput
+                    value={dictationKey}
+                    onChange={async (newHotkey) => {
+                      await registerHotkey(newHotkey);
+                    }}
+                    disabled={isHotkeyRegistering}
+                    validate={validateDictationHotkey}
+                  />
+                  {effectiveDefaultHotkey &&
+                    dictationKey &&
+                    dictationKey !== effectiveDefaultHotkey && (
+                      <button
+                        onClick={() => registerHotkey(effectiveDefaultHotkey)}
+                        disabled={isHotkeyRegistering}
+                        className="mt-2 text-xs text-muted-foreground/70 hover:text-foreground transition-colors disabled:opacity-50"
+                      >
+                        {t("settingsPage.general.hotkey.resetToDefault", {
+                          hotkey: formatHotkeyLabel(effectiveDefaultHotkey),
+                        })}
+                      </button>
+                    )}
+                </SettingsPanelRow>
 
-            {/* Data Management — moved from General */}
-            <div className="border-t border-border/40 pt-8">
+                {(!isUsingNativeShortcut || getCachedPlatform() === "linux") && (
+                  <SettingsPanelRow>
+                    <p className="text-xs font-medium text-muted-foreground/80 mb-2">
+                      {t("settingsPage.general.hotkey.activationMode")}
+                    </p>
+                    <ActivationModeSelector value={activationMode} onChange={setActivationMode} />
+                    {getCachedPlatform() === "linux" && activationMode === "push" && (
+                      <LinuxPttSetupInfo isAvailable={linuxPttAvailable} />
+                    )}
+                  </SettingsPanelRow>
+                )}
+              </SettingsPanel>
+            </div>
+
+            {/* Meeting Mode Hotkey */}
+            <div>
+              <SectionHeader
+                title={t("settingsPage.general.meetingHotkey.title")}
+                description={t("settingsPage.general.meetingHotkey.description")}
+              />
+              <SettingsPanel>
+                <SettingsPanelRow>
+                  <HotkeyInput
+                    value={meetingKey}
+                    onChange={async (newHotkey) => {
+                      await registerMeetingHotkey(newHotkey);
+                    }}
+                    disabled={isMeetingHotkeyRegistering}
+                    validate={validateMeetingHotkey}
+                  />
+                  {meetingKey && (
+                    <button
+                      onClick={async () => {
+                        await window.electronAPI?.registerMeetingHotkey?.("");
+                        setMeetingKey("");
+                      }}
+                      disabled={isMeetingHotkeyRegistering}
+                      className="mt-2 text-xs text-muted-foreground/70 hover:text-foreground transition-colors disabled:opacity-50"
+                    >
+                      {t("settingsPage.general.meetingHotkey.clear")}
+                    </button>
+                  )}
+                </SettingsPanelRow>
+                <SettingsPanelRow className="flex items-center justify-between gap-3 border-t border-border/40 dark:border-white/5">
+                  <span className="text-xs text-muted-foreground/80">
+                    {t("settingsPage.general.meetingHotkey.layoutLabel")}
+                  </span>
+                  <Select
+                    value={meetingHotkeyLayoutMode}
+                    onValueChange={(value) =>
+                      setMeetingHotkeyLayoutMode(value as "side-panel" | "full-width")
+                    }
+                  >
+                    <SelectTrigger className="h-7 w-36 text-xs rounded-lg px-2.5 [&>svg]:h-3 [&>svg]:w-3">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem
+                        value="full-width"
+                        className="text-xs py-1.5 pl-2.5 pr-7 rounded-md"
+                      >
+                        {t("settingsPage.general.meetingHotkey.layoutFullWidth")}
+                      </SelectItem>
+                      <SelectItem
+                        value="side-panel"
+                        className="text-xs py-1.5 pl-2.5 pr-7 rounded-md"
+                      >
+                        {t("settingsPage.general.meetingHotkey.layoutSidePanel")}
+                      </SelectItem>
+                    </SelectContent>
+                  </Select>
+                </SettingsPanelRow>
+              </SettingsPanel>
+            </div>
+
+            {/* Agent Hotkey */}
+            <div>
+              <SectionHeader
+                title={t("agentMode.settings.hotkey")}
+                description={t("agentMode.settings.hotkeyDescription")}
+              />
+              <SettingsPanel>
+                <SettingsPanelRow>
+                  <HotkeyInput
+                    value={chatAgentKey}
+                    onChange={setChatAgentKey}
+                    validate={validateAgentHotkey}
+                  />
+                </SettingsPanelRow>
+              </SettingsPanel>
+            </div>
+          </div>
+        );
+
+      case "speechToText":
+        return (
+          <SpeechToTextTabs
+            initialTab={initialSubTab as SpeechTab | undefined}
+            renderDictation={() => (
+              <div className="space-y-6">
+                <TranscriptionSection
+                  isSignedIn={isSignedIn ?? false}
+                  startOnboarding={startOnboarding}
+                  cloudTranscriptionMode={cloudTranscriptionMode}
+                  setCloudTranscriptionMode={setCloudTranscriptionMode}
+                  useLocalWhisper={useLocalWhisper}
+                  setUseLocalWhisper={setUseLocalWhisper}
+                  updateTranscriptionSettings={updateTranscriptionSettings}
+                  cloudTranscriptionProvider={cloudTranscriptionProvider}
+                  setCloudTranscriptionProvider={setCloudTranscriptionProvider}
+                  cloudTranscriptionModel={cloudTranscriptionModel}
+                  setCloudTranscriptionModel={setCloudTranscriptionModel}
+                  localTranscriptionProvider={localTranscriptionProvider}
+                  setLocalTranscriptionProvider={setLocalTranscriptionProvider}
+                  whisperModel={whisperModel}
+                  setWhisperModel={setWhisperModel}
+                  parakeetModel={parakeetModel}
+                  setParakeetModel={setParakeetModel}
+                  cloudTranscriptionBaseUrl={cloudTranscriptionBaseUrl}
+                  setCloudTranscriptionBaseUrl={setCloudTranscriptionBaseUrl}
+                  transcriptionMode={transcriptionMode}
+                  setTranscriptionMode={setTranscriptionMode}
+                  remoteTranscriptionUrl={remoteTranscriptionUrl}
+                  setRemoteTranscriptionUrl={setRemoteTranscriptionUrl}
+                  showTranscriptionPreview={showTranscriptionPreview}
+                  setShowTranscriptionPreview={setShowTranscriptionPreview}
+                  toast={toast}
+                />
+                {transcriptionMode === "local" &&
+                  localTranscriptionProvider !== "nvidia" &&
+                  renderWhisperVadSettings()}
+              </div>
+            )}
+            renderNoteRecording={() => (
+              <div className="space-y-6">
+                <MeetingTranscriptionPanel />
+                {transcriptionMode === "local" &&
+                  localTranscriptionProvider !== "nvidia" &&
+                  renderWhisperVadSettings()}
+              </div>
+            )}
+          />
+        );
+
+      case "llms":
+        return (
+          <LlmsTabs
+            initialTab={initialSubTab as LlmTab | undefined}
+            renderChatIntelligence={() => <ChatAgentSettings />}
+            renderDictationCleanup={() => (
+              <div className="space-y-6">
+                <AiModelsSection
+                  useCleanupModel={useCleanupModel}
+                  setUseCleanupModel={(value) => {
+                    updateCleanupSettings({ useCleanupModel: value });
+                  }}
+                  toast={toast}
+                />
+
+                <div className="border-t border-border/40 pt-6">
+                  <SectionHeader
+                    title={t("settingsPage.prompts.title")}
+                    description={t("settingsPage.prompts.description")}
+                  />
+                  <PromptStudio />
+                </div>
+              </div>
+            )}
+            renderDictationAgent={() => <DictationAgentSettings />}
+            renderNoteFormatting={() => <NoteFormattingSettings />}
+          />
+        );
+
+      case "privacyData":
+        return (
+          <div className="space-y-6">
+            {/* Privacy */}
+            <div>
+              <SectionHeader
+                title={t("settingsPage.privacy.title")}
+                description={t("settingsPage.privacy.description")}
+              />
+
+              {isSignedIn && (
+                <div className="mb-4">
+                  <SettingsPanel className="mb-2">
+                    <SettingsPanelRow>
+                      <SettingsRow
+                        label={t("settingsPage.privacy.cloudBackup")}
+                        description={t("settingsPage.privacy.cloudBackupDescription")}
+                      >
+                        <Toggle
+                          checked={cloudBackupEnabled}
+                          onChange={(v) => {
+                            setCloudBackupEnabled(v);
+                            if (v) {
+                              startMigration().catch(console.error);
+                              syncService.syncAll().catch(console.error);
+                            }
+                          }}
+                        />
+                      </SettingsRow>
+                    </SettingsPanelRow>
+                  </SettingsPanel>
+                  {migration && (
+                    <div className="mt-2 space-y-1">
+                      <div className="flex items-center justify-between text-xs text-muted-foreground">
+                        <span className="flex items-center gap-1.5">
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                          {t("settingsPage.privacy.cloudNotesMigration", {
+                            done: migration.done,
+                            total: migration.total,
+                          })}
+                        </span>
+                        <span>{Math.round((migration.done / migration.total) * 100)}%</span>
+                      </div>
+                      <div className="h-1 w-full rounded-full bg-muted overflow-hidden">
+                        <div
+                          className="h-full bg-primary transition-all duration-300 ease-out"
+                          style={{ width: `${(migration.done / migration.total) * 100}%` }}
+                        />
+                      </div>
+                    </div>
+                  )}
+                  {!migration && cloudBackupEnabled && isSignedIn && (
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {t("settingsPage.privacy.cloudNotesMigrationDone")}
+                    </p>
+                  )}
+                  {cloudBackupEnabled &&
+                    isSignedIn &&
+                    (() => {
+                      const lastSyncedAt = localStorage.getItem("lastSyncedAt");
+                      if (!lastSyncedAt) return null;
+                      const date = new Date(lastSyncedAt);
+                      const now = new Date();
+                      const diffMs = now.getTime() - date.getTime();
+                      const diffMin = Math.floor(diffMs / 60000);
+                      const diffHr = Math.floor(diffMs / 3600000);
+                      let relative: string;
+                      if (diffMin < 1) relative = t("settingsPage.privacy.justNow");
+                      else if (diffMin < 60)
+                        relative = t("settingsPage.privacy.minutesAgo", { count: diffMin });
+                      else if (diffHr < 24)
+                        relative = t("settingsPage.privacy.hoursAgo", { count: diffHr });
+                      else
+                        relative = date.toLocaleDateString(undefined, {
+                          month: "short",
+                          day: "numeric",
+                          hour: "2-digit",
+                          minute: "2-digit",
+                        });
+                      return (
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          {t("settingsPage.privacy.lastSynced", { time: relative })}
+                        </p>
+                      );
+                    })()}
+                </div>
+              )}
+
+              <SettingsPanel>
+                <SettingsPanelRow>
+                  <SettingsRow
+                    label={t("settingsPage.privacy.usageAnalytics")}
+                    description={t("settingsPage.privacy.usageAnalyticsDescription")}
+                  >
+                    <Toggle checked={telemetryEnabled} onChange={setTelemetryEnabled} />
+                  </SettingsRow>
+                </SettingsPanelRow>
+              </SettingsPanel>
+            </div>
+
+            {/* Audio Retention */}
+            <div className="border-t border-border/40 pt-6">
+              <SectionHeader
+                title={t("settingsPage.privacy.audioRetention")}
+                description={t("settingsPage.privacy.audioRetentionDescription")}
+              />
+
+              <SettingsPanel>
+                <SettingsPanelRow>
+                  <SettingsRow
+                    label={t("settingsPage.privacy.audioRetention")}
+                    description={t("settingsPage.privacy.audioRetentionDescription")}
+                  >
+                    <select
+                      value={audioRetentionDays}
+                      onChange={(e) => setAudioRetentionDays(parseInt(e.target.value, 10))}
+                      className="h-7 rounded border border-border/70 bg-surface-1/80 px-2.5 text-xs font-medium text-foreground shadow-sm backdrop-blur-sm hover:border-border-hover hover:bg-surface-2/70 focus:outline-none focus:ring-2 focus:ring-ring/30 focus:ring-offset-1 transition-colors duration-200"
+                    >
+                      <option value={0}>{t("settingsPage.privacy.audioRetentionDisabled")}</option>
+                      <option value={7}>
+                        {t("settingsPage.privacy.audioRetentionDays", { count: 7 })}
+                      </option>
+                      <option value={14}>
+                        {t("settingsPage.privacy.audioRetentionDays", { count: 14 })}
+                      </option>
+                      <option value={30}>
+                        {t("settingsPage.privacy.audioRetentionDays", { count: 30 })}
+                      </option>
+                      <option value={60}>
+                        {t("settingsPage.privacy.audioRetentionDays", { count: 60 })}
+                      </option>
+                      <option value={90}>
+                        {t("settingsPage.privacy.audioRetentionDays", { count: 90 })}
+                      </option>
+                    </select>
+                  </SettingsRow>
+                </SettingsPanelRow>
+                <SettingsPanelRow>
+                  <SettingsRow
+                    label={t("settingsPage.privacy.audioStorageUsage")}
+                    description={
+                      audioStorageUsage.fileCount > 0
+                        ? t("settingsPage.privacy.audioStorageFiles", {
+                            count: audioStorageUsage.fileCount,
+                            size: formatBytes(audioStorageUsage.totalBytes),
+                          })
+                        : t("settingsPage.privacy.audioStorageEmpty")
+                    }
+                  >
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-7 text-xs"
+                      disabled={audioStorageUsage.fileCount === 0}
+                      onClick={handleClearAllAudio}
+                    >
+                      {t("settingsPage.privacy.clearAllAudio")}
+                    </Button>
+                  </SettingsRow>
+                </SettingsPanelRow>
+              </SettingsPanel>
+            </div>
+
+            {/* Data Retention */}
+            <div className="border-t border-border/40 pt-6">
+              <SettingsPanel>
+                <SettingsPanelRow>
+                  <SettingsRow
+                    label={t("settingsPage.privacy.dataRetention")}
+                    description={t("settingsPage.privacy.dataRetentionDescription")}
+                  >
+                    <Toggle checked={dataRetentionEnabled} onChange={setDataRetentionEnabled} />
+                  </SettingsRow>
+                </SettingsPanelRow>
+              </SettingsPanel>
+            </div>
+
+            {/* Permissions */}
+            <div className="border-t border-border/40 pt-6">
+              <SectionHeader
+                title={t("settingsPage.permissions.title")}
+                description={t("settingsPage.permissions.description")}
+              />
+
+              <div className="space-y-3">
+                <PermissionCard
+                  icon={Mic}
+                  title={t("settingsPage.permissions.microphoneTitle")}
+                  description={t("settingsPage.permissions.microphoneDescription")}
+                  granted={permissionsHook.micPermissionGranted}
+                  onRequest={permissionsHook.requestMicPermission}
+                  buttonText={t("settingsPage.permissions.grantAccess")}
+                />
+
+                {(platform === "darwin" || canManageSystemAudioInApp(systemAudio)) && (
+                  <>
+                    {platform === "darwin" && (
+                      <PermissionCard
+                        icon={Shield}
+                        title={t("settingsPage.permissions.accessibilityTitle")}
+                        description={t("settingsPage.permissions.accessibilityDescription")}
+                        granted={permissionsHook.accessibilityPermissionGranted}
+                        onRequest={permissionsHook.requestAccessibilityPermission}
+                        buttonText={t("settingsPage.permissions.grantAccess")}
+                      />
+                    )}
+                    {canManageSystemAudioInApp(systemAudio) && (
+                      <PermissionCard
+                        icon={Monitor}
+                        title={t("settingsPage.permissions.systemAudioTitle")}
+                        description={t("settingsPage.permissions.systemAudioDescription")}
+                        granted={systemAudio.granted}
+                        onRequest={systemAudio.request}
+                        buttonText={t("settingsPage.permissions.grantAccess")}
+                        badge={t("settingsPage.permissions.optional")}
+                      />
+                    )}
+                  </>
+                )}
+              </div>
+
+              {!permissionsHook.micPermissionGranted && permissionsHook.micPermissionError && (
+                <MicPermissionWarning
+                  error={permissionsHook.micPermissionError}
+                  onOpenSoundSettings={permissionsHook.openSoundInputSettings}
+                  onOpenPrivacySettings={permissionsHook.openMicPrivacySettings}
+                />
+              )}
+
+              {platform === "linux" &&
+                permissionsHook.pasteToolsInfo &&
+                !permissionsHook.pasteToolsInfo.available && (
+                  <PasteToolsInfo
+                    pasteToolsInfo={permissionsHook.pasteToolsInfo}
+                    isChecking={permissionsHook.isCheckingPasteTools}
+                    onCheck={permissionsHook.checkPasteToolsAvailability}
+                  />
+                )}
+
+              {platform === "darwin" && (
+                <div className="mt-5">
+                  <p className="text-xs font-medium text-foreground mb-3">
+                    {t("settingsPage.permissions.troubleshootingTitle")}
+                  </p>
+                  <SettingsPanel>
+                    <SettingsPanelRow>
+                      <SettingsRow
+                        label={t("settingsPage.permissions.resetAccessibility.label")}
+                        description={t(
+                          "settingsPage.permissions.resetAccessibility.rowDescription"
+                        )}
+                      >
+                        <Button
+                          onClick={resetAccessibilityPermissions}
+                          variant="ghost"
+                          size="sm"
+                          className="text-foreground/70 hover:text-foreground"
+                        >
+                          {t("settingsPage.permissions.troubleshoot")}
+                        </Button>
+                      </SettingsRow>
+                    </SettingsPanelRow>
+                  </SettingsPanel>
+                </div>
+              )}
+            </div>
+          </div>
+        );
+
+      case "system":
+        return (
+          <div className="space-y-6">
+            {/* Software Updates */}
+            <div>
+              <SectionHeader title={t("settingsPage.general.updates.title")} />
+              <SettingsPanel>
+                <SettingsPanelRow>
+                  <SettingsRow
+                    label={t("settingsPage.general.updates.currentVersion")}
+                    description={
+                      updateStatus.isDevelopment
+                        ? t("settingsPage.general.updates.devMode")
+                        : isUpdateAvailable
+                          ? t("settingsPage.general.updates.newVersionAvailable")
+                          : t("settingsPage.general.updates.latestVersion")
+                    }
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <span className="text-xs tabular-nums text-muted-foreground font-mono">
+                        {currentVersion || t("settingsPage.general.updates.versionPlaceholder")}
+                      </span>
+                      {updateStatus.isDevelopment ? (
+                        <Badge variant="warning">
+                          {t("settingsPage.general.updates.badges.dev")}
+                        </Badge>
+                      ) : isUpdateAvailable ? (
+                        <Badge variant="success">
+                          {t("settingsPage.general.updates.badges.update")}
+                        </Badge>
+                      ) : (
+                        <Badge variant="outline">
+                          {t("settingsPage.general.updates.badges.latest")}
+                        </Badge>
+                      )}
+                    </div>
+                  </SettingsRow>
+                </SettingsPanelRow>
+
+                <SettingsPanelRow>
+                  <div className="space-y-2.5">
+                    <Button
+                      onClick={async () => {
+                        try {
+                          const result = await checkForUpdates();
+                          if (result && !result.updateAvailable) {
+                            toast({
+                              title: t("settingsPage.general.updates.dialogs.noUpdates.title"),
+                              description: t(
+                                "settingsPage.general.updates.dialogs.noUpdates.description"
+                              ),
+                            });
+                          }
+                        } catch {}
+                      }}
+                      disabled={checkingForUpdates || updateStatus.isDevelopment}
+                      variant="outline"
+                      className="w-full"
+                      size="sm"
+                    >
+                      <RefreshCw
+                        size={13}
+                        className={`mr-1.5 ${checkingForUpdates ? "animate-spin" : ""}`}
+                      />
+                      {checkingForUpdates
+                        ? t("settingsPage.general.updates.checking")
+                        : t("settingsPage.general.updates.checkForUpdates")}
+                    </Button>
+
+                    {isUpdateAvailable && !updateStatus.updateDownloaded && (
+                      <div className="space-y-2">
+                        <Button
+                          onClick={async () => {
+                            try {
+                              await downloadUpdate();
+                            } catch {
+                              showAlertDialog({
+                                title: t(
+                                  "settingsPage.general.updates.dialogs.downloadFailed.title"
+                                ),
+                                description: t(
+                                  "settingsPage.general.updates.dialogs.downloadFailed.description"
+                                ),
+                              });
+                            }
+                          }}
+                          disabled={downloadingUpdate}
+                          variant="success"
+                          className="w-full"
+                          size="sm"
+                        >
+                          <Download
+                            size={13}
+                            className={`mr-1.5 ${downloadingUpdate ? "animate-pulse" : ""}`}
+                          />
+                          {downloadingUpdate
+                            ? t("settingsPage.general.updates.downloading", {
+                                progress: Math.round(updateDownloadProgress),
+                              })
+                            : t("settingsPage.general.updates.downloadUpdate", {
+                                version: updateInfo?.version || "",
+                              })}
+                        </Button>
+
+                        {downloadingUpdate && (
+                          <div className="h-1 w-full overflow-hidden rounded-full bg-muted/50">
+                            <div
+                              className="h-full bg-success transition-[width] duration-200 rounded-full"
+                              style={{
+                                width: `${Math.min(100, Math.max(0, updateDownloadProgress))}%`,
+                              }}
+                            />
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {updateStatus.updateDownloaded && (
+                      <Button
+                        onClick={() => {
+                          showConfirmDialog({
+                            title: t("settingsPage.general.updates.dialogs.installUpdate.title"),
+                            description: t(
+                              "settingsPage.general.updates.dialogs.installUpdate.description",
+                              { version: updateInfo?.version || "" }
+                            ),
+                            confirmText: t(
+                              "settingsPage.general.updates.dialogs.installUpdate.confirmText"
+                            ),
+                            onConfirm: async () => {
+                              try {
+                                await installUpdateAction();
+                              } catch {
+                                showAlertDialog({
+                                  title: t(
+                                    "settingsPage.general.updates.dialogs.installFailed.title"
+                                  ),
+                                  description: t(
+                                    "settingsPage.general.updates.dialogs.installFailed.description"
+                                  ),
+                                });
+                              }
+                            },
+                          });
+                        }}
+                        disabled={installInitiated}
+                        className="w-full"
+                        size="sm"
+                      >
+                        <RefreshCw
+                          size={14}
+                          className={`mr-2 ${installInitiated ? "animate-spin" : ""}`}
+                        />
+                        {installInitiated
+                          ? t("settingsPage.general.updates.restarting")
+                          : t("settingsPage.general.updates.installAndRestart")}
+                      </Button>
+                    )}
+                  </div>
+
+                  {updateInfo?.releaseNotes && (
+                    <div className="mt-4 pt-4 border-t border-border/30">
+                      <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-2">
+                        {t("settingsPage.general.updates.whatsNew", {
+                          version: updateInfo.version,
+                        })}
+                      </p>
+                      <div
+                        className="text-xs text-muted-foreground [&_ul]:list-disc [&_ul]:pl-4 [&_ul]:space-y-1 [&_ol]:list-decimal [&_ol]:pl-4 [&_ol]:space-y-1 [&_li]:pl-1 [&_p]:mb-2 [&_p:last-child]:mb-0 [&_a]:text-link [&_a]:underline"
+                        dangerouslySetInnerHTML={{ __html: updateInfo.releaseNotes }}
+                      />
+                    </div>
+                  )}
+                </SettingsPanelRow>
+              </SettingsPanel>
+            </div>
+
+            {/* Developer Tools */}
+            <div className="border-t border-border/40 pt-6">
+              <DeveloperSection />
+            </div>
+
+            {/* Data Management */}
+            <div className="border-t border-border/40 pt-6">
               <SectionHeader
                 title={t("settingsPage.developer.dataManagementTitle")}
                 description={t("settingsPage.developer.dataManagementDescription")}
@@ -2197,28 +3776,29 @@ export default function SettingsPage({ activeSection = "general" }: SettingsPage
                           showConfirmDialog({
                             title: t("settingsPage.developer.resetAll.title"),
                             description: t("settingsPage.developer.resetAll.description"),
-                            onConfirm: () => {
-                              window.electronAPI
-                                ?.cleanupApp()
-                                .then(() => {
-                                  showAlertDialog({
-                                    title: t("settingsPage.developer.resetAll.successTitle"),
-                                    description: t(
-                                      "settingsPage.developer.resetAll.successDescription"
-                                    ),
-                                  });
-                                  setTimeout(() => {
-                                    window.location.reload();
-                                  }, 1000);
-                                })
-                                .catch(() => {
-                                  showAlertDialog({
-                                    title: t("settingsPage.developer.resetAll.failedTitle"),
-                                    description: t(
-                                      "settingsPage.developer.resetAll.failedDescription"
-                                    ),
-                                  });
+                            onConfirm: async () => {
+                              try {
+                                try {
+                                  await signOut();
+                                } catch {}
+                                await window.electronAPI?.cleanupApp();
+                                showAlertDialog({
+                                  title: t("settingsPage.developer.resetAll.successTitle"),
+                                  description: t(
+                                    "settingsPage.developer.resetAll.successDescription"
+                                  ),
                                 });
+                                setTimeout(() => {
+                                  window.location.reload();
+                                }, 1000);
+                              } catch {
+                                showAlertDialog({
+                                  title: t("settingsPage.developer.resetAll.failedTitle"),
+                                  description: t(
+                                    "settingsPage.developer.resetAll.failedDescription"
+                                  ),
+                                });
+                              }
                             },
                             variant: "destructive",
                             confirmText: t("settingsPage.developer.resetAll.confirmText"),

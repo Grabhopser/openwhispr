@@ -1,4 +1,5 @@
 import modelDataRaw from "./modelRegistryData.json";
+import { isCloudCleanupMode, getSettings } from "../stores/settingsStore";
 
 export interface ModelDefinition {
   id: string;
@@ -12,6 +13,7 @@ export interface ModelDefinition {
   contextLength: number;
   hfRepo: string;
   recommended?: boolean;
+  supportsThinking?: boolean;
 }
 
 export interface LocalProviderData {
@@ -37,6 +39,9 @@ export interface CloudModelDefinition {
   description: string;
   descriptionKey?: string;
   disableThinking?: boolean;
+  supportsThinking?: boolean;
+  tokenParam?: "max_tokens" | "max_completion_tokens";
+  supportsTemperature?: boolean;
 }
 
 export interface CloudProviderData {
@@ -45,11 +50,16 @@ export interface CloudProviderData {
   models: CloudModelDefinition[];
 }
 
+export interface EnterpriseProviderData extends CloudProviderData {
+  allowCustomModelId: boolean;
+}
+
 export interface TranscriptionModelDefinition {
   id: string;
   name: string;
   description: string;
   descriptionKey?: string;
+  streaming?: boolean;
 }
 
 export interface TranscriptionProviderData {
@@ -98,6 +108,7 @@ interface ModelRegistryData {
   whisperModels: WhisperModelsMap;
   transcriptionProviders: TranscriptionProviderData[];
   cloudProviders: CloudProviderData[];
+  enterpriseProviders: EnterpriseProviderData[];
   localProviders: LocalProviderData[];
 }
 
@@ -160,6 +171,10 @@ class ModelRegistry {
     return modelData.cloudProviders;
   }
 
+  getEnterpriseProviders(): EnterpriseProviderData[] {
+    return modelData.enterpriseProviders;
+  }
+
   getTranscriptionProviders(): TranscriptionProviderData[] {
     return modelData.transcriptionProviders;
   }
@@ -200,6 +215,12 @@ export interface ReasoningProvider {
 
 export type ReasoningProviders = Record<string, ReasoningProvider>;
 
+export type EnterpriseProvider = "bedrock" | "azure" | "vertex";
+export const ENTERPRISE_PROVIDERS: readonly EnterpriseProvider[] = ["bedrock", "azure", "vertex"];
+export function isEnterpriseProvider(value: unknown): value is EnterpriseProvider {
+  return typeof value === "string" && (ENTERPRISE_PROVIDERS as readonly string[]).includes(value);
+}
+
 function buildReasoningProviders(): ReasoningProviders {
   const providers: ReasoningProviders = {};
 
@@ -207,6 +228,18 @@ function buildReasoningProviders(): ReasoningProviders {
     providers[cloudProvider.id] = {
       name: cloudProvider.name,
       models: cloudProvider.models.map((m) => ({
+        value: m.id,
+        label: m.name,
+        description: m.description,
+        descriptionKey: m.descriptionKey,
+      })),
+    };
+  }
+
+  for (const ep of modelRegistry.getEnterpriseProviders()) {
+    providers[ep.id] = {
+      name: ep.name,
+      models: ep.models.map((m) => ({
         value: m.id,
         label: m.name,
         description: m.description,
@@ -251,13 +284,18 @@ export function getReasoningModelLabel(modelId: string): string {
 }
 
 export function getModelProvider(modelId: string): string {
-  // When in OpenWhispr cloud mode, route reasoning through the cloud API
-  if (typeof localStorage !== "undefined") {
-    const cloudMode = localStorage.getItem("cloudReasoningMode");
-    const isSignedIn = localStorage.getItem("isSignedIn") === "true";
-    if (cloudMode === "openwhispr" && isSignedIn) {
-      return "openwhispr";
-    }
+  if (isCloudCleanupMode()) {
+    return "openwhispr";
+  }
+
+  const storedProvider = getSettings().cleanupProvider;
+
+  if (storedProvider === "custom") {
+    return "custom";
+  }
+
+  if (isEnterpriseProvider(storedProvider)) {
+    return storedProvider;
   }
 
   const model = getAllReasoningModels().find((m) => m.value === modelId);
@@ -272,8 +310,9 @@ export function getModelProvider(modelId: string): string {
       modelId.includes("openai/") ||
       modelId.includes("llama-3.1-8b-instant") ||
       modelId.includes("llama-3.3-") ||
-      modelId.includes("mixtral-") ||
-      modelId.includes("gemma2-")
+      modelId.includes("meta-llama/llama-4-") ||
+      modelId.includes("groq/compound") ||
+      modelId.includes("moonshotai/kimi-k2-")
     )
       return "groq";
     if (
@@ -290,6 +329,13 @@ export function getModelProvider(modelId: string): string {
 
 export function getTranscriptionProviders(): TranscriptionProviderData[] {
   return modelRegistry.getTranscriptionProviders();
+}
+
+export function getStreamingTranscriptionProviders(): TranscriptionProviderData[] {
+  return modelRegistry
+    .getTranscriptionProviders()
+    .map((p) => ({ ...p, models: p.models.filter((m) => m.streaming) }))
+    .filter((p) => p.models.length > 0);
 }
 
 export function getTranscriptionProvider(
@@ -323,7 +369,49 @@ export function getCloudModel(modelId: string): CloudModelDefinition | undefined
     const model = provider.models.find((m) => m.id === modelId);
     if (model) return model;
   }
+  for (const provider of modelData.enterpriseProviders) {
+    const model = provider.models.find((m) => m.id === modelId);
+    if (model) return model;
+  }
   return undefined;
+}
+
+export function getLocalModel(modelId: string): ModelDefinition | undefined {
+  return modelRegistry.getModel(modelId)?.model;
+}
+
+export interface OpenAiApiConfig {
+  tokenParam: "max_tokens" | "max_completion_tokens";
+  supportsTemperature: boolean;
+}
+
+export function getOpenAiApiConfig(modelId: string): OpenAiApiConfig {
+  const model = getCloudModel(modelId);
+  if (model?.tokenParam) {
+    return {
+      tokenParam: model.tokenParam,
+      supportsTemperature: model.supportsTemperature ?? true,
+    };
+  }
+
+  // Fallback for models not in the registry (custom model IDs, etc.)
+  const isLegacy =
+    modelId.startsWith("gpt-3") ||
+    modelId.startsWith("gpt-4o") ||
+    modelId.startsWith("gpt-4-") ||
+    modelId === "gpt-4";
+
+  if (isLegacy) {
+    return { tokenParam: "max_tokens", supportsTemperature: true };
+  }
+
+  // gpt-4.1* supports temperature but uses max_completion_tokens
+  if (modelId.startsWith("gpt-4.1")) {
+    return { tokenParam: "max_completion_tokens", supportsTemperature: true };
+  }
+
+  // gpt-5* reasoning models: no temperature
+  return { tokenParam: "max_completion_tokens", supportsTemperature: false };
 }
 
 export function getParakeetModels(): ParakeetModelsMap {

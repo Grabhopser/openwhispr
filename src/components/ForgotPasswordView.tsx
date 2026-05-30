@@ -1,6 +1,6 @@
 import React, { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { requestPasswordReset, NEON_AUTH_URL, authClient } from "../lib/neonAuth";
+import { requestPasswordReset, AUTH_URL, authClient } from "../lib/auth";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { AlertCircle, ArrowLeft, Check, Loader2, Mail } from "lucide-react";
@@ -42,11 +42,11 @@ export default function ForgotPasswordView({
     [email]
   );
 
-  if (!NEON_AUTH_URL || !authClient) {
+  if (!AUTH_URL || !authClient) {
     return (
       <div className="space-y-3">
         <div className="bg-warning/5 p-2.5 rounded border border-warning/20">
-          <p className="text-[10px] text-warning text-center leading-snug">
+          <p className="text-xs text-warning text-center leading-snug">
             {t("forgotPassword.notConfigured")}
           </p>
         </div>
@@ -75,7 +75,7 @@ export default function ForgotPasswordView({
         </div>
 
         <div className="bg-muted/50 p-2.5 rounded border border-border/50">
-          <p className="text-[10px] text-muted-foreground text-center leading-snug">
+          <p className="text-xs text-muted-foreground text-center leading-snug">
             {t("forgotPassword.success.help")}
           </p>
         </div>
@@ -105,7 +105,7 @@ export default function ForgotPasswordView({
       <button
         type="button"
         onClick={onBack}
-        className="text-[10px] text-muted-foreground hover:text-foreground transition-colors flex items-center gap-0.5"
+        className="text-xs text-muted-foreground hover:text-foreground transition-colors flex items-center gap-0.5"
       >
         <ArrowLeft className="w-3 h-3" />
         {t("forgotPassword.back")}
@@ -135,7 +135,7 @@ export default function ForgotPasswordView({
         {error && (
           <div className="px-2.5 py-1.5 rounded bg-destructive/5 border border-destructive/20 flex items-center gap-1.5">
             <AlertCircle className="w-3 h-3 text-destructive shrink-0" />
-            <p className="text-[10px] text-destructive leading-snug">{error}</p>
+            <p className="text-xs text-destructive leading-snug">{error}</p>
           </div>
         )}
 

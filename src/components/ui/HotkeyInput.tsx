@@ -1,7 +1,7 @@
 import React, { useState, useCallback, useRef, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { AlertTriangle } from "lucide-react";
-import { formatHotkeyLabel } from "../../utils/hotkeys";
+import { formatHotkeyLabel, isGlobeLikeHotkey } from "../../utils/hotkeys";
 import { getPlatform } from "../../utils/platform";
 
 const CODE_TO_KEY: Record<string, string> = {
@@ -149,7 +149,7 @@ export interface HotkeyInputProps {
   validate?: (hotkey: string) => string | null | undefined;
 }
 
-export function mapKeyboardEventToHotkey(e: KeyboardEvent): string | null {
+function mapKeyboardEventToHotkey(e: KeyboardEvent): string | null {
   if (MODIFIER_CODES.has(e.code)) {
     return null;
   }
@@ -396,6 +396,20 @@ export function HotkeyInput({
     [disabled, buildModifierOnlyHotkey, finalizeCapture]
   );
 
+  const handleMouseDown = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      if (disabled || !isCapturing) return;
+
+      const mouseHotkey = e.button === 3 ? "MouseButton4" : e.button === 4 ? "MouseButton5" : null;
+      if (!mouseHotkey) return;
+
+      e.preventDefault();
+      e.stopPropagation();
+      finalizeCapture(mouseHotkey);
+    },
+    [disabled, isCapturing, finalizeCapture]
+  );
+
   const handleFocus = useCallback(() => {
     if (!disabled) {
       setIsCapturing(true);
@@ -455,7 +469,7 @@ export function HotkeyInput({
   }, [isCapturing, isMac, finalizeCapture]);
 
   const displayValue = formatHotkeyLabel(value);
-  const isGlobe = value === "GLOBE";
+  const isGlobe = isGlobeLikeHotkey(value);
   const hotkeyParts = value?.includes("+") ? displayValue.split("+") : [];
 
   // Hero variant: large centered key display for onboarding
@@ -466,14 +480,16 @@ export function HotkeyInput({
         tabIndex={disabled ? -1 : 0}
         role="button"
         aria-label={t("hotkeyInput.ariaLabel")}
+        data-capturing={isCapturing || undefined}
         onKeyDown={handleKeyDown}
         onKeyUp={handleKeyUp}
+        onMouseDown={handleMouseDown}
         onFocus={handleFocus}
         onBlur={handleBlur}
         className={`
           relative group flex flex-col items-center justify-center py-4 px-5 min-h-28
           rounded-md border cursor-pointer select-none outline-none
-          transition-all duration-150
+          transition-colors duration-150
           ${
             disabled
               ? "bg-muted/30 border-border cursor-not-allowed opacity-50"
@@ -504,7 +520,7 @@ export function HotkeyInput({
                   <span className="text-primary/50 text-sm font-medium">+</span>
                 </div>
                 {isFnHeld && (
-                  <span className="text-[10px] text-muted-foreground">
+                  <span className="text-xs text-muted-foreground">
                     {t("hotkeyInput.fnHeldHint")}
                   </span>
                 )}
@@ -517,7 +533,7 @@ export function HotkeyInput({
             {validationWarning && (
               <div className="flex items-center gap-1.5 mt-2 px-3 py-1.5 rounded-md bg-warning/8 border border-warning/20 dark:bg-warning/12 dark:border-warning/25">
                 <AlertTriangle className="w-3 h-3 text-warning shrink-0" />
-                <span className="text-[11px] text-warning dark:text-amber-400">
+                <span className="text-xs text-warning dark:text-amber-400">
                   {validationWarning}
                 </span>
               </div>
@@ -548,7 +564,7 @@ export function HotkeyInput({
                 </kbd>
               )}
             </div>
-            <span className="text-[10px] text-muted-foreground/60 group-hover:text-muted-foreground transition-colors">
+            <span className="text-xs text-muted-foreground/60 group-hover:text-muted-foreground transition-colors">
               {t("hotkeyInput.clickToChange")}
             </span>
           </div>
@@ -569,13 +585,15 @@ export function HotkeyInput({
       tabIndex={disabled ? -1 : 0}
       role="button"
       aria-label={t("hotkeyInput.ariaLabel")}
+      data-capturing={isCapturing || undefined}
       onKeyDown={handleKeyDown}
       onKeyUp={handleKeyUp}
+      onMouseDown={handleMouseDown}
       onFocus={handleFocus}
       onBlur={handleBlur}
       className={`
         relative overflow-hidden rounded-md border
-        transition-all duration-150 cursor-pointer select-none focus:outline-none
+        transition-colors duration-150 cursor-pointer select-none focus:outline-none
         ${
           disabled
             ? "bg-muted/30 border-border cursor-not-allowed opacity-50"
@@ -604,17 +622,17 @@ export function HotkeyInput({
                   {Array.from(activeModifiers).map((mod) => (
                     <kbd
                       key={mod}
-                      className="px-2 py-0.5 bg-primary/10 border border-primary/20 rounded-sm text-[11px] font-semibold text-primary"
+                      className="px-2 py-0.5 bg-primary/10 border border-primary/20 rounded-sm text-xs font-semibold text-primary"
                     >
                       {mod}
                     </kbd>
                   ))}
-                  <span className="text-primary/40 text-[11px]">
+                  <span className="text-primary/40 text-xs">
                     {isFnHeld ? t("hotkeyInput.fnCaptureHint") : t("hotkeyInput.keyHint")}
                   </span>
                 </div>
               ) : (
-                <span className="text-[11px] text-muted-foreground">
+                <span className="text-xs text-muted-foreground">
                   {isMac ? t("hotkeyInput.tryShortcutMac") : t("hotkeyInput.tryShortcut")}
                 </span>
               )}
@@ -622,7 +640,7 @@ export function HotkeyInput({
             {validationWarning && (
               <div className="flex items-center gap-1.5 mt-1.5 px-3 py-1.5 rounded-md bg-warning/8 border border-warning/20 dark:bg-warning/12 dark:border-warning/25">
                 <AlertTriangle className="w-3 h-3 text-warning shrink-0" />
-                <span className="text-[11px] text-warning dark:text-amber-400">
+                <span className="text-xs text-warning dark:text-amber-400">
                   {validationWarning}
                 </span>
               </div>
@@ -630,7 +648,7 @@ export function HotkeyInput({
           </>
         ) : value ? (
           <div className="flex items-center justify-between">
-            <span className="text-[11px] font-medium text-muted-foreground">
+            <span className="text-xs font-medium text-muted-foreground">
               {t("hotkeyInput.hotkeyLabel")}
             </span>
             <div className="flex items-center gap-2">
@@ -638,7 +656,7 @@ export function HotkeyInput({
                 <div className="flex items-center gap-1">
                   {hotkeyParts.map((part, i) => (
                     <React.Fragment key={part}>
-                      {i > 0 && <span className="text-muted-foreground/30 text-[10px]">+</span>}
+                      {i > 0 && <span className="text-muted-foreground/30 text-xs">+</span>}
                       <kbd className="px-2 py-0.5 bg-surface-raised border border-border rounded-sm text-xs font-semibold text-foreground">
                         {part}
                       </kbd>
@@ -650,16 +668,14 @@ export function HotkeyInput({
                   <kbd className="px-2 py-0.5 bg-surface-raised border border-border rounded-sm text-base">
                     🌐
                   </kbd>
-                  <span className="text-[11px] text-muted-foreground">
-                    {t("hotkeyInput.globe")}
-                  </span>
+                  <span className="text-xs text-muted-foreground">{t("hotkeyInput.globe")}</span>
                 </div>
               ) : (
                 <kbd className="px-2.5 py-1 bg-surface-raised border border-border rounded-sm text-xs font-semibold text-foreground">
                   {displayValue}
                 </kbd>
               )}
-              <span className="text-[10px] text-muted-foreground/50">
+              <span className="text-xs text-muted-foreground/50">
                 {t("hotkeyInput.clickToChangeLower")}
               </span>
             </div>

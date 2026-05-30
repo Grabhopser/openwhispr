@@ -3,12 +3,63 @@ import { API_ENDPOINTS, buildApiUrl, normalizeBaseUrl } from "../config/constant
 import logger from "../utils/logger";
 import { isBuiltInMicrophone } from "../utils/audioDeviceUtils";
 import { isSecureEndpoint } from "../utils/urlUtils";
-import { withSessionRefresh } from "../lib/neonAuth";
-import { getBaseLanguageCode, validateLanguageForModel } from "../utils/languageSupport";
-import { hasStoredByokKey } from "../utils/byokDetection";
+import { withSessionRefresh } from "../lib/auth";
+import { getBaseLanguageCode } from "../utils/languageSupport";
+import {
+  createLocalSpeechGateState,
+  getLocalSpeechGateDecision,
+  recordLocalSpeechWindow,
+} from "./localSpeechGate";
+import { getSettings, getEffectiveCleanupModel, isCloudCleanupMode } from "../stores/settingsStore";
+import { detectAgentName } from "../config/agentDetection";
+import { resolvePrompt } from "../config/prompts";
+import { syncService } from "../services/SyncService.js";
 
-const SHORT_CLIP_DURATION_SECONDS = 2.5;
 const REASONING_CACHE_TTL = 30000; // 30 seconds
+const REALTIME_MODELS = new Set(["gpt-4o-mini-transcribe", "gpt-4o-transcribe"]);
+
+function resolveReasoningRoute(text, settings, agentName) {
+  const cleanupReachable =
+    !!settings.useCleanupModel && (!!settings.cleanupModel?.trim() || isCloudCleanupMode());
+  const agentModel = settings.dictationAgentModel?.trim() || "";
+  const agentReachable = !!settings.useDictationAgent && agentModel.length > 0;
+  if (!cleanupReachable && !agentReachable) return { kind: "skip" };
+
+  const invoked = !!agentName && detectAgentName(text, agentName);
+  if (agentReachable && invoked) {
+    const provider = settings.dictationAgentProvider?.trim() || undefined;
+    const isSelfHostedAgent =
+      settings.dictationAgentMode === "self-hosted" && !!settings.dictationAgentRemoteUrl;
+    const isCustomAgent = settings.dictationAgentMode === "providers" && provider === "custom";
+    return {
+      kind: "agent",
+      model: agentModel,
+      config: {
+        provider,
+        lanUrl: isSelfHostedAgent ? settings.dictationAgentRemoteUrl : undefined,
+        baseUrl: isCustomAgent ? settings.dictationAgentCloudBaseUrl || undefined : undefined,
+        customApiKey:
+          isCustomAgent || isSelfHostedAgent
+            ? settings.dictationAgentCustomApiKey || undefined
+            : undefined,
+        disableThinking: settings.dictationAgentDisableThinking,
+        systemPrompt: resolvePrompt("dictationAgent", {
+          agentName,
+          language: settings.preferredLanguage,
+          customDictionary: settings.customDictionary,
+          uiLanguage: settings.uiLanguage,
+        }),
+      },
+    };
+  }
+  if (cleanupReachable) {
+    return {
+      kind: "cleanup",
+      config: { disableThinking: settings.cleanupDisableThinking },
+    };
+  }
+  return { kind: "skip" };
+}
 
 const PLACEHOLDER_KEYS = {
   openai: "your_openai_api_key_here",
@@ -20,6 +71,43 @@ const isValidApiKey = (key, provider = "openai") => {
   if (!key || key.trim() === "") return false;
   const placeholder = PLACEHOLDER_KEYS[provider] || PLACEHOLDER_KEYS.openai;
   return key !== placeholder;
+};
+
+const STREAMING_PROVIDERS = {
+  deepgram: {
+    warmup: (opts) => window.electronAPI.deepgramStreamingWarmup(opts),
+    start: (opts) => window.electronAPI.deepgramStreamingStart(opts),
+    send: (buf) => window.electronAPI.deepgramStreamingSend(buf),
+    finalize: () => window.electronAPI.deepgramStreamingFinalize(),
+    stop: () => window.electronAPI.deepgramStreamingStop(),
+    status: () => window.electronAPI.deepgramStreamingStatus(),
+    onPartial: (cb) => window.electronAPI.onDeepgramPartialTranscript(cb),
+    onFinal: (cb) => window.electronAPI.onDeepgramFinalTranscript(cb),
+    onError: (cb) => window.electronAPI.onDeepgramError(cb),
+    onSessionEnd: (cb) => window.electronAPI.onDeepgramSessionEnd(cb),
+  },
+  assemblyai: {
+    warmup: (opts) => window.electronAPI.assemblyAiStreamingWarmup(opts),
+    start: (opts) => window.electronAPI.assemblyAiStreamingStart(opts),
+    send: (buf) => window.electronAPI.assemblyAiStreamingSend(buf),
+    finalize: () => window.electronAPI.assemblyAiStreamingForceEndpoint(),
+    stop: () => window.electronAPI.assemblyAiStreamingStop(),
+    status: () => window.electronAPI.assemblyAiStreamingStatus(),
+    onPartial: (cb) => window.electronAPI.onAssemblyAiPartialTranscript(cb),
+    onFinal: (cb) => window.electronAPI.onAssemblyAiFinalTranscript(cb),
+    onError: (cb) => window.electronAPI.onAssemblyAiError(cb),
+    onSessionEnd: (cb) => window.electronAPI.onAssemblyAiSessionEnd(cb),
+  },
+  "openai-realtime": {
+    warmup: (opts) => window.electronAPI.dictationRealtimeWarmup(opts),
+    start: (opts) => window.electronAPI.dictationRealtimeStart(opts),
+    send: (buf) => window.electronAPI.dictationRealtimeSend(buf),
+    stop: () => window.electronAPI.dictationRealtimeStop(),
+    onPartial: (cb) => window.electronAPI.onDictationRealtimePartial(cb),
+    onFinal: (cb) => window.electronAPI.onDictationRealtimeFinal(cb),
+    onError: (cb) => window.electronAPI.onDictationRealtimeError(cb),
+    onSessionEnd: (cb) => window.electronAPI.onDictationRealtimeSessionEnd(cb),
+  },
 };
 
 class AudioManager {
@@ -64,6 +152,12 @@ class AudioManager {
     this.stopRequestedDuringStreamingStart = false;
     this.streamingFallbackRecorder = null;
     this.streamingFallbackChunks = [];
+    this.skipReasoning = false;
+    this.context = "dictation";
+    this.sttConfig = null;
+    this.lastAudioBlob = null;
+    this.lastAudioMetadata = null;
+    this._localSpeechGateState = null;
   }
 
   getWorkletBlobUrl() {
@@ -111,33 +205,64 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
   }
 
   getCustomDictionaryPrompt() {
-    try {
-      const raw = localStorage.getItem("customDictionary");
-      if (!raw) return null;
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed) && parsed.length > 0) return parsed.join(", ");
-    } catch {
-      // ignore parse errors
-    }
-    return null;
+    const words = getSettings().customDictionary;
+    return words.length > 0 ? words.join(", ") : null;
   }
 
-  setCallbacks({ onStateChange, onError, onTranscriptionComplete, onPartialTranscript }) {
+  setCallbacks({
+    onStateChange,
+    onError,
+    onTranscriptionComplete,
+    onPartialTranscript,
+    onStreamingCommit,
+  }) {
     this.onStateChange = onStateChange;
     this.onError = onError;
     this.onTranscriptionComplete = onTranscriptionComplete;
     this.onPartialTranscript = onPartialTranscript;
+    this.onStreamingCommit = onStreamingCommit;
+  }
+
+  setSkipReasoning(skip) {
+    this.skipReasoning = skip;
+  }
+
+  setContext(context) {
+    this.context = context;
+  }
+
+  setSttConfig(config) {
+    this.sttConfig = config;
+  }
+
+  getStreamingProvider() {
+    const { cloudTranscriptionModel } = getSettings();
+    if (REALTIME_MODELS.has(cloudTranscriptionModel)) {
+      return STREAMING_PROVIDERS["openai-realtime"];
+    }
+    const defaultProvider = this.context === "notes" ? "deepgram" : "openai-realtime";
+    const providerName = this.sttConfig?.streamingProvider || defaultProvider;
+    return STREAMING_PROVIDERS[providerName] || STREAMING_PROVIDERS[defaultProvider];
+  }
+
+  getStreamingProviderName() {
+    const defaultProvider = this.context === "notes" ? "deepgram" : "openai-realtime";
+    return this.sttConfig?.streamingProvider || defaultProvider;
   }
 
   async getAudioConstraints() {
-    const preferBuiltIn = localStorage.getItem("preferBuiltInMic") !== "false";
-    const selectedDeviceId = localStorage.getItem("selectedMicDeviceId") || "";
+    const { preferBuiltInMic: preferBuiltIn, selectedMicDeviceId: selectedDeviceId } =
+      getSettings();
 
-    // Disable browser audio processing — dictation doesn't need it and it adds ~48ms latency
+    // All browser audio processing disabled to avoid OS-level side-effects.
+    // AGC off: Chromium's AGC on Windows mutates the system mic volume via WASAPI (#476).
+    // Echo cancellation and noise suppression off to avoid latency and speech distortion.
+    // Stereo recording required — mono WebM breaks silence detection on Linux/PipeWire (#472).
     const noProcessing = {
       echoCancellation: false,
       noiseSuppression: false,
       autoGainControl: false,
+      channelCount: 2,
     };
 
     if (preferBuiltIn) {
@@ -185,8 +310,7 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
   async cacheMicrophoneDeviceId() {
     if (this.cachedMicDeviceId) return; // Already cached
 
-    const preferBuiltIn = localStorage.getItem("preferBuiltInMic") !== "false";
-    if (!preferBuiltIn) return; // Only needed for built-in mic detection
+    if (!getSettings().preferBuiltInMic) return; // Only needed for built-in mic detection
 
     try {
       const devices = await navigator.mediaDevices.enumerateDevices();
@@ -208,9 +332,9 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       }
 
       const constraints = await this.getAudioConstraints();
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      const micStream = await navigator.mediaDevices.getUserMedia(constraints);
 
-      const audioTrack = stream.getAudioTracks()[0];
+      const audioTrack = micStream.getAudioTracks()[0];
       if (audioTrack) {
         const settings = audioTrack.getSettings();
         logger.info(
@@ -225,7 +349,33 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         );
       }
 
-      this.mediaRecorder = new MediaRecorder(stream);
+      try {
+        this._silenceCtx = new AudioContext();
+        this._silenceAnalyser = this._silenceCtx.createAnalyser();
+        this._silenceAnalyser.fftSize = 2048;
+        const sourceNode = this._silenceCtx.createMediaStreamSource(micStream);
+        sourceNode.connect(this._silenceAnalyser);
+        this._localSpeechGateState = createLocalSpeechGateState();
+        const dataArray = new Uint8Array(this._silenceAnalyser.fftSize);
+        this._silenceInterval = setInterval(() => {
+          this._silenceAnalyser.getByteTimeDomainData(dataArray);
+          let sum = 0;
+          let peak = 0;
+          for (let i = 0; i < dataArray.length; i++) {
+            const v = (dataArray[i] - 128) / 128;
+            sum += v * v;
+            const abs = Math.abs(v);
+            if (abs > peak) peak = abs;
+          }
+          const rms = Math.sqrt(sum / dataArray.length);
+          recordLocalSpeechWindow(this._localSpeechGateState, rms, peak);
+        }, 100);
+      } catch (e) {
+        logger.warn("Audio level gate setup failed, skipping", { error: e.message }, "audio");
+        this._localSpeechGateState = null;
+      }
+
+      this.mediaRecorder = new MediaRecorder(micStream);
       this.audioChunks = [];
       this.recordingStartTime = Date.now();
       this.recordingMimeType = this.mediaRecorder.mimeType || "audio/webm";
@@ -235,11 +385,22 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       };
 
       this.mediaRecorder.onstop = async () => {
+        if (this._silenceInterval) {
+          clearInterval(this._silenceInterval);
+          this._silenceInterval = null;
+        }
+        this._silenceCtx?.close().catch(() => {});
+        this._silenceCtx = null;
+        this._silenceAnalyser = null;
+
+        this.cleanupPreview({ showCleanup: this.shouldShowPreviewCleanupState() });
+
         this.isRecording = false;
         this.isProcessing = true;
         this.onStateChange?.({ isRecording: false, isProcessing: true });
 
         const audioBlob = new Blob(this.audioChunks, { type: this.recordingMimeType });
+        this.lastAudioBlob = audioBlob;
 
         logger.info(
           "Recording stopped",
@@ -257,12 +418,43 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         this.recordingStartTime = null;
         await this.processAudio(audioBlob, { durationSeconds });
 
-        stream.getTracks().forEach((track) => track.stop());
+        micStream.getTracks().forEach((track) => track.stop());
       };
 
       this.mediaRecorder.start();
       this.isRecording = true;
       this.onStateChange?.({ isRecording: true, isProcessing: false });
+
+      const {
+        showTranscriptionPreview,
+        useLocalWhisper,
+        localTranscriptionProvider,
+        whisperModel,
+        parakeetModel,
+      } = getSettings();
+      if (showTranscriptionPreview && useLocalWhisper) {
+        try {
+          this._previewAudioContext = new AudioContext({ sampleRate: 16000 });
+          this._previewSource = this._previewAudioContext.createMediaStreamSource(micStream);
+          await this._previewAudioContext.audioWorklet.addModule(this.getWorkletBlobUrl());
+
+          this._previewProcessor = new AudioWorkletNode(
+            this._previewAudioContext,
+            "pcm-streaming-processor"
+          );
+          this._previewProcessor.port.onmessage = (event) => {
+            window.electronAPI?.sendDictationPreviewAudio?.(event.data);
+          };
+          this._previewSource.connect(this._previewProcessor);
+
+          const provider = localTranscriptionProvider === "nvidia" ? "nvidia" : "whisper";
+          const model = provider === "nvidia" ? parakeetModel : whisperModel;
+          const language = getBaseLanguageCode(getSettings().preferredLanguage);
+          window.electronAPI?.startDictationPreview?.({ provider, model, language });
+        } catch (e) {
+          logger.warn("Preview worklet setup failed", { error: e.message }, "audio");
+        }
+      }
 
       return true;
     } catch (error) {
@@ -301,6 +493,7 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
   cancelRecording() {
     if (this.mediaRecorder && this.mediaRecorder.state === "recording") {
       this.mediaRecorder.onstop = () => {
+        this.cleanupPreview({ dismiss: true });
         this.isRecording = false;
         this.isProcessing = false;
         this.audioChunks = [];
@@ -330,17 +523,43 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
 
   async processAudio(audioBlob, metadata = {}) {
     const pipelineStart = performance.now();
+    const settings = getSettings();
+    const speechGateDecision = getLocalSpeechGateDecision(this._localSpeechGateState);
+    this._localSpeechGateState = null;
+
+    const shouldUseStrongLocalWhisperGate =
+      settings.useLocalWhisper && settings.localTranscriptionProvider === "whisper";
+    if (
+      speechGateDecision.skip &&
+      (speechGateDecision.reason === "silence" || shouldUseStrongLocalWhisperGate)
+    ) {
+      logger.info(
+        "Speech gate skipped transcription",
+        {
+          reason: speechGateDecision.reason,
+          useLocalWhisper: settings.useLocalWhisper,
+          localProvider: settings.localTranscriptionProvider,
+          peakRms: speechGateDecision.peakRms?.toFixed(4),
+          peakAmplitude: speechGateDecision.peakAmplitude?.toFixed(4),
+          speechWindowCount: speechGateDecision.speechWindowCount,
+          maxConsecutiveSpeechWindows: speechGateDecision.maxConsecutiveSpeechWindows,
+        },
+        "audio"
+      );
+      this.isProcessing = false;
+      this.onStateChange?.({ isRecording: false, isProcessing: false });
+      this.onTranscriptionComplete?.({ success: true, text: "" });
+      return;
+    }
 
     try {
-      const useLocalWhisper = localStorage.getItem("useLocalWhisper") === "true";
-      const localProvider = localStorage.getItem("localTranscriptionProvider") || "whisper";
-      const whisperModel = localStorage.getItem("whisperModel") || "base";
-      const parakeetModel = localStorage.getItem("parakeetModel") || "parakeet-tdt-0.6b-v3";
+      const useLocalWhisper = settings.useLocalWhisper;
+      const localProvider = settings.localTranscriptionProvider;
+      const whisperModel = settings.whisperModel;
+      const parakeetModel = settings.parakeetModel || "parakeet-tdt-0.6b-v3";
 
-      const cloudTranscriptionMode =
-        localStorage.getItem("cloudTranscriptionMode") ||
-        (hasStoredByokKey() ? "byok" : "openwhispr");
-      const isSignedIn = localStorage.getItem("isSignedIn") === "true";
+      const cloudTranscriptionMode = settings.cloudTranscriptionMode;
+      const isSignedIn = settings.isSignedIn;
 
       const isOpenWhisprCloudMode = !useLocalWhisper && cloudTranscriptionMode === "openwhispr";
       const useCloud = isOpenWhisprCloudMode && isSignedIn;
@@ -366,6 +585,7 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
             "OpenWhispr Cloud requires sign-in. Please sign in again or switch to BYOK mode."
           );
           err.code = "AUTH_REQUIRED";
+          err.messageKey = "hooks.audioRecording.errorDescriptions.sessionExpired";
           throw err;
         }
         activeModel = "openwhispr-cloud";
@@ -379,7 +599,19 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         return;
       }
 
+      this.lastAudioMetadata = {
+        durationMs: metadata?.durationSeconds
+          ? Math.round(metadata.durationSeconds * 1000)
+          : Math.round(performance.now() - pipelineStart),
+        provider: result?.source || (useLocalWhisper ? localProvider : "cloud"),
+        model: activeModel || null,
+      };
+
       this.onTranscriptionComplete?.(result);
+
+      if (result?.source === "openwhispr") {
+        window.dispatchEvent(new Event("usage-changed"));
+      }
 
       const roundTripDurationMs = Math.round(performance.now() - pipelineStart);
 
@@ -420,7 +652,13 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
           title: "Transcription Error",
           description: `Transcription failed: ${error.message}`,
           code: error.code,
+          messageKey: error.messageKey,
         });
+
+        // Save failed transcription with audio so the user can retry later
+        if (this.lastAudioBlob) {
+          this.saveFailedTranscription(error.message, error.code || null, metadata);
+        }
       }
     } finally {
       if (this.isProcessing) {
@@ -437,7 +675,7 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       // Send original audio to main process - FFmpeg in main process handles conversion
       // (renderer-side AudioContext conversion was unreliable with WebM/Opus format)
       const arrayBuffer = await audioBlob.arrayBuffer();
-      const language = getBaseLanguageCode(localStorage.getItem("preferredLanguage"));
+      const language = getBaseLanguageCode(getSettings().preferredLanguage);
       const options = { model };
       if (language) {
         options.language = language;
@@ -474,12 +712,13 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       );
 
       if (result.success && result.text) {
+        const rawText = result.text;
         const reasoningStart = performance.now();
         const text = await this.processTranscription(result.text, "local");
         timings.reasoningProcessingDurationMs = Math.round(performance.now() - reasoningStart);
 
         if (text !== null && text !== undefined) {
-          return { success: true, text: text || result.text, source: "local", timings };
+          return { success: true, text: text || result.text, rawText, source: "local", timings };
         } else {
           throw new Error("No text transcribed");
         }
@@ -493,8 +732,7 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         throw error;
       }
 
-      const allowOpenAIFallback = localStorage.getItem("allowOpenAIFallback") === "true";
-      const isLocalMode = localStorage.getItem("useLocalWhisper") === "true";
+      const { allowOpenAIFallback, useLocalWhisper: isLocalMode } = getSettings();
 
       if (allowOpenAIFallback && isLocalMode) {
         try {
@@ -516,11 +754,6 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
 
     try {
       const arrayBuffer = await audioBlob.arrayBuffer();
-      const language = validateLanguageForModel(localStorage.getItem("preferredLanguage"), model);
-      const options = { model };
-      if (language) {
-        options.language = language;
-      }
 
       logger.debug(
         "Parakeet transcription starting",
@@ -533,7 +766,7 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       );
 
       const transcriptionStart = performance.now();
-      const result = await window.electronAPI.transcribeLocalParakeet(arrayBuffer, options);
+      const result = await window.electronAPI.transcribeLocalParakeet(arrayBuffer, { model });
       timings.transcriptionProcessingDurationMs = Math.round(
         performance.now() - transcriptionStart
       );
@@ -548,12 +781,19 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       );
 
       if (result.success && result.text) {
+        const rawText = result.text;
         const reasoningStart = performance.now();
         const text = await this.processTranscription(result.text, "local-parakeet");
         timings.reasoningProcessingDurationMs = Math.round(performance.now() - reasoningStart);
 
         if (text !== null && text !== undefined) {
-          return { success: true, text: text || result.text, source: "local-parakeet", timings };
+          return {
+            success: true,
+            text: text || result.text,
+            rawText,
+            source: "local-parakeet",
+            timings,
+          };
         } else {
           throw new Error("No text transcribed");
         }
@@ -567,8 +807,7 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         throw error;
       }
 
-      const allowOpenAIFallback = localStorage.getItem("allowOpenAIFallback") === "true";
-      const isLocalMode = localStorage.getItem("useLocalWhisper") === "true";
+      const { allowOpenAIFallback, useLocalWhisper: isLocalMode } = getSettings();
 
       if (allowOpenAIFallback && isLocalMode) {
         try {
@@ -586,11 +825,8 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
   }
 
   async getAPIKey() {
-    // Get the current transcription provider
-    const provider =
-      typeof localStorage !== "undefined"
-        ? localStorage.getItem("cloudTranscriptionProvider") || "openai"
-        : "openai";
+    const s = getSettings();
+    const provider = s.cloudTranscriptionProvider || "openai";
 
     // Check cache (invalidate if provider changed)
     if (this.cachedApiKey !== null && this.cachedApiKeyProvider === provider) {
@@ -600,8 +836,8 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
     let apiKey = null;
 
     if (provider === "custom") {
-      // Prefer localStorage (user-entered via UI) over main process (.env)
-      apiKey = localStorage.getItem("customTranscriptionApiKey") || "";
+      // Prefer store value (user-entered via UI) over main process (.env)
+      apiKey = s.customTranscriptionApiKey || "";
       if (!apiKey.trim()) {
         try {
           apiKey = await window.electronAPI.getCustomTranscriptionKey?.();
@@ -621,7 +857,6 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
           provider,
           hasKey: !!apiKey,
           keyLength: apiKey?.length || 0,
-          keyPreview: apiKey ? `${apiKey.substring(0, 8)}...` : "(none)",
         },
         "transcription"
       );
@@ -631,36 +866,46 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         apiKey = null;
       }
     } else if (provider === "mistral") {
-      // Prefer localStorage (user-entered via UI) over main process (.env)
+      // Prefer store value (user-entered via UI) over main process (.env)
       // to avoid stale keys in process.env after auth mode transitions
-      apiKey = localStorage.getItem("mistralApiKey");
+      apiKey = s.mistralApiKey;
       if (!isValidApiKey(apiKey, "mistral")) {
         apiKey = await window.electronAPI.getMistralKey?.();
       }
       if (!isValidApiKey(apiKey, "mistral")) {
-        throw new Error("Mistral API key not found. Please set your API key in the Control Panel.");
+        const err = new Error(
+          "Mistral API key not found. Please set your API key in the Control Panel."
+        );
+        err.code = "API_KEY_MISSING";
+        throw err;
       }
     } else if (provider === "groq") {
-      // Prefer localStorage (user-entered via UI) over main process (.env)
-      apiKey = localStorage.getItem("groqApiKey");
+      // Prefer store value (user-entered via UI) over main process (.env)
+      apiKey = s.groqApiKey;
       if (!isValidApiKey(apiKey, "groq")) {
         apiKey = await window.electronAPI.getGroqKey?.();
       }
       if (!isValidApiKey(apiKey, "groq")) {
-        throw new Error("Groq API key not found. Please set your API key in the Control Panel.");
+        const err = new Error(
+          "Groq API key not found. Please set your API key in the Control Panel."
+        );
+        err.code = "API_KEY_MISSING";
+        throw err;
       }
     } else {
       // Default to OpenAI
-      // Prefer localStorage (user-entered via UI) over main process (.env)
+      // Prefer store value (user-entered via UI) over main process (.env)
       // to avoid stale keys in process.env after auth mode transitions
-      apiKey = localStorage.getItem("openaiApiKey");
+      apiKey = s.openaiApiKey;
       if (!isValidApiKey(apiKey, "openai")) {
         apiKey = await window.electronAPI.getOpenAIKey();
       }
       if (!isValidApiKey(apiKey, "openai")) {
-        throw new Error(
+        const err = new Error(
           "OpenAI API key not found. Please set your API key in the .env file or Control Panel."
         );
+        err.code = "API_KEY_MISSING";
+        throw err;
       }
     }
 
@@ -669,89 +914,18 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
     return apiKey;
   }
 
-  async optimizeAudio(audioBlob) {
-    return new Promise((resolve) => {
-      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-      const reader = new FileReader();
-
-      reader.onload = async () => {
-        try {
-          const arrayBuffer = reader.result;
-          const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-
-          // Convert to 16kHz mono for smaller size and faster upload
-          const sampleRate = 16000;
-          const channels = 1;
-          const length = Math.floor(audioBuffer.duration * sampleRate);
-          const offlineContext = new OfflineAudioContext(channels, length, sampleRate);
-
-          const source = offlineContext.createBufferSource();
-          source.buffer = audioBuffer;
-          source.connect(offlineContext.destination);
-          source.start();
-
-          const renderedBuffer = await offlineContext.startRendering();
-          const wavBlob = this.audioBufferToWav(renderedBuffer);
-          resolve(wavBlob);
-        } catch (error) {
-          // If optimization fails, use original
-          resolve(audioBlob);
-        }
-      };
-
-      reader.onerror = () => resolve(audioBlob);
-      reader.readAsArrayBuffer(audioBlob);
-    });
-  }
-
-  audioBufferToWav(buffer) {
-    const length = buffer.length;
-    const arrayBuffer = new ArrayBuffer(44 + length * 2);
-    const view = new DataView(arrayBuffer);
-    const sampleRate = buffer.sampleRate;
-    const channelData = buffer.getChannelData(0);
-
-    const writeString = (offset, string) => {
-      for (let i = 0; i < string.length; i++) {
-        view.setUint8(offset + i, string.charCodeAt(i));
-      }
-    };
-
-    writeString(0, "RIFF");
-    view.setUint32(4, 36 + length * 2, true);
-    writeString(8, "WAVE");
-    writeString(12, "fmt ");
-    view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true);
-    view.setUint16(22, 1, true);
-    view.setUint32(24, sampleRate, true);
-    view.setUint32(28, sampleRate * 2, true);
-    view.setUint16(32, 2, true);
-    view.setUint16(34, 16, true);
-    writeString(36, "data");
-    view.setUint32(40, length * 2, true);
-
-    let offset = 44;
-    for (let i = 0; i < length; i++) {
-      const sample = Math.max(-1, Math.min(1, channelData[i]));
-      view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
-      offset += 2;
-    }
-
-    return new Blob([arrayBuffer], { type: "audio/wav" });
-  }
-
-  async processWithReasoningModel(text, model, agentName) {
+  async processWithReasoningModel(text, model, agentName, config) {
     logger.logReasoning("CALLING_REASONING_SERVICE", {
       model,
       agentName,
       textLength: text.length,
+      hasOverrides: !!config,
     });
 
     const startTime = Date.now();
 
     try {
-      const result = await ReasoningService.processText(text, model, agentName);
+      const result = await ReasoningService.processText(text, model, agentName, config);
 
       const processingTime = Date.now() - startTime;
 
@@ -778,37 +952,43 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
   }
 
   async isReasoningAvailable() {
-    if (typeof window === "undefined" || !window.localStorage) {
+    if (typeof window === "undefined") {
       return false;
     }
 
-    const storedValue = localStorage.getItem("useReasoningModel");
+    const s = getSettings();
+    const useReasoning =
+      !!s.useCleanupModel || (!!s.useDictationAgent && !!s.dictationAgentModel?.trim());
     const now = Date.now();
     const cacheValid =
       this.reasoningAvailabilityCache &&
       now < this.reasoningAvailabilityCache.expiresAt &&
-      this.cachedReasoningPreference === storedValue;
+      this.cachedReasoningPreference === useReasoning;
 
     if (cacheValid) {
       return this.reasoningAvailabilityCache.value;
     }
 
     logger.logReasoning("REASONING_STORAGE_CHECK", {
-      storedValue,
-      typeOfStoredValue: typeof storedValue,
-      isTrue: storedValue === "true",
-      isTruthy: !!storedValue && storedValue !== "false",
+      useReasoning,
     });
-
-    const useReasoning = storedValue === "true" || (!!storedValue && storedValue !== "false");
 
     if (!useReasoning) {
       this.reasoningAvailabilityCache = {
         value: false,
         expiresAt: now + REASONING_CACHE_TTL,
       };
-      this.cachedReasoningPreference = storedValue;
+      this.cachedReasoningPreference = useReasoning;
       return false;
+    }
+
+    if (s.useCleanupModel && isCloudCleanupMode()) {
+      this.reasoningAvailabilityCache = {
+        value: true,
+        expiresAt: now + REASONING_CACHE_TTL,
+      };
+      this.cachedReasoningPreference = useReasoning;
+      return true;
     }
 
     try {
@@ -824,7 +1004,7 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         value: isAvailable,
         expiresAt: now + REASONING_CACHE_TTL,
       };
-      this.cachedReasoningPreference = storedValue;
+      this.cachedReasoningPreference = useReasoning;
 
       return isAvailable;
     } catch (error) {
@@ -837,13 +1017,29 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         value: false,
         expiresAt: now + REASONING_CACHE_TTL,
       };
-      this.cachedReasoningPreference = storedValue;
+      this.cachedReasoningPreference = useReasoning;
       return false;
     }
   }
 
   async processTranscription(text, source) {
     const normalizedText = typeof text === "string" ? text.trim() : "";
+
+    if (!normalizedText) {
+      logger.logReasoning("TRANSCRIPTION_EMPTY_SKIPPING_REASONING", {
+        source,
+        reason: "Empty text after normalization",
+      });
+      return normalizedText;
+    }
+
+    if (this.skipReasoning) {
+      logger.logReasoning("REASONING_SKIPPED_AGENT_MODE", {
+        source,
+        reason: "skipReasoning is set (agent mode) — returning raw transcription",
+      });
+      return normalizedText;
+    }
 
     logger.logReasoning("TRANSCRIPTION_RECEIVED", {
       source,
@@ -852,21 +1048,20 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       timestamp: new Date().toISOString(),
     });
 
-    const reasoningModel =
-      typeof window !== "undefined" && window.localStorage
-        ? localStorage.getItem("reasoningModel") || ""
-        : "";
-    const reasoningProvider =
-      typeof window !== "undefined" && window.localStorage
-        ? localStorage.getItem("reasoningProvider") || "auto"
-        : "auto";
+    const cleanupModel = getEffectiveCleanupModel();
+    const isCloud = isCloudCleanupMode();
+    const settings = getSettings();
+    const cleanupProvider = settings.cleanupProvider || "auto";
+    const hasAgentModel = !!settings.dictationAgentModel?.trim();
+    const cleanupReachable = !!settings.useCleanupModel && (!!cleanupModel || isCloud);
+    const agentReachable = !!settings.useDictationAgent && hasAgentModel;
     const agentName =
       typeof window !== "undefined" && window.localStorage
         ? localStorage.getItem("agentName") || null
         : null;
-    if (!reasoningModel) {
+    if (!cleanupReachable && !agentReachable) {
       logger.logReasoning("REASONING_SKIPPED", {
-        reason: "No reasoning model selected",
+        reason: "No cleanup or dictation-agent model available",
       });
       return normalizedText;
     }
@@ -875,23 +1070,32 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
 
     logger.logReasoning("REASONING_CHECK", {
       useReasoning,
-      reasoningModel,
-      reasoningProvider,
+      cleanupModel,
+      cleanupProvider,
       agentName,
     });
 
     if (useReasoning) {
       try {
+        const route = resolveReasoningRoute(normalizedText, getSettings(), agentName);
+        if (route.kind === "skip") return normalizedText;
+
+        const targetModel = route.kind === "agent" ? route.model : cleanupModel;
+        const reasoningConfig = route.config;
+
         logger.logReasoning("SENDING_TO_REASONING", {
           preparedTextLength: normalizedText.length,
-          model: reasoningModel,
-          provider: reasoningProvider,
+          model: targetModel,
+          provider: route.config?.provider || cleanupProvider,
+          path: route.kind,
+          disableThinking: reasoningConfig?.disableThinking,
         });
 
         const result = await this.processWithReasoningModel(
           normalizedText,
-          reasoningModel,
-          agentName
+          targetModel,
+          agentName,
+          reasoningConfig
         );
 
         logger.logReasoning("REASONING_SUCCESS", {
@@ -907,7 +1111,7 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
           stack: error.stack,
           fallbackToCleanup: true,
         });
-        console.error(`Reasoning failed (${source}):`, error.message);
+        logger.warn("Reasoning failed", { source, error: error.message }, "notes");
       }
     }
 
@@ -1077,15 +1281,23 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
     if (!navigator.onLine) {
       const err = new Error("You're offline. Cloud transcription requires an internet connection.");
       err.code = "OFFLINE";
+      err.messageKey = "hooks.audioRecording.errorDescriptions.offline";
       throw err;
     }
 
     const timings = {};
-    const language = getBaseLanguageCode(localStorage.getItem("preferredLanguage"));
+    const settings = getSettings();
+    const language = getBaseLanguageCode(settings.preferredLanguage);
 
     const arrayBuffer = await audioBlob.arrayBuffer();
+    const audioSizeBytes = audioBlob.size;
+    const audioFormat = audioBlob.type;
     const opts = {};
     if (language) opts.language = language;
+    const cleanupCloudMode = settings.cleanupCloudMode || "openwhispr";
+    if (settings.useCleanupModel && !this.skipReasoning && cleanupCloudMode === "openwhispr") {
+      opts.sendLogs = "false";
+    }
 
     const dictionaryPrompt = this.getCustomDictionaryPrompt();
     if (dictionaryPrompt) opts.prompt = dictionaryPrompt;
@@ -1103,22 +1315,38 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
     });
     timings.transcriptionProcessingDurationMs = Math.round(performance.now() - transcriptionStart);
 
-    // Process with reasoning if enabled
+    const rawText = result.text;
     let processedText = result.text;
-    const useReasoningModel = localStorage.getItem("useReasoningModel") === "true";
-    if (useReasoningModel && processedText) {
+    if (processedText && !this.skipReasoning) {
       const reasoningStart = performance.now();
-      const agentName = localStorage.getItem("agentName") || "";
-      const cloudReasoningMode = localStorage.getItem("cloudReasoningMode") || "openwhispr";
+      const agentName = localStorage.getItem("agentName") || null;
+      const route = resolveReasoningRoute(processedText, settings, agentName);
+      const cleanupCloudMode = settings.cleanupCloudMode || "openwhispr";
 
-      if (cloudReasoningMode === "openwhispr") {
+      if (route.kind === "agent") {
+        const reasoned = await this.processWithReasoningModel(
+          processedText,
+          route.model,
+          agentName,
+          route.config
+        );
+        if (reasoned) processedText = reasoned;
+      } else if (route.kind === "cleanup" && cleanupCloudMode === "openwhispr") {
         const reasonResult = await withSessionRefresh(async () => {
           const res = await window.electronAPI.cloudReason(processedText, {
             agentName,
-            customDictionary: this.getCustomDictionaryArray(),
+            customDictionary: settings.customDictionary,
             customPrompt: this.getCustomPrompt(),
-            language: localStorage.getItem("preferredLanguage") || "auto",
-            locale: localStorage.getItem("uiLanguage") || "en",
+            language: settings.preferredLanguage || "auto",
+            locale: settings.uiLanguage || "en",
+            sttProvider: result.sttProvider,
+            sttModel: result.sttModel,
+            sttProcessingMs: result.sttProcessingMs,
+            sttWordCount: result.sttWordCount,
+            sttLanguage: result.sttLanguage,
+            audioDurationMs: result.audioDurationMs,
+            audioSizeBytes,
+            audioFormat,
           });
           if (!res.success) {
             const err = new Error(res.error || "Cloud reasoning failed");
@@ -1131,17 +1359,16 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         if (reasonResult.success) {
           processedText = reasonResult.text;
         }
-      } else {
-        const reasoningModel = localStorage.getItem("reasoningModel") || "";
-        if (reasoningModel) {
-          const result = await this.processWithReasoningModel(
+      } else if (route.kind === "cleanup") {
+        const effectiveModel = getEffectiveCleanupModel();
+        if (effectiveModel) {
+          const reasoned = await this.processWithReasoningModel(
             processedText,
-            reasoningModel,
-            agentName
+            effectiveModel,
+            agentName,
+            route.config
           );
-          if (result) {
-            processedText = result;
-          }
+          if (reasoned) processedText = reasoned;
         }
       }
       timings.reasoningProcessingDurationMs = Math.round(performance.now() - reasoningStart);
@@ -1150,34 +1377,22 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
     return {
       success: true,
       text: processedText,
+      rawText,
       source: "openwhispr",
       timings,
       limitReached: result.limitReached,
       wordsUsed: result.wordsUsed,
       wordsRemaining: result.wordsRemaining,
+      clientTranscriptionId: result.clientTranscriptionId,
     };
   }
 
   getCustomDictionaryArray() {
-    try {
-      const raw = localStorage.getItem("customDictionary");
-      if (!raw) return [];
-      const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      return [];
-    }
+    return getSettings().customDictionary;
   }
 
   getCustomPrompt() {
-    try {
-      const raw = localStorage.getItem("customUnifiedPrompt");
-      if (!raw) return undefined;
-      const parsed = JSON.parse(raw);
-      return typeof parsed === "string" ? parsed : undefined;
-    } catch {
-      return undefined;
-    }
+    return getSettings().customPrompts.cleanup || undefined;
   }
 
   getKeyterms() {
@@ -1186,19 +1401,15 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
 
   async processWithOpenAIAPI(audioBlob, metadata = {}) {
     const timings = {};
-    const language = getBaseLanguageCode(localStorage.getItem("preferredLanguage"));
-    const allowLocalFallback = localStorage.getItem("allowLocalFallback") === "true";
-    const fallbackModel = localStorage.getItem("fallbackWhisperModel") || "base";
+    const apiSettings = getSettings();
+    const language = getBaseLanguageCode(apiSettings.preferredLanguage);
+    const allowLocalFallback = apiSettings.allowLocalFallback;
+    const fallbackModel = apiSettings.fallbackWhisperModel || "base";
 
     try {
       const durationSeconds = metadata.durationSeconds ?? null;
-      const shouldSkipOptimizationForDuration =
-        typeof durationSeconds === "number" &&
-        durationSeconds > 0 &&
-        durationSeconds < SHORT_CLIP_DURATION_SECONDS;
-
       const model = this.getTranscriptionModel();
-      const provider = localStorage.getItem("cloudTranscriptionProvider") || "openai";
+      const provider = apiSettings.cloudTranscriptionProvider || "openai";
 
       logger.debug(
         "Transcription request starting",
@@ -1213,26 +1424,8 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         "transcription"
       );
 
-      // gpt-4o-transcribe models don't support WAV format - they need webm, mp3, mp4, etc.
-      // Only use WAV optimization for whisper-1 and groq models
-      const is4oModel = model.includes("gpt-4o");
-      const shouldOptimize =
-        !is4oModel && !shouldSkipOptimizationForDuration && audioBlob.size > 1024 * 1024;
-
-      logger.debug(
-        "Audio optimization decision",
-        {
-          is4oModel,
-          shouldOptimize,
-          shouldSkipOptimizationForDuration,
-        },
-        "transcription"
-      );
-
-      const [apiKey, optimizedAudio] = await Promise.all([
-        this.getAPIKey(),
-        shouldOptimize ? this.optimizeAudio(audioBlob) : Promise.resolve(audioBlob),
-      ]);
+      const apiKey = await this.getAPIKey();
+      const optimizedAudio = audioBlob;
 
       const formData = new FormData();
       // Determine the correct file extension based on the blob type
@@ -1267,9 +1460,29 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         formData.append("language", language);
       }
 
-      // Add custom dictionary as prompt hint for cloud transcription
-      const dictionaryPrompt = this.getCustomDictionaryPrompt();
+      const endpoint = this.getTranscriptionEndpoint();
+
+      // Groq rejects prompts > 896 chars (incl. when reached via "custom" provider).
+      // 890 leaves margin for UTF-16 vs codepoint counting drift.
+      const isGroqEndpoint = provider === "groq" || endpoint.includes("api.groq.com");
+      const MAX_PROMPT_CHARS = isGroqEndpoint ? 890 : 900;
+      let dictionaryPrompt = this.getCustomDictionaryPrompt();
       if (dictionaryPrompt) {
+        if (dictionaryPrompt.length > MAX_PROMPT_CHARS) {
+          const originalLength = dictionaryPrompt.length;
+          const truncated = dictionaryPrompt.slice(0, MAX_PROMPT_CHARS);
+          const lastComma = truncated.lastIndexOf(",");
+          dictionaryPrompt = lastComma > 0 ? truncated.slice(0, lastComma) : truncated;
+          logger.debug(
+            "Custom dictionary prompt truncated",
+            {
+              originalLength,
+              truncatedLength: dictionaryPrompt.length,
+              maxChars: MAX_PROMPT_CHARS,
+            },
+            "transcription"
+          );
+        }
         formData.append("prompt", dictionaryPrompt);
       }
 
@@ -1278,7 +1491,6 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         formData.append("stream", "true");
       }
 
-      const endpoint = this.getTranscriptionEndpoint();
       const isCustomEndpoint =
         provider === "custom" ||
         (!endpoint.includes("api.openai.com") &&
@@ -1308,12 +1520,13 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
 
         if (proxyText && proxyText.trim().length > 0) {
           timings.transcriptionProcessingDurationMs = Math.round(performance.now() - apiCallStart);
+          const rawText = proxyText;
           const reasoningStart = performance.now();
           const text = await this.processTranscription(proxyText, "mistral");
           timings.reasoningProcessingDurationMs = Math.round(performance.now() - reasoningStart);
 
           const source = (await this.isReasoningAvailable()) ? "mistral-reasoned" : "mistral";
-          return { success: true, text, source, timings };
+          return { success: true, text, rawText, source, timings };
         }
 
         throw new Error("No text transcribed - Mistral response was empty");
@@ -1328,7 +1541,6 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
           provider,
           isCustomEndpoint,
           hasApiKey: !!apiKey,
-          apiKeyPreview: apiKey ? `${apiKey.substring(0, 8)}...` : "(none)",
         },
         "transcription"
       );
@@ -1384,7 +1596,13 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
           },
           "transcription"
         );
-        throw new Error(`API Error: ${response.status} ${errorText}`);
+        const err = new Error(`API Error: ${response.status} ${errorText}`);
+        if (response.status === 401) err.code = "INVALID_KEY";
+        else if (response.status === 429) {
+          err.code = "LIMIT_REACHED";
+          err.messageKey = "hooks.audioRecording.errorDescriptions.dailyLimitReached";
+        } else if (response.status >= 500) err.code = "SERVER_ERROR";
+        throw err;
       }
 
       let result;
@@ -1442,6 +1660,7 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       // Check for text - handle both empty string and missing field
       if (result.text && result.text.trim().length > 0) {
         timings.transcriptionProcessingDurationMs = Math.round(performance.now() - apiCallStart);
+        const rawText = result.text;
 
         const reasoningStart = performance.now();
         const text = await this.processTranscription(result.text, "openai");
@@ -1459,7 +1678,7 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
           },
           "transcription"
         );
-        return { success: true, text, source, timings };
+        return { success: true, text, rawText, source, timings };
       } else {
         // Log at info level so it shows without debug mode
         logger.info(
@@ -1490,7 +1709,7 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         );
       }
     } catch (error) {
-      const isOpenAIMode = localStorage.getItem("useLocalWhisper") !== "true";
+      const isOpenAIMode = !getSettings().useLocalWhisper;
 
       if (allowLocalFallback && isOpenAIMode) {
         try {
@@ -1522,17 +1741,9 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
 
   getTranscriptionModel() {
     try {
-      const provider =
-        typeof localStorage !== "undefined"
-          ? localStorage.getItem("cloudTranscriptionProvider") || "openai"
-          : "openai";
-
-      const model =
-        typeof localStorage !== "undefined"
-          ? localStorage.getItem("cloudTranscriptionModel") || ""
-          : "";
-
-      const trimmedModel = model.trim();
+      const s = getSettings();
+      const provider = s.cloudTranscriptionProvider || "openai";
+      const trimmedModel = (s.cloudTranscriptionModel || "").trim();
 
       // For custom provider, use whatever model is set (or fallback to whisper-1)
       if (provider === "custom") {
@@ -1567,24 +1778,21 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
   }
 
   getTranscriptionEndpoint() {
-    // Get current provider and base URL to check if cache is valid
-    const currentProvider =
-      typeof localStorage !== "undefined"
-        ? localStorage.getItem("cloudTranscriptionProvider") || "openai"
-        : "openai";
-    const currentBaseUrl =
-      typeof localStorage !== "undefined"
-        ? localStorage.getItem("cloudTranscriptionBaseUrl") || ""
-        : "";
+    const s = getSettings();
+    const currentProvider = s.cloudTranscriptionProvider || "openai";
+    const currentBaseUrl = s.cloudTranscriptionBaseUrl || "";
+    const transcriptionMode = s.transcriptionMode || "";
+    const remoteUrl = (s.remoteTranscriptionUrl || "").trim();
 
-    // Only use custom URL when provider is explicitly "custom"
-    const isCustomEndpoint = currentProvider === "custom";
+    const isSelfHosted = transcriptionMode === "self-hosted" && remoteUrl.length > 0;
+    const isCustomEndpoint = isSelfHosted || currentProvider === "custom";
 
-    // Invalidate cache if provider or base URL changed
     if (
       this.cachedTranscriptionEndpoint &&
       (this.cachedEndpointProvider !== currentProvider ||
-        this.cachedEndpointBaseUrl !== currentBaseUrl)
+        this.cachedEndpointBaseUrl !== currentBaseUrl ||
+        this.cachedEndpointMode !== transcriptionMode ||
+        this.cachedEndpointRemoteUrl !== remoteUrl)
     ) {
       logger.debug(
         "STT endpoint cache invalidated",
@@ -1593,6 +1801,10 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
           newProvider: currentProvider,
           previousBaseUrl: this.cachedEndpointBaseUrl,
           newBaseUrl: currentBaseUrl,
+          previousMode: this.cachedEndpointMode,
+          newMode: transcriptionMode,
+          previousRemoteUrl: this.cachedEndpointRemoteUrl,
+          newRemoteUrl: remoteUrl,
         },
         "transcription"
       );
@@ -1604,9 +1816,10 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
     }
 
     try {
-      // Use custom URL only when provider is "custom", otherwise use provider-specific defaults
       let base;
-      if (isCustomEndpoint) {
+      if (isSelfHosted) {
+        base = remoteUrl;
+      } else if (currentProvider === "custom") {
         base = currentBaseUrl.trim() || API_ENDPOINTS.TRANSCRIPTION_BASE;
       } else if (currentProvider === "groq") {
         base = API_ENDPOINTS.GROQ_BASE;
@@ -1623,8 +1836,11 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         "STT endpoint resolution",
         {
           provider: currentProvider,
+          mode: transcriptionMode,
+          isSelfHosted,
           isCustomEndpoint,
           rawBaseUrl: currentBaseUrl,
+          remoteUrl,
           normalizedBase,
           defaultBase: API_ENDPOINTS.TRANSCRIPTION_BASE,
         },
@@ -1635,6 +1851,8 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         this.cachedTranscriptionEndpoint = endpoint;
         this.cachedEndpointProvider = currentProvider;
         this.cachedEndpointBaseUrl = currentBaseUrl;
+        this.cachedEndpointMode = transcriptionMode;
+        this.cachedEndpointRemoteUrl = remoteUrl;
 
         logger.debug(
           "STT endpoint resolved",
@@ -1692,6 +1910,8 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       this.cachedTranscriptionEndpoint = API_ENDPOINTS.TRANSCRIPTION;
       this.cachedEndpointProvider = currentProvider;
       this.cachedEndpointBaseUrl = currentBaseUrl;
+      this.cachedEndpointMode = transcriptionMode;
+      this.cachedEndpointRemoteUrl = remoteUrl;
       return API_ENDPOINTS.TRANSCRIPTION;
     }
   }
@@ -1712,12 +1932,90 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
     }
   }
 
-  async saveTranscription(text) {
+  async saveTranscription(text, rawText = null, { clientTranscriptionId } = {}) {
+    if (!getSettings().dataRetentionEnabled) {
+      logger.debug("Skipping transcription save — data retention disabled", {}, "audio");
+      this.lastAudioBlob = null;
+      this.lastAudioMetadata = null;
+      return true;
+    }
+
     try {
-      await window.electronAPI.saveTranscription(text);
+      const result = await window.electronAPI.saveTranscription(text, rawText, {
+        clientTranscriptionId,
+      });
+      if (result?.id) syncService.debouncedPush("transcription", result.id);
+
+      // Save audio if we have a captured blob and the transcription was saved successfully
+      if (result?.id && this.lastAudioBlob) {
+        try {
+          const arrayBuffer = await this.lastAudioBlob.arrayBuffer();
+          await window.electronAPI.saveTranscriptionAudio(
+            result.id,
+            arrayBuffer,
+            this.lastAudioMetadata
+          );
+        } catch (audioErr) {
+          // Non-blocking: transcription is saved even if audio save fails
+          logger.warn("Failed to save transcription audio", { error: audioErr.message }, "audio");
+        }
+        this.lastAudioBlob = null;
+        this.lastAudioMetadata = null;
+      }
+
       return true;
     } catch (error) {
       return false;
+    }
+  }
+
+  async saveFailedTranscription(errorMessage, errorCode = null, metadata = {}) {
+    if (!getSettings().dataRetentionEnabled) {
+      logger.debug("Skipping failed transcription save — data retention disabled", {}, "audio");
+      this.lastAudioBlob = null;
+      this.lastAudioMetadata = null;
+      return;
+    }
+
+    try {
+      const result = await window.electronAPI.saveTranscription("", null, {
+        status: "failed",
+        errorMessage,
+        errorCode,
+      });
+      if (result?.id) syncService.debouncedPush("transcription", result.id);
+
+      if (result?.id && this.lastAudioBlob) {
+        try {
+          const durationMs = metadata?.durationSeconds
+            ? Math.round(metadata.durationSeconds * 1000)
+            : null;
+          const arrayBuffer = await this.lastAudioBlob.arrayBuffer();
+          await window.electronAPI.saveTranscriptionAudio(result.id, arrayBuffer, {
+            durationMs,
+            provider: null,
+            model: null,
+          });
+        } catch (audioErr) {
+          logger.warn(
+            "Failed to save audio for failed transcription",
+            {
+              error: audioErr.message,
+            },
+            "audio"
+          );
+        }
+        this.lastAudioBlob = null;
+        this.lastAudioMetadata = null;
+      }
+    } catch (error) {
+      logger.error(
+        "Failed to save failed transcription record",
+        {
+          error: error.message,
+        },
+        "audio"
+      );
     }
   }
 
@@ -1731,19 +2029,31 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
   }
 
   shouldUseStreaming(isSignedInOverride) {
-    const cloudTranscriptionMode =
-      localStorage.getItem("cloudTranscriptionMode") ||
-      (hasStoredByokKey() ? "byok" : "openwhispr");
-    const isSignedIn = isSignedInOverride ?? localStorage.getItem("isSignedIn") === "true";
-    const useLocalWhisper = localStorage.getItem("useLocalWhisper") === "true";
-    const streamingDisabled = localStorage.getItem("deepgramStreaming") === "false";
+    const s = getSettings();
+    if (s.useLocalWhisper) return false;
 
-    return (
-      !useLocalWhisper &&
-      cloudTranscriptionMode === "openwhispr" &&
-      isSignedIn &&
-      !streamingDisabled
-    );
+    // For dictation/agent: respect sttConfig mode from the API — this allows
+    // batch mode even for realtime-capable models (e.g. gpt-4o-mini-transcribe).
+    if (this.context !== "notes" && this.sttConfig?.dictation?.mode === "batch") {
+      return false;
+    }
+
+    if (REALTIME_MODELS.has(s.cloudTranscriptionModel)) {
+      // Realtime WS is OpenAI-only — other providers fall through to HTTP.
+      if ((s.cloudTranscriptionProvider || "openai") !== "openai") return false;
+      if (s.cloudTranscriptionMode === "byok") return !!s.openaiApiKey;
+      if (s.cloudTranscriptionMode === "openwhispr") return !!(isSignedInOverride ?? s.isSignedIn);
+      return false;
+    }
+
+    if (s.cloudTranscriptionMode !== "openwhispr" || !(isSignedInOverride ?? s.isSignedIn)) {
+      return false;
+    }
+    if (this.context === "notes") {
+      return localStorage.getItem("notesStreamingPreference") === "streaming";
+    }
+    if (!this.sttConfig) return false;
+    return this.sttConfig.dictation?.mode === "streaming";
   }
 
   async warmupStreamingConnection({ isSignedIn: isSignedInOverride } = {}) {
@@ -1753,14 +2063,21 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
     }
 
     try {
+      const provider = this.getStreamingProvider();
       const [, wsResult] = await Promise.all([
         this.cacheMicrophoneDeviceId(),
         withSessionRefresh(async () => {
-          const warmupLang = localStorage.getItem("preferredLanguage");
-          const res = await window.electronAPI.deepgramStreamingWarmup({
+          const {
+            preferredLanguage: warmupLang,
+            cloudTranscriptionModel,
+            cloudTranscriptionMode,
+          } = getSettings();
+          const res = await provider.warmup({
             sampleRate: 16000,
             language: warmupLang && warmupLang !== "auto" ? warmupLang : undefined,
             keyterms: this.getKeyterms(),
+            model: cloudTranscriptionModel,
+            mode: cloudTranscriptionMode === "byok" ? "byok" : "openwhispr",
           });
           // Throw error to trigger retry if AUTH_EXPIRED
           if (!res.success && res.code) {
@@ -1809,7 +2126,7 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         }
 
         logger.info(
-          "Deepgram streaming connection warmed up",
+          "Streaming connection warmed up",
           { alreadyWarm: wsResult.alreadyWarm, micCached: !!this.cachedMicDeviceId },
           "streaming"
         );
@@ -1818,11 +2135,11 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         logger.debug("Streaming warmup skipped - API not configured", {}, "streaming");
         return false;
       } else {
-        logger.warn("Deepgram warmup failed", { error: wsResult.error }, "streaming");
+        logger.warn("Streaming warmup failed", { error: wsResult.error }, "streaming");
         return false;
       }
     } catch (error) {
-      logger.error("Deepgram warmup error", { error: error.message }, "streaming");
+      logger.error("Streaming warmup error", { error: error.message }, "streaming");
       return false;
     }
   }
@@ -1902,14 +2219,16 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       }
 
       this.streamingProcessor = new AudioWorkletNode(audioContext, "pcm-streaming-processor");
+      const provider = this.getStreamingProvider();
 
       this.streamingProcessor.port.onmessage = (event) => {
         if (!this.isStreaming) return;
-        window.electronAPI.deepgramStreamingSend(event.data);
+        provider.send(event.data);
       };
 
       this.isStreaming = true;
       this.streamingSource.connect(this.streamingProcessor);
+
       const tPipeline = performance.now();
 
       // 3. Register IPC event listeners BEFORE connecting, so no transcript
@@ -1919,19 +2238,25 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       this.streamingTextResolve = null;
       this.streamingTextDebounce = null;
 
-      const partialCleanup = window.electronAPI.onDeepgramPartialTranscript((text) => {
+      const partialCleanup = provider.onPartial((text) => {
         this.streamingPartialText = text;
         this.onPartialTranscript?.(text);
       });
 
-      const finalCleanup = window.electronAPI.onDeepgramFinalTranscript((text) => {
+      const finalCleanup = provider.onFinal((text) => {
+        // text = accumulated final text from streaming provider.
+        // Extract just the new segment (delta from previous accumulated final).
+        const prevLen = this.streamingFinalText.length;
         this.streamingFinalText = text;
         this.streamingPartialText = "";
-        this.onPartialTranscript?.(text);
+        const newSegment = text.slice(prevLen);
+        if (newSegment) {
+          this.onStreamingCommit?.(newSegment);
+        }
       });
 
-      const errorCleanup = window.electronAPI.onDeepgramError((error) => {
-        logger.error("Deepgram streaming error", { error }, "streaming");
+      const errorCleanup = provider.onError((error) => {
+        logger.error("Streaming provider error", { error }, "streaming");
         this.onError?.({
           title: "Streaming Error",
           description: error,
@@ -1948,8 +2273,8 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         }
       });
 
-      const sessionEndCleanup = window.electronAPI.onDeepgramSessionEnd((data) => {
-        logger.debug("Deepgram session ended", data, "streaming");
+      const sessionEndCleanup = provider.onSessionEnd((data) => {
+        logger.debug("Streaming session ended", data, "streaming");
         if (data.text) {
           this.streamingFinalText = data.text;
         }
@@ -1963,19 +2288,37 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       // 4. Connect WebSocket — audio is already flowing from the pipeline above,
       //    so Deepgram receives data immediately (no idle timeout).
       const result = await withSessionRefresh(async () => {
-        const preferredLang = localStorage.getItem("preferredLanguage");
-        const res = await window.electronAPI.deepgramStreamingStart({
+        const {
+          preferredLanguage: preferredLang,
+          cloudTranscriptionModel,
+          cloudTranscriptionMode,
+          useLocalWhisper,
+        } = getSettings();
+        const res = await provider.start({
           sampleRate: 16000,
           language: preferredLang && preferredLang !== "auto" ? preferredLang : undefined,
           keyterms: this.getKeyterms(),
+          model: cloudTranscriptionModel,
+          mode: cloudTranscriptionMode === "byok" ? "byok" : "openwhispr",
         });
 
         if (!res.success) {
           if (res.code === "NO_API") {
             return { needsFallback: true };
           }
+          if (res.code === "NETWORK_ERROR" && useLocalWhisper) {
+            this.onError?.({
+              code: "NETWORK_ERROR",
+              title: "streaming.errors.cloudUnreachable.title",
+              description: "Cloud unreachable — using local engine for this recording.",
+              messageKey: "streaming.errors.cloudUnreachable.fallback",
+            });
+            return { needsFallback: true };
+          }
           const err = new Error(res.error || "Failed to start streaming session");
           err.code = res.code;
+          err.messageKey = res.messageKey;
+          err.networkCode = res.networkCode;
           throw err;
         }
         return res;
@@ -2034,9 +2377,14 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         errorTitle = "Sign-in Required";
         errorDescription =
           "Your OpenWhispr Cloud session is unavailable. Please sign in again from Settings.";
+      } else if (error.code === "NETWORK_ERROR") {
+        errorTitle = "streaming.errors.cloudUnreachable.title";
+        errorDescription = error.messageKey || "streaming.errors.cloudUnreachable.generic";
       }
 
       this.onError?.({
+        code: error.code,
+        messageKey: error.messageKey,
         title: errorTitle,
         description: errorDescription,
       });
@@ -2102,6 +2450,9 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         this.streamingFallbackRecorder.stop();
       });
     }
+    if (fallbackBlob) {
+      this.lastAudioBlob = fallbackBlob;
+    }
     this.streamingFallbackRecorder = null;
     this.streamingFallbackChunks = [];
 
@@ -2111,19 +2462,19 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
     }
     const tAudioCleanup = performance.now();
 
-    // 3. Wait for flushed buffer to travel: port → main thread → IPC → WebSocket → server.
+    // 3. Wait for flushed buffer to travel: port -> main thread -> IPC -> WebSocket -> server.
     //    Then mark streaming done so no further audio is forwarded.
     await new Promise((resolve) => setTimeout(resolve, 120));
     this.isStreaming = false;
 
-    // 4. Finalize tells Deepgram to process any buffered audio and send final Results.
-    //    Wait briefly so the server sends back the from_finalize transcript before
-    //    CloseStream triggers connection close.
-    window.electronAPI.deepgramStreamingFinalize?.();
+    // 4. Finalize tells the provider to process any buffered audio and send final results.
+    //    Wait briefly so the server sends back the finalized transcript before disconnect.
+    const provider = this.getStreamingProvider();
+    provider.finalize?.();
     await new Promise((resolve) => setTimeout(resolve, 300));
     const tForceEndpoint = performance.now();
 
-    const stopResult = await window.electronAPI.deepgramStreamingStop().catch((e) => {
+    const stopResult = await provider.stop().catch((e) => {
       logger.debug("Streaming disconnect error", { error: e.message }, "streaming");
       return { success: false };
     });
@@ -2160,21 +2511,50 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       "streaming"
     );
 
-    const useReasoningModel = localStorage.getItem("useReasoningModel") === "true";
-    if (useReasoningModel && finalText) {
+    const stSettings = getSettings();
+    const streamingSttModel = stopResult?.model || "nova-3";
+    const streamingSttProcessingMs = Math.round(tTerminate - t0);
+    const streamingAudioBytesSent = stopResult?.audioBytesSent || 0;
+    const streamingSttLanguage = getBaseLanguageCode(stSettings.preferredLanguage) || undefined;
+    const streamingSttWordCount = finalText ? finalText.split(/\s+/).filter(Boolean).length : 0;
+
+    let usedCloudReasoning = false;
+    if (finalText && !this.skipReasoning) {
       const reasoningStart = performance.now();
-      const agentName = localStorage.getItem("agentName") || "";
-      const cloudReasoningMode = localStorage.getItem("cloudReasoningMode") || "openwhispr";
+      const agentName = localStorage.getItem("agentName") || null;
+      const route = resolveReasoningRoute(finalText, stSettings, agentName);
+      const cleanupCloudMode = stSettings.cleanupCloudMode || "openwhispr";
 
       try {
-        if (cloudReasoningMode === "openwhispr") {
+        if (route.kind === "agent") {
+          const reasoned = await this.processWithReasoningModel(
+            finalText,
+            route.model,
+            agentName,
+            route.config
+          );
+          if (reasoned) finalText = reasoned;
+          logger.info(
+            "Streaming dictation-agent complete",
+            { reasoningDurationMs: Math.round(performance.now() - reasoningStart) },
+            "streaming"
+          );
+        } else if (route.kind === "cleanup" && cleanupCloudMode === "openwhispr") {
           const reasonResult = await withSessionRefresh(async () => {
             const res = await window.electronAPI.cloudReason(finalText, {
               agentName,
-              customDictionary: this.getCustomDictionaryArray(),
+              customDictionary: stSettings.customDictionary,
               customPrompt: this.getCustomPrompt(),
-              language: localStorage.getItem("preferredLanguage") || "auto",
-              locale: localStorage.getItem("uiLanguage") || "en",
+              language: stSettings.preferredLanguage || "auto",
+              locale: stSettings.uiLanguage || "en",
+              sttProvider: this.getStreamingProviderName(),
+              sttModel: streamingSttModel,
+              sttProcessingMs: streamingSttProcessingMs,
+              sttWordCount: streamingSttWordCount,
+              sttLanguage: streamingSttLanguage,
+              audioDurationMs: durationSeconds ? Math.round(durationSeconds * 1000) : undefined,
+              audioSizeBytes: streamingAudioBytesSent || undefined,
+              audioFormat: "linear16",
             });
             if (!res.success) {
               const err = new Error(res.error || "Cloud reasoning failed");
@@ -2187,6 +2567,7 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
           if (reasonResult.success && reasonResult.text) {
             finalText = reasonResult.text;
           }
+          usedCloudReasoning = true;
 
           logger.info(
             "Streaming reasoning complete",
@@ -2196,17 +2577,16 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
             },
             "streaming"
           );
-        } else {
-          const reasoningModel = localStorage.getItem("reasoningModel") || "";
-          if (reasoningModel) {
-            const result = await this.processWithReasoningModel(
+        } else if (route.kind === "cleanup") {
+          const effectiveModel = getEffectiveCleanupModel();
+          if (effectiveModel) {
+            const reasoned = await this.processWithReasoningModel(
               finalText,
-              reasoningModel,
-              agentName
+              effectiveModel,
+              agentName,
+              route.config
             );
-            if (result) {
-              finalText = result;
-            }
+            if (reasoned) finalText = reasoned;
             logger.info(
               "Streaming BYOK reasoning complete",
               { reasoningDurationMs: Math.round(performance.now() - reasoningStart) },
@@ -2224,6 +2604,8 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
     }
 
     // If streaming produced no text, fall back to batch transcription
+    // (batch fallback records usage server-side via /api/transcribe)
+    let usedBatchFallback = false;
     if (!finalText && durationSeconds > 2 && fallbackBlob?.size > 0) {
       logger.info(
         "Streaming produced no text, falling back to batch transcription",
@@ -2236,6 +2618,7 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         });
         if (batchResult?.text) {
           finalText = batchResult.text;
+          usedBatchFallback = true;
           logger.info("Batch fallback succeeded", { textLength: finalText.length }, "streaming");
         }
       } catch (fallbackErr) {
@@ -2245,20 +2628,65 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
 
     if (finalText) {
       const tBeforePaste = performance.now();
+      const clientTotalMs = Math.round(tBeforePaste - t0);
+      this.lastAudioMetadata = {
+        durationMs: durationSeconds
+          ? Math.round(durationSeconds * 1000)
+          : Math.round(tBeforePaste - t0),
+        provider: `${this.getStreamingProviderName()}-streaming`,
+        model: streamingSttModel || null,
+      };
       this.onTranscriptionComplete?.({
         success: true,
         text: finalText,
-        source: "deepgram-streaming",
+        rawText: finalText,
+        source: `${this.getStreamingProviderName()}-streaming`,
       });
+
+      if (!usedBatchFallback) {
+        (async () => {
+          try {
+            await withSessionRefresh(async () => {
+              const res = await window.electronAPI.cloudStreamingUsage(
+                finalText,
+                durationSeconds ?? 0,
+                {
+                  sendLogs: !usedCloudReasoning,
+                  sttProvider: this.getStreamingProviderName(),
+                  sttModel: streamingSttModel,
+                  sttProcessingMs: streamingSttProcessingMs,
+                  sttLanguage: streamingSttLanguage,
+                  audioSizeBytes: streamingAudioBytesSent || undefined,
+                  audioFormat: "linear16",
+                  clientTotalMs,
+                }
+              );
+              if (!res.success) {
+                const err = new Error(res.error || "Streaming usage recording failed");
+                err.code = res.code;
+                throw err;
+              }
+            });
+          } catch (err) {
+            logger.error("Failed to report streaming usage", { error: err.message }, "streaming");
+          }
+          window.dispatchEvent(new Event("usage-changed"));
+        })();
+      } else {
+        window.dispatchEvent(new Event("usage-changed"));
+      }
 
       logger.info(
         "Streaming total processing",
         {
           totalProcessingMs: Math.round(tBeforePaste - t0),
-          hasReasoning: useReasoningModel,
+          hasReasoning: stSettings.useCleanupModel || stSettings.useDictationAgent,
         },
         "streaming"
       );
+    } else {
+      // Silence: still fire callback so media playback resumes.
+      this.onTranscriptionComplete?.({ success: true, text: "" });
     }
 
     this.isProcessing = false;
@@ -2271,6 +2699,34 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
     }
 
     return true;
+  }
+
+  shouldShowPreviewCleanupState() {
+    const settings = getSettings();
+    return (!!settings.useCleanupModel || !!settings.useDictationAgent) && !this.skipReasoning;
+  }
+
+  cleanupPreview(options = {}) {
+    const { dismiss = false, showCleanup = false } = options;
+
+    if (this._previewProcessor) {
+      this._previewProcessor.port.postMessage("stop");
+      this._previewProcessor.disconnect();
+      this._previewProcessor = null;
+    }
+    if (this._previewSource) {
+      this._previewSource.disconnect();
+      this._previewSource = null;
+    }
+    if (this._previewAudioContext) {
+      this._previewAudioContext.close().catch(() => {});
+      this._previewAudioContext = null;
+    }
+    if (dismiss) {
+      window.electronAPI?.dismissDictationPreview?.();
+      return;
+    }
+    window.electronAPI?.stopDictationPreview?.({ showCleanup });
   }
 
   cleanupStreamingAudio() {
@@ -2333,6 +2789,8 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
   }
 
   cleanup() {
+    this.lastAudioBlob = null;
+    this.lastAudioMetadata = null;
     if (this.isStreaming) {
       this.cleanupStreaming();
     }
@@ -2349,7 +2807,7 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       this.workletBlobUrl = null;
     }
     try {
-      window.electronAPI?.deepgramStreamingStop?.();
+      this.getStreamingProvider().stop?.();
     } catch (e) {
       // Ignore errors during cleanup (page may be unloading)
     }
@@ -2357,6 +2815,7 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
     this.onError = null;
     this.onTranscriptionComplete = null;
     this.onPartialTranscript = null;
+    this.onStreamingCommit = null;
     if (this._onApiKeyChanged) {
       window.removeEventListener("api-key-changed", this._onApiKeyChanged);
     }

@@ -1,5 +1,6 @@
 {
-  "appId": "com.herotools.openwispr",
+  "appId": "com.gizmolabs.openwhispr",
+  "afterPack": "scripts/afterPack.js",
   "productName": "OpenWhispr",
   "protocols": {
     "name": "OpenWhispr Protocol",
@@ -18,6 +19,7 @@
     "src/dist/**/*",
     "src/helpers/**/*",
     "src/config/**/*",
+    "src/constants/**/*",
     "src/locales/**/*",
     "src/hooks/**/*",
     "src/models/**/*",
@@ -82,12 +84,15 @@
     "!**/node_modules/**/CHANGELOG*",
     "!**/node_modules/**/.github/**"
   ],
-  "asarUnpack": ["**/node_modules/ffmpeg-static/**/*", "**/node_modules/better-sqlite3/**/*"],
+  "asarUnpack": [
+    "**/node_modules/ffmpeg-static/**/*",
+    "**/node_modules/better-sqlite3/**/*",
+    "**/node_modules/onnxruntime-node/**/*",
+    "**/node_modules/@napi-rs/keyring/**/*"
+  ],
   "extraResources": [
+    ".env",
     "src/assets/**/*",
-    "resources/bin/macos-globe-listener",
-    "resources/bin/macos-fast-paste",
-    "resources/bin/linux-fast-paste",
     {
       "from": "resources/bin/",
       "to": "bin/",
@@ -96,8 +101,24 @@
         "whisper-server-*",
         "llama-server-*",
         "sherpa-onnx-*",
+        "qdrant-*",
+        "macos-audio-tap",
+        "macos-globe-listener",
+        "macos-fast-paste",
+        "macos-mic-listener",
+        "macos-text-monitor",
+        "macos-media-remote",
+        "linux-fast-paste",
+        "linux-system-audio-helper",
+        "linux-text-monitor",
+        "linux-key-listener*",
+        "meeting-aec-helper-*",
         "windows-key-listener*",
+        "windows-mic-listener*",
+        "windows-text-monitor*",
         "windows-fast-paste*",
+        "all-MiniLM-L6-v2/**/*",
+        "diarization-models/**/*",
         "*.dylib",
         "*.dll",
         "*.so*"
@@ -112,17 +133,31 @@
     "hardenedRuntime": true,
     "entitlements": "resources/mac/entitlements.mac.plist",
     "entitlementsInherit": "resources/mac/entitlements.mac.plist",
-    "identity": "HeroTools Inc. (9R85XFMH59)",
+    "identity": "Gizmo Labs Inc. (T832773L2J)",
     "notarize": true,
+    "extraResources": [
+      {
+        "from": "src/assets/Assets.car",
+        "to": "Assets.car"
+      }
+    ],
     "extendInfo": {
       "LSUIElement": false,
-      "NSMicrophoneUsageDescription": "OpenWhispr needs microphone access for speech-to-text transcription.",
+      "CFBundleIconName": "openwhispr",
+      "NSMicrophoneUsageDescription": "OpenWhispr uses the microphone to capture your voice for transcription.",
+      "NSAudioCaptureUsageDescription": "OpenWhispr uses system audio to capture other participants' audio from calls and meetings.",
       "NSAccessibilityUsageDescription": "OpenWhispr needs accessibility permissions to paste transcribed text into other applications."
     }
   },
   "win": {
     "target": ["nsis", "portable"],
     "icon": "src/assets/icon.ico",
+    "azureSignOptions": {
+      "endpoint": "https://eus.codesigning.azure.net/",
+      "certificateProfileName": "openwhispr-release",
+      "codeSigningAccountName": "OpenWhispr",
+      "publisherName": "CN=Gizmo Labs Inc., O=Gizmo Labs Inc., L=Wilmington, S=Delaware, C=US"
+    },
     "extraResources": [
       {
         "from": "resources/bin/nircmd.exe",
@@ -156,24 +191,42 @@
     ]
   },
   "deb": {
+    "afterInstall": "resources/linux/after-install.sh",
     "afterRemove": "resources/linux/after-remove.sh",
+    "depends": ["ydotool"],
     "fpm": [
+      "--deb-recommends",
+      "ydotoold",
       "--deb-suggests",
       "xdotool",
       "--deb-suggests",
       "wtype",
       "--deb-recommends",
-      "wl-clipboard"
+      "wl-clipboard",
+      "--deb-recommends",
+      "xclip",
+      "--deb-suggests",
+      "xsel"
     ]
   },
   "rpm": {
     "fpm": [
+      "--after-install",
+      "resources/linux/after-install.sh",
+      "--rpm-rpmbuild-define",
+      "_build_id_links none",
+      "--rpm-tag",
+      "Requires: ydotool",
       "--rpm-tag",
       "Suggests: xdotool",
       "--rpm-tag",
       "Suggests: wtype",
       "--rpm-tag",
-      "Recommends: wl-clipboard"
+      "Recommends: wl-clipboard",
+      "--rpm-tag",
+      "Recommends: xclip",
+      "--rpm-tag",
+      "Suggests: xsel"
     ]
   },
   "nsis": {
@@ -193,7 +246,7 @@
   },
   "publish": {
     "provider": "github",
-    "owner": "OpenWhispr",
+    "owner": "Grabhopser",
     "repo": "openwhispr",
     "private": false,
     "releaseType": "draft"

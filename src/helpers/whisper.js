@@ -39,6 +39,7 @@ class WhisperManager {
     // Server manager for HTTP-based transcription
     this.serverManager = new WhisperServerManager();
     this.currentServerModel = null;
+    this.cachedVadModelPath = undefined;
   }
 
   getModelsDir() {
@@ -60,6 +61,22 @@ class WhisperManager {
     return path.join(this.getModelsDir(), config.fileName);
   }
 
+  getVadModelPath() {
+    if (this.cachedVadModelPath !== undefined) return this.cachedVadModelPath;
+
+    const fileName = "ggml-silero-v5.1.2.bin";
+    const candidates = [];
+
+    if (process.resourcesPath) {
+      candidates.push(path.join(process.resourcesPath, "bin", "whisper-vad", fileName));
+    }
+    candidates.push(path.join(__dirname, "..", "..", "resources", "bin", "whisper-vad", fileName));
+
+    const resolved = candidates.find((p) => fs.existsSync(p)) || null;
+    this.cachedVadModelPath = resolved;
+    return resolved;
+  }
+
   async initializeAtStartup(settings = {}) {
     const startTime = Date.now();
 
@@ -69,7 +86,7 @@ class WhisperManager {
       await cleanupStaleDownloads(this.getModelsDir());
 
       // Pre-warm whisper-server if local mode enabled (eliminates 2-5s cold-start delay)
-      const { localTranscriptionProvider, whisperModel } = settings;
+      const { localTranscriptionProvider, whisperModel, useCuda } = settings;
 
       if (
         localTranscriptionProvider === "whisper" &&
@@ -82,11 +99,12 @@ class WhisperManager {
           debugLogger.info("Pre-warming whisper-server", {
             model: whisperModel,
             modelPath,
+            cuda: !!useCuda,
           });
 
           try {
             const serverStartTime = Date.now();
-            await this.serverManager.start(modelPath);
+            await this.serverManager.start(modelPath, { useCuda: !!useCuda });
             this.currentServerModel = whisperModel;
 
             debugLogger.info("whisper-server pre-warmed successfully", {
@@ -188,7 +206,7 @@ class WhisperManager {
     debugLogger.info(`[Dependencies] Models: ${modelsStatus}`);
   }
 
-  async startServer(modelName) {
+  async startServer(modelName, options = {}) {
     if (!this.serverManager.isAvailable()) {
       return { success: false, reason: "whisper-server binary not found" };
     }
@@ -199,7 +217,7 @@ class WhisperManager {
     }
 
     try {
-      await this.serverManager.start(modelPath);
+      await this.serverManager.start(modelPath, options);
       this.currentServerModel = modelName;
       debugLogger.info("whisper-server started", {
         model: modelName,
@@ -253,26 +271,37 @@ class WhisperManager {
     const model = options.model || "base";
     const language = options.language || null;
     const initialPrompt = options.initialPrompt || null;
+    const vadEnabled = options.vadEnabled === true;
+    const vadConfig = options.vadConfig || null;
     const modelPath = this.getModelPath(model);
 
-    // Check if model exists
     if (!fs.existsSync(modelPath)) {
       throw new Error(`Whisper model "${model}" not downloaded. Please download it from Settings.`);
     }
 
-    return await this.transcribeViaServer(audioBlob, model, language, initialPrompt);
+    return await this.transcribeViaServer(audioBlob, model, language, initialPrompt, {
+      vadEnabled,
+      vadConfig,
+    });
   }
 
-  async transcribeViaServer(audioBlob, model, language, initialPrompt = null) {
+  async transcribeViaServer(audioBlob, model, language, initialPrompt = null, options = {}) {
     debugLogger.info("Transcription mode: SERVER", { model, language: language || "auto" });
     const modelPath = this.getModelPath(model);
 
-    // Start server if not running or if model changed
-    if (!this.serverManager.ready || this.currentServerModel !== model) {
-      debugLogger.debug("Starting/restarting whisper-server for model", { model });
-      await this.serverManager.start(modelPath);
-      this.currentServerModel = model;
+    const vadEnabled = options.vadEnabled === true;
+    const vadModelPath = vadEnabled ? this.getVadModelPath() : null;
+    if (vadEnabled && !vadModelPath) {
+      debugLogger.warn("VAD requested but ggml-silero model not found; running without VAD");
     }
+
+    await this.serverManager.start(modelPath, {
+      useCuda: this.serverManager.useCuda,
+      vadEnabled,
+      vadModelPath,
+      vadConfig: options.vadConfig || null,
+    });
+    this.currentServerModel = model;
 
     // Convert audioBlob to Buffer if needed
     let audioBuffer;
@@ -306,6 +335,51 @@ class WhisperManager {
     const elapsed = Date.now() - startTime;
 
     debugLogger.logWhisperPipeline("transcribeViaServer - completed", {
+      elapsed,
+      resultKeys: Object.keys(result),
+    });
+
+    return this.parseWhisperResult(result);
+  }
+
+  async transcribeViaLan(audioBlob, url, options = {}) {
+    debugLogger.info("Transcription mode: LAN", { url, language: options.language || "auto" });
+
+    await this.serverManager.connectRemote(url);
+
+    let audioBuffer;
+    if (Buffer.isBuffer(audioBlob)) {
+      audioBuffer = audioBlob;
+    } else if (ArrayBuffer.isView(audioBlob)) {
+      audioBuffer = Buffer.from(audioBlob.buffer, audioBlob.byteOffset, audioBlob.byteLength);
+    } else if (audioBlob instanceof ArrayBuffer) {
+      audioBuffer = Buffer.from(audioBlob);
+    } else if (typeof audioBlob === "string") {
+      audioBuffer = Buffer.from(audioBlob, "base64");
+    } else if (audioBlob && audioBlob.buffer && typeof audioBlob.byteLength === "number") {
+      audioBuffer = Buffer.from(audioBlob.buffer, audioBlob.byteOffset || 0, audioBlob.byteLength);
+    } else {
+      throw new Error(`Unsupported audio data type: ${typeof audioBlob}`);
+    }
+
+    if (!audioBuffer || audioBuffer.length === 0) {
+      throw new Error("Audio buffer is empty - no audio data received");
+    }
+
+    debugLogger.logWhisperPipeline("transcribeViaLan - sending to server", {
+      bufferSize: audioBuffer.length,
+      url,
+      language: options.language,
+    });
+
+    const startTime = Date.now();
+    const result = await this.serverManager.transcribe(audioBuffer, {
+      language: options.language || null,
+      initialPrompt: options.initialPrompt || null,
+    });
+    const elapsed = Date.now() - startTime;
+
+    debugLogger.logWhisperPipeline("transcribeViaLan - completed", {
       elapsed,
       resultKeys: Object.keys(result),
     });

@@ -1,13 +1,14 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useLayoutEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import "./index.css";
 import { X } from "lucide-react";
-import { useToast } from "./components/ui/Toast";
+import { useToast } from "./components/ui/useToast";
 import { LoadingDots } from "./components/ui/LoadingDots";
 import { useHotkey } from "./hooks/useHotkey";
+import { formatHotkeyLabel } from "./utils/hotkeys";
 import { useWindowDrag } from "./hooks/useWindowDrag";
 import { useAudioRecording } from "./hooks/useAudioRecording";
-import { useAuth } from "./hooks/useAuth";
+import { useSettingsStore } from "./stores/settingsStore";
 
 // Sound Wave Icon Component (for idle/hover states)
 const SoundWaveIcon = ({ size = 16 }) => {
@@ -33,7 +34,7 @@ const VoiceWaveIndicator = ({ isListening }) => {
       {[...Array(4)].map((_, i) => (
         <div
           key={i}
-          className={`w-0.5 bg-white rounded-full transition-all duration-150 ${
+          className={`w-0.5 bg-white rounded-full transition-[height] duration-150 ${
             isListening ? "animate-pulse h-4" : "h-2"
           }`}
           style={{
@@ -46,9 +47,15 @@ const VoiceWaveIndicator = ({ isListening }) => {
   );
 };
 
-// Enhanced Tooltip Component
-const Tooltip = ({ children, content, emoji }) => {
+// Tooltip Component
+const Tooltip = ({ children, content, emoji, align = "center" }) => {
   const [isVisible, setIsVisible] = useState(false);
+
+  const alignClass =
+    align === "right" ? "right-0" : align === "left" ? "left-0" : "left-1/2 -translate-x-1/2";
+
+  const arrowClass =
+    align === "right" ? "right-3" : align === "left" ? "left-3" : "left-1/2 -translate-x-1/2";
 
   return (
     <div className="relative inline-block">
@@ -57,12 +64,13 @@ const Tooltip = ({ children, content, emoji }) => {
       </div>
       {isVisible && (
         <div
-          className="absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-1 py-1 text-popover-foreground bg-popover border border-border rounded-md whitespace-nowrap z-10 transition-opacity duration-150 shadow-lg"
-          style={{ fontSize: "9.7px", maxWidth: "96px" }}
+          className={`absolute bottom-full ${alignClass} mb-2 px-1.5 py-1 text-[10px] text-popover-foreground bg-popover border border-border rounded-md z-10 shadow-lg transition-opacity duration-150 whitespace-nowrap`}
         >
           {emoji && <span className="mr-1">{emoji}</span>}
           {content}
-          <div className="absolute top-full left-1/2 transform -translate-x-1/2 w-0 h-0 border-l-2 border-r-2 border-t-2 border-transparent border-t-popover"></div>
+          <div
+            className={`absolute top-full ${arrowClass} w-0 h-0 border-l-2 border-r-2 border-t-2 border-transparent border-t-popover`}
+          ></div>
         </div>
       )}
     </div>
@@ -74,19 +82,17 @@ export default function App() {
   const [isCommandMenuOpen, setIsCommandMenuOpen] = useState(false);
   const commandMenuRef = useRef(null);
   const buttonRef = useRef(null);
-  const { toast, toastCount } = useToast();
+  const { toast, dismiss, toastCount } = useToast();
   const { t } = useTranslation();
   const { hotkey } = useHotkey();
   const { isDragging, handleMouseDown, handleMouseUp } = useWindowDrag();
-  const { isSignedIn } = useAuth();
 
   const [dragStartPos, setDragStartPos] = useState(null);
   const [hasDragged, setHasDragged] = useState(false);
 
-  // Floating icon auto-hide setting (read from localStorage, synced via IPC)
-  const [floatingIconAutoHide, setFloatingIconAutoHide] = useState(
-    () => localStorage.getItem("floatingIconAutoHide") === "true"
-  );
+  // Floating icon auto-hide setting (read from store, synced via IPC)
+  const floatingIconAutoHide = useSettingsStore((s) => s.floatingIconAutoHide);
+  const panelStartPosition = useSettingsStore((s) => s.panelStartPosition);
   const prevAutoHideRef = useRef(floatingIconAutoHide);
 
   const setWindowInteractivity = React.useCallback((shouldCapture) => {
@@ -102,7 +108,10 @@ export default function App() {
     const unsubscribeFallback = window.electronAPI?.onHotkeyFallbackUsed?.((data) => {
       toast({
         title: t("app.toasts.hotkeyChanged.title"),
-        description: data.message,
+        description: t("app.toasts.hotkeyChanged.description", {
+          original: data.original,
+          fallback: data.fallback,
+        }),
         duration: 8000,
       });
     });
@@ -115,11 +124,45 @@ export default function App() {
       });
     });
 
+    const unsubscribeCorrections = window.electronAPI?.onCorrectionsLearned?.((words) => {
+      if (words && words.length > 0) {
+        const wordList = words.map((w) => `\u201c${w}\u201d`).join(", ");
+        let toastId;
+        toastId = toast({
+          title: t("app.toasts.addedToDict", { words: wordList }),
+          variant: "success",
+          duration: 6000,
+          action: (
+            <button
+              onClick={async () => {
+                try {
+                  const result = await window.electronAPI?.undoLearnedCorrections?.(words);
+                  if (result?.success) {
+                    dismiss(toastId);
+                  }
+                } catch {
+                  // silently fail — word stays in dictionary
+                }
+              }}
+              className="text-[10px] font-medium px-2.5 py-1 rounded-sm whitespace-nowrap
+                text-emerald-100/90 hover:text-white
+                bg-emerald-500/15 hover:bg-emerald-500/25
+                border border-emerald-400/20 hover:border-emerald-400/35
+                transition-all duration-150"
+            >
+              {t("app.toasts.undo")}
+            </button>
+          ),
+        });
+      }
+    });
+
     return () => {
       unsubscribeFallback?.();
       unsubscribeFailed?.();
+      unsubscribeCorrections?.();
     };
-  }, [toast, t]);
+  }, [toast, dismiss, t]);
 
   useEffect(() => {
     if (isCommandMenuOpen || toastCount > 0) {
@@ -149,33 +192,32 @@ export default function App() {
     setWindowInteractivity(false);
   }, [setWindowInteractivity]);
 
-  const {
-    isRecording,
-    isProcessing,
-    toggleListening,
-    cancelRecording,
-    cancelProcessing,
-    warmupStreaming,
-  } = useAudioRecording(toast, {
-    onToggle: handleDictationToggle,
-  });
+  const { isRecording, isProcessing, toggleListening, cancelRecording, cancelProcessing } =
+    useAudioRecording(toast, {
+      onToggle: handleDictationToggle,
+    });
 
-  // Trigger streaming warmup when user signs in (covers first-time account creation).
-  // Pass isSignedIn directly to bypass the localStorage race condition where
-  // useAuth's useEffect may not have written localStorage yet.
-  useEffect(() => {
-    if (isSignedIn) {
-      warmupStreaming({ isSignedIn: true });
-    }
-  }, [isSignedIn, warmupStreaming]);
-
-  // Listen for auto-hide setting changes relayed from the main process
+  // Sync auto-hide from main process — setState directly to avoid IPC echo
   useEffect(() => {
     const unsubscribe = window.electronAPI?.onFloatingIconAutoHideChanged?.((enabled) => {
-      setFloatingIconAutoHide(enabled);
+      localStorage.setItem("floatingIconAutoHide", String(enabled));
+      useSettingsStore.setState({ floatingIconAutoHide: enabled });
     });
     return () => unsubscribe?.();
   }, []);
+
+  const isRecordingRef = useRef(isRecording);
+
+  useLayoutEffect(() => {
+    isRecordingRef.current = isRecording;
+  }, [isRecording]);
+
+  useEffect(() => {
+    const unsubscribe = window.electronAPI?.onCancelHotkeyPressed?.(() => {
+      if (isRecordingRef.current) cancelRecording();
+    });
+    return () => unsubscribe?.();
+  }, [cancelRecording]);
 
   // Auto-hide the floating icon when idle (setting enabled or dictation cycle completed)
   useEffect(() => {
@@ -252,7 +294,7 @@ export default function App() {
       case "hover":
         return {
           className: `${baseClasses} bg-black/50 cursor-pointer`,
-          tooltip: t("app.mic.hotkeyToSpeak", { hotkey }),
+          tooltip: formatHotkeyLabel(hotkey),
         };
       case "recording":
         return {
@@ -277,8 +319,16 @@ export default function App() {
 
   return (
     <div className="dictation-window">
-      {/* Bottom-right voice button - window expands upward/leftward */}
-      <div className="fixed bottom-6 right-6 z-50">
+      {/* Voice button - position determined by panelStartPosition setting */}
+      <div
+        className={`fixed bottom-1 z-50 ${
+          panelStartPosition === "bottom-left"
+            ? "left-1"
+            : panelStartPosition === "center"
+              ? "left-1/2 -translate-x-1/2"
+              : "right-1"
+        }`}
+      >
         <div
           className="relative flex items-center gap-2"
           onMouseEnter={() => {
@@ -301,7 +351,7 @@ export default function App() {
                 e.stopPropagation();
                 isRecording ? cancelRecording() : cancelProcessing();
               }}
-              className="group/cancel w-5 h-5 rounded-full bg-surface-2/90 hover:bg-destructive border border-border hover:border-destructive/70 flex items-center justify-center transition-all duration-150 shadow-sm backdrop-blur-sm"
+              className="group/cancel w-5 h-5 rounded-full bg-surface-2/90 hover:bg-destructive border border-border hover:border-destructive/70 flex items-center justify-center transition-colors duration-150 shadow-sm backdrop-blur-sm"
             >
               <X
                 size={10}
@@ -310,7 +360,16 @@ export default function App() {
               />
             </button>
           )}
-          <Tooltip content={micProps.tooltip}>
+          <Tooltip
+            content={micProps.tooltip}
+            align={
+              panelStartPosition === "bottom-left"
+                ? "left"
+                : panelStartPosition === "center"
+                  ? "center"
+                  : "right"
+            }
+          >
             <button
               ref={buttonRef}
               onMouseDown={(e) => {

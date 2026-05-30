@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { Card, CardContent } from "./ui/card";
 import { Button } from "./ui/button";
@@ -8,36 +8,36 @@ import {
   ChevronLeft,
   Check,
   Settings,
-  Mic,
   Shield,
   Command,
   UserCircle,
 } from "lucide-react";
 import TitleBar from "./TitleBar";
-import PermissionCard from "./ui/PermissionCard";
+import WindowControls from "./WindowControls";
+import PermissionsSection from "./ui/PermissionsSection";
 import SupportDropdown from "./ui/SupportDropdown";
-import MicPermissionWarning from "./ui/MicPermissionWarning";
-import PasteToolsInfo from "./ui/PasteToolsInfo";
 import StepProgress from "./ui/StepProgress";
 import { AlertDialog, ConfirmDialog } from "./ui/dialog";
 import { useLocalStorage } from "../hooks/useLocalStorage";
 import { useDialogs } from "../hooks/useDialogs";
 import { usePermissions } from "../hooks/usePermissions";
 import { useClipboard } from "../hooks/useClipboard";
+import { useSystemAudioPermission } from "../hooks/useSystemAudioPermission";
 import { useSettings } from "../hooks/useSettings";
 import LanguageSelector from "./ui/LanguageSelector";
 import AuthenticationStep from "./AuthenticationStep";
 import EmailVerificationStep from "./EmailVerificationStep";
 import { setAgentName as saveAgentName } from "../utils/agentName";
-import { formatHotkeyLabel, getDefaultHotkey } from "../utils/hotkeys";
+import { formatHotkeyLabel, getDefaultHotkey, isGlobeLikeHotkey } from "../utils/hotkeys";
 import { useAuth } from "../hooks/useAuth";
 import { HotkeyInput } from "./ui/HotkeyInput";
-import HotkeyGuidanceAccordion from "./ui/HotkeyGuidanceAccordion";
 import { useHotkeyRegistration } from "../hooks/useHotkeyRegistration";
 import { getValidationMessage } from "../utils/hotkeyValidator";
-import { getPlatform } from "../utils/platform";
+import { getCachedPlatform, getPlatform } from "../utils/platform";
+import logger from "../utils/logger";
 import { ActivationModeSelector } from "./ui/ActivationModeSelector";
 import TranscriptionModelPicker from "./TranscriptionModelPicker";
+import { ACCESSIBILITY_SKIPPED_KEY, areRequiredPermissionsMet } from "../utils/permissions";
 
 interface OnboardingFlowProps {
   onComplete: () => void;
@@ -47,9 +47,6 @@ export default function OnboardingFlow({ onComplete }: OnboardingFlowProps) {
   const { t } = useTranslation();
   const { isSignedIn } = useAuth();
 
-  // Max valid step index dynamically determined based on auth state
-  // Signed-in users: 3 steps (Welcome, Setup, Activation) - index 0-2
-  // Non-signed-in users: 4 steps (Welcome, Setup, Permissions, Activation) - index 0-3
   const getMaxStep = () => (isSignedIn ? 2 : 3);
 
   const [currentStep, setCurrentStep, removeCurrentStep] = useLocalStorage(
@@ -68,6 +65,14 @@ export default function OnboardingFlow({ onComplete }: OnboardingFlowProps) {
       },
     }
   );
+  const [accessibilitySkipped, setAccessibilitySkipped] = useLocalStorage(
+    ACCESSIBILITY_SKIPPED_KEY,
+    false,
+    {
+      serialize: String,
+      deserialize: (value) => value === "true",
+    }
+  );
 
   const {
     useLocalWhisper,
@@ -80,15 +85,11 @@ export default function OnboardingFlow({ onComplete }: OnboardingFlowProps) {
     openaiApiKey,
     groqApiKey,
     mistralApiKey,
-    customTranscriptionApiKey,
-    setCustomTranscriptionApiKey,
     dictationKey,
     activationMode,
     setActivationMode,
     setDictationKey,
-    setOpenaiApiKey,
-    setGroqApiKey,
-    setMistralApiKey,
+    setUseLocalWhisper,
     updateTranscriptionSettings,
     preferredLanguage,
   } = useSettings();
@@ -98,10 +99,14 @@ export default function OnboardingFlow({ onComplete }: OnboardingFlowProps) {
   const [skipAuth, setSkipAuth] = useState(false);
   const [pendingVerificationEmail, setPendingVerificationEmail] = useState<string | null>(null);
   const [isModelDownloaded, setIsModelDownloaded] = useState(false);
-  const [isUsingGnomeHotkeys, setIsUsingGnomeHotkeys] = useState(false);
+  const [isUsingNativeShortcut, setIsUsingNativeShortcut] = useState(false);
   const readableHotkey = formatHotkeyLabel(hotkey);
   const { alertDialog, confirmDialog, showAlertDialog, hideAlertDialog, hideConfirmDialog } =
     useDialogs();
+  const [connectivityDialog, setConnectivityDialog] = useState<{
+    open: boolean;
+    cause: string;
+  }>({ open: false, cause: "" });
 
   const autoRegisterInFlightRef = useRef(false);
   const hotkeyStepInitializedRef = useRef(false);
@@ -123,20 +128,35 @@ export default function OnboardingFlow({ onComplete }: OnboardingFlowProps) {
   const permissionsHook = usePermissions(showAlertDialog);
   useClipboard(showAlertDialog); // Initialize clipboard hook for permission checks
 
-  // For signed-in users, merge setup and permissions into one step
-  const steps =
-    isSignedIn && !skipAuth
-      ? [
-          { title: t("onboarding.steps.welcome"), icon: UserCircle },
-          { title: t("onboarding.steps.setup"), icon: Settings },
-          { title: t("onboarding.steps.activation"), icon: Command },
-        ]
-      : [
-          { title: t("onboarding.steps.welcome"), icon: UserCircle },
-          { title: t("onboarding.steps.setup"), icon: Settings },
-          { title: t("onboarding.steps.permissions"), icon: Shield },
-          { title: t("onboarding.steps.activation"), icon: Command },
-        ];
+  const systemAudio = useSystemAudioPermission();
+
+  useEffect(() => {
+    if (permissionsHook.accessibilityPermissionGranted && accessibilitySkipped) {
+      setAccessibilitySkipped(false);
+    }
+  }, [
+    permissionsHook.accessibilityPermissionGranted,
+    accessibilitySkipped,
+    setAccessibilitySkipped,
+  ]);
+
+  // For signed-in users, permissions are folded into the "setup" step.
+  const steps = useMemo(
+    () =>
+      isSignedIn && !skipAuth
+        ? [
+            { id: "welcome", title: t("onboarding.steps.welcome"), icon: UserCircle },
+            { id: "setup", title: t("onboarding.steps.setup"), icon: Settings },
+            { id: "activation", title: t("onboarding.steps.activation"), icon: Command },
+          ]
+        : [
+            { id: "welcome", title: t("onboarding.steps.welcome"), icon: UserCircle },
+            { id: "setup", title: t("onboarding.steps.setup"), icon: Settings },
+            { id: "permissions", title: t("onboarding.steps.permissions"), icon: Shield },
+            { id: "activation", title: t("onboarding.steps.activation"), icon: Command },
+          ],
+    [isSignedIn, skipAuth, t]
+  );
 
   // Only show progress for signed-up users after account creation step
   const showProgress = currentStep > 0;
@@ -145,16 +165,30 @@ export default function OnboardingFlow({ onComplete }: OnboardingFlowProps) {
     const checkHotkeyMode = async () => {
       try {
         const info = await window.electronAPI?.getHotkeyModeInfo();
-        if (info?.isUsingGnome) {
-          setIsUsingGnomeHotkeys(true);
-          setActivationMode("tap");
+        if (info?.isUsingNativeShortcut) {
+          setIsUsingNativeShortcut(true);
+          if (!info.supportsPushToTalk) {
+            setActivationMode("tap");
+          }
         }
       } catch (error) {
-        console.error("Failed to check hotkey mode:", error);
+        logger.error("Failed to check hotkey mode", { error }, "onboarding");
       }
     };
     checkHotkeyMode();
   }, [setActivationMode]);
+
+  // Update wizard UI when backend falls back to a different hotkey.
+  // Only update local state — don't persist to localStorage so the app
+  // retries the preferred key on next launch.
+  useEffect(() => {
+    const unsubscribe = window.electronAPI?.onHotkeyFallbackUsed?.((data: { fallback: string }) => {
+      if (data?.fallback) {
+        setHotkey(data.fallback);
+      }
+    });
+    return () => unsubscribe?.();
+  }, []);
 
   useEffect(() => {
     const modelToCheck = localTranscriptionProvider === "nvidia" ? parakeetModel : whisperModel;
@@ -171,7 +205,7 @@ export default function OnboardingFlow({ onComplete }: OnboardingFlowProps) {
             : await window.electronAPI?.checkModelStatus(modelToCheck);
         setIsModelDownloaded(result?.downloaded ?? false);
       } catch (error) {
-        console.error("Failed to check model status:", error);
+        logger.error("Failed to check model status", { error }, "onboarding");
         setIsModelDownloaded(false);
       }
     };
@@ -200,13 +234,23 @@ export default function OnboardingFlow({ onComplete }: OnboardingFlowProps) {
       hotkeyStepInitializedRef.current = true;
 
       try {
-        // Get platform-appropriate default hotkey
-        const defaultHotkey = getDefaultHotkey();
+        // Check if backend already registered a hotkey (e.g., KDE D-Bus fallback)
+        const backendKey = localStorage.getItem("dictationKey");
+        if (backendKey && backendKey.trim() !== "") {
+          setHotkey(backendKey);
+          setDictationKey(backendKey);
+          return;
+        }
+
+        // Get platform-appropriate default hotkey from backend (accounts for
+        // X11 modifier-only and GNOME gsettings limitations)
+        const defaultHotkey =
+          (await window.electronAPI?.getEffectiveDefaultHotkey?.()) || getDefaultHotkey();
         const platform = window.electronAPI?.getPlatform?.() ?? "darwin";
 
         // Only auto-register if no hotkey is currently set
         const shouldAutoRegister =
-          !hotkey || hotkey.trim() === "" || (platform !== "darwin" && hotkey === "GLOBE");
+          !hotkey || hotkey.trim() === "" || (platform !== "darwin" && isGlobeLikeHotkey(hotkey));
 
         if (shouldAutoRegister) {
           // Try to register the default hotkey silently
@@ -216,14 +260,14 @@ export default function OnboardingFlow({ onComplete }: OnboardingFlowProps) {
           }
         }
       } catch (error) {
-        console.error("Failed to auto-register default hotkey:", error);
+        logger.error("Failed to auto-register default hotkey", { error }, "onboarding");
       } finally {
         autoRegisterInFlightRef.current = false;
       }
     };
 
     void autoRegisterDefaultHotkey();
-  }, [currentStep, hotkey, registerHotkey, activationStepIndex]);
+  }, [currentStep, hotkey, registerHotkey, activationStepIndex, setDictationKey]);
 
   const ensureHotkeyRegistered = useCallback(async () => {
     if (!window.electronAPI?.updateHotkey) {
@@ -241,7 +285,7 @@ export default function OnboardingFlow({ onComplete }: OnboardingFlowProps) {
       }
       return true;
     } catch (error) {
-      console.error("Failed to register onboarding hotkey", error);
+      logger.error("Failed to register onboarding hotkey", { error }, "onboarding");
       showAlertDialog({
         title: t("onboarding.hotkey.couldNotRegisterTitle"),
         description: t("onboarding.hotkey.couldNotRegisterDescription"),
@@ -263,18 +307,50 @@ export default function OnboardingFlow({ onComplete }: OnboardingFlowProps) {
     localStorage.setItem("onboardingCompleted", "true");
     localStorage.setItem("skipAuth", skippedAuth.toString());
 
+    // Fresh install: write the bundle-migration sentinel so the
+    // PostMigrationOnboarding modal doesn't fire on next launch.
+    // Migrating users skip onboarding entirely (their flag carries over
+    // via productName-keyed userData), so they never reach this code.
+    void window.electronAPI?.markBundleMigrated?.();
+
+    // Non-signed-in users in cloud mode default to BYOK to avoid
+    // "OpenWhispr Cloud requires sign-in" errors.
+    if (!isSignedIn && !useLocalWhisper) {
+      updateTranscriptionSettings({ cloudTranscriptionMode: "byok" });
+    }
+
     try {
       await window.electronAPI?.saveAllKeysToEnv?.();
     } catch (error) {
-      console.error("Failed to persist API keys:", error);
+      logger.error("Failed to persist API keys", { error }, "onboarding");
     }
 
     return true;
-  }, [hotkey, agentName, setDictationKey, ensureHotkeyRegistered]);
+  }, [
+    hotkey,
+    agentName,
+    setDictationKey,
+    ensureHotkeyRegistered,
+    isSignedIn,
+    useLocalWhisper,
+    skipAuth,
+    updateTranscriptionSettings,
+  ]);
 
   const nextStep = useCallback(async () => {
     if (currentStep >= steps.length - 1) {
       return;
+    }
+
+    const currentStepId = steps[currentStep]?.id;
+    const isPermissionsGate =
+      currentStepId === "permissions" || (currentStepId === "setup" && isSignedIn && !skipAuth);
+    if (
+      getPlatform() === "darwin" &&
+      isPermissionsGate &&
+      !permissionsHook.accessibilityPermissionGranted
+    ) {
+      setAccessibilitySkipped(true);
     }
 
     const newStep = currentStep + 1;
@@ -286,7 +362,16 @@ export default function OnboardingFlow({ onComplete }: OnboardingFlowProps) {
         window.electronAPI.showDictationPanel();
       }
     }
-  }, [currentStep, setCurrentStep, steps.length, activationStepIndex]);
+  }, [
+    currentStep,
+    setCurrentStep,
+    steps,
+    activationStepIndex,
+    isSignedIn,
+    skipAuth,
+    permissionsHook.accessibilityPermissionGranted,
+    setAccessibilitySkipped,
+  ]);
 
   const prevStep = useCallback(() => {
     if (currentStep > 0) {
@@ -300,9 +385,47 @@ export default function OnboardingFlow({ onComplete }: OnboardingFlowProps) {
     if (!saved) {
       return;
     }
-    removeCurrentStep();
-    onComplete();
-  }, [saveSettings, removeCurrentStep, onComplete]);
+
+    const cloudHealthCheck = window.electronAPI?.cloudHealthCheck;
+    if (useLocalWhisper || !cloudHealthCheck) {
+      removeCurrentStep();
+      onComplete();
+      return;
+    }
+
+    let result;
+    try {
+      result = await cloudHealthCheck();
+    } catch (error) {
+      logger.error("Cloud health check threw", { error }, "onboarding");
+      result = { ok: false } as Awaited<ReturnType<typeof cloudHealthCheck>>;
+    }
+
+    // Any HTTP response (even 4xx) proves the network reached the server.
+    // Only a transport-level failure with no status warrants the warning.
+    if (result.ok || result.status !== undefined) {
+      removeCurrentStep();
+      onComplete();
+      return;
+    }
+
+    setConnectivityDialog({
+      open: true,
+      cause: t(result.messageKey || "streaming.errors.cloudUnreachable.generic"),
+    });
+  }, [saveSettings, removeCurrentStep, onComplete, useLocalWhisper, t]);
+
+  const resolveConnectivity = useCallback(
+    (useLocal: boolean) => {
+      if (useLocal) {
+        setUseLocalWhisper(true);
+      }
+      setConnectivityDialog({ open: false, cause: "" });
+      removeCurrentStep();
+      onComplete();
+    },
+    [setUseLocalWhisper, removeCurrentStep, onComplete]
+  );
 
   const renderStep = () => {
     switch (currentStep) {
@@ -334,16 +457,12 @@ export default function OnboardingFlow({ onComplete }: OnboardingFlowProps) {
         );
 
       case 1: // Setup - Choose Mode & Configure (merged with permissions for signed-in users)
-        // Simplified path for signed-in users (cloud-first) with permissions
         if (isSignedIn && !skipAuth) {
-          const platform = permissionsHook.pasteToolsInfo?.platform;
-          const isMacOS = platform === "darwin";
-
           return (
             <div className="space-y-6">
               <div className="text-center">
-                <div className="w-14 h-14 bg-emerald-100 rounded-full flex items-center justify-center mx-auto mb-4">
-                  <Check className="w-7 h-7 text-emerald-600" />
+                <div className="w-14 h-14 bg-green-500/10 rounded-full flex items-center justify-center mx-auto mb-4">
+                  <Check className="w-7 h-7 text-green-500" />
                 </div>
                 <h2 className="text-2xl font-semibold text-foreground mb-2">
                   {t("onboarding.setup.title")}
@@ -372,48 +491,7 @@ export default function OnboardingFlow({ onComplete }: OnboardingFlowProps) {
                 <h3 className="text-sm font-medium text-foreground">
                   {t("onboarding.permissions.title")}
                 </h3>
-                <div className="space-y-1.5">
-                  <PermissionCard
-                    icon={Mic}
-                    title={t("onboarding.permissions.microphoneTitle")}
-                    description={t("onboarding.permissions.microphoneDescription")}
-                    granted={permissionsHook.micPermissionGranted}
-                    onRequest={permissionsHook.requestMicPermission}
-                    buttonText={t("onboarding.permissions.grant")}
-                  />
-
-                  {isMacOS && (
-                    <PermissionCard
-                      icon={Shield}
-                      title={t("onboarding.permissions.accessibilityTitle")}
-                      description={t("onboarding.permissions.accessibilityDescription")}
-                      granted={permissionsHook.accessibilityPermissionGranted}
-                      onRequest={permissionsHook.testAccessibilityPermission}
-                      buttonText={t("onboarding.permissions.testAndGrant")}
-                      onOpenSettings={permissionsHook.openAccessibilitySettings}
-                    />
-                  )}
-                </div>
-
-                {/* Error state - only show when there's actually an issue */}
-                {!permissionsHook.micPermissionGranted && permissionsHook.micPermissionError && (
-                  <MicPermissionWarning
-                    error={permissionsHook.micPermissionError}
-                    onOpenSoundSettings={permissionsHook.openSoundInputSettings}
-                    onOpenPrivacySettings={permissionsHook.openMicPrivacySettings}
-                  />
-                )}
-
-                {/* Linux paste tools - only when needed */}
-                {platform === "linux" &&
-                  permissionsHook.pasteToolsInfo &&
-                  !permissionsHook.pasteToolsInfo.available && (
-                    <PasteToolsInfo
-                      pasteToolsInfo={permissionsHook.pasteToolsInfo}
-                      isChecking={permissionsHook.isCheckingPasteTools}
-                      onCheck={permissionsHook.checkPasteToolsAvailability}
-                    />
-                  )}
+                <PermissionsSection permissions={permissionsHook} systemAudio={systemAudio} />
               </div>
             </div>
           );
@@ -458,15 +536,12 @@ export default function OnboardingFlow({ onComplete }: OnboardingFlowProps) {
                 })
               }
               useLocalWhisper={useLocalWhisper}
-              onModeChange={(isLocal) => updateTranscriptionSettings({ useLocalWhisper: isLocal })}
-              openaiApiKey={openaiApiKey}
-              setOpenaiApiKey={setOpenaiApiKey}
-              groqApiKey={groqApiKey}
-              setGroqApiKey={setGroqApiKey}
-              mistralApiKey={mistralApiKey}
-              setMistralApiKey={setMistralApiKey}
-              customTranscriptionApiKey={customTranscriptionApiKey}
-              setCustomTranscriptionApiKey={setCustomTranscriptionApiKey}
+              onModeChange={(isLocal) => {
+                updateTranscriptionSettings({
+                  useLocalWhisper: isLocal,
+                  ...(!isLocal && !isSignedIn ? { cloudTranscriptionMode: "byok" } : {}),
+                });
+              }}
               cloudTranscriptionBaseUrl={cloudTranscriptionBaseUrl}
               setCloudTranscriptionBaseUrl={(url) =>
                 updateTranscriptionSettings({ cloudTranscriptionBaseUrl: url })
@@ -514,49 +589,7 @@ export default function OnboardingFlow({ onComplete }: OnboardingFlowProps) {
               </p>
             </div>
 
-            {/* Permission cards - tight stack */}
-            <div className="space-y-1.5">
-              <PermissionCard
-                icon={Mic}
-                title={t("onboarding.permissions.microphoneTitle")}
-                description={t("onboarding.permissions.microphoneDescription")}
-                granted={permissionsHook.micPermissionGranted}
-                onRequest={permissionsHook.requestMicPermission}
-                buttonText={t("onboarding.permissions.grant")}
-              />
-
-              {isMacOS && (
-                <PermissionCard
-                  icon={Shield}
-                  title={t("onboarding.permissions.accessibilityTitle")}
-                  description={t("onboarding.permissions.accessibilityDescription")}
-                  granted={permissionsHook.accessibilityPermissionGranted}
-                  onRequest={permissionsHook.testAccessibilityPermission}
-                  buttonText={t("onboarding.permissions.testAndGrant")}
-                  onOpenSettings={permissionsHook.openAccessibilitySettings}
-                />
-              )}
-            </div>
-
-            {/* Error state - only show when there's actually an issue */}
-            {!permissionsHook.micPermissionGranted && permissionsHook.micPermissionError && (
-              <MicPermissionWarning
-                error={permissionsHook.micPermissionError}
-                onOpenSoundSettings={permissionsHook.openSoundInputSettings}
-                onOpenPrivacySettings={permissionsHook.openMicPrivacySettings}
-              />
-            )}
-
-            {/* Linux paste tools - only when needed */}
-            {platform === "linux" &&
-              permissionsHook.pasteToolsInfo &&
-              !permissionsHook.pasteToolsInfo.available && (
-                <PasteToolsInfo
-                  pasteToolsInfo={permissionsHook.pasteToolsInfo}
-                  isChecking={permissionsHook.isCheckingPasteTools}
-                  onCheck={permissionsHook.checkPasteToolsAvailability}
-                />
-              )}
+            <PermissionsSection permissions={permissionsHook} systemAudio={systemAudio} />
           </div>
         );
 
@@ -602,13 +635,13 @@ export default function OnboardingFlow({ onComplete }: OnboardingFlowProps) {
         </div>
 
         {/* Mode section - inline with hotkey */}
-        {!isUsingGnomeHotkeys && (
+        {(!isUsingNativeShortcut || getCachedPlatform() === "linux") && (
           <div className="p-4 flex items-center justify-between gap-4">
             <div className="flex-1 min-w-0">
               <span className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
                 {t("onboarding.activation.mode")}
               </span>
-              <p className="text-[11px] text-muted-foreground/70 mt-0.5">
+              <p className="text-xs text-muted-foreground/70 mt-0.5">
                 {activationMode === "tap"
                   ? t("onboarding.activation.tapDescription")
                   : t("onboarding.activation.holdDescription")}
@@ -629,8 +662,8 @@ export default function OnboardingFlow({ onComplete }: OnboardingFlowProps) {
           <span className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
             {t("onboarding.activation.test")}
           </span>
-          <span className="text-[10px] text-muted-foreground/60">
-            {activationMode === "tap" || isUsingGnomeHotkeys
+          <span className="text-xs text-muted-foreground/60">
+            {activationMode === "tap" || (isUsingNativeShortcut && getCachedPlatform() !== "linux")
               ? t("onboarding.activation.hotkeyToStartStop", { hotkey: readableHotkey })
               : t("onboarding.activation.holdHotkey", { hotkey: readableHotkey })}
           </span>
@@ -651,15 +684,7 @@ export default function OnboardingFlow({ onComplete }: OnboardingFlowProps) {
       case 1:
         // For signed-in users: Setup step includes permissions
         if (isSignedIn && !skipAuth) {
-          // Check permissions
-          if (!permissionsHook.micPermissionGranted) {
-            return false;
-          }
-          const currentPlatform = permissionsHook.pasteToolsInfo?.platform;
-          if (currentPlatform === "darwin") {
-            return permissionsHook.accessibilityPermissionGranted;
-          }
-          return true;
+          return areRequiredPermissionsMet(permissionsHook.micPermissionGranted);
         }
 
         // For non-signed-in users: Setup - check if configuration is complete
@@ -673,6 +698,8 @@ export default function OnboardingFlow({ onComplete }: OnboardingFlowProps) {
             return openaiApiKey.trim().length > 0;
           } else if (cloudTranscriptionProvider === "groq") {
             return groqApiKey.trim().length > 0;
+          } else if (cloudTranscriptionProvider === "mistral") {
+            return mistralApiKey.trim().length > 0;
           } else if (cloudTranscriptionProvider === "custom") {
             // Custom can work without API key for local endpoints
             return true;
@@ -686,14 +713,7 @@ export default function OnboardingFlow({ onComplete }: OnboardingFlowProps) {
         }
 
         // For non-signed-in users, this is permissions step
-        if (!permissionsHook.micPermissionGranted) {
-          return false;
-        }
-        const currentPlatform = permissionsHook.pasteToolsInfo?.platform;
-        if (currentPlatform === "darwin") {
-          return permissionsHook.accessibilityPermissionGranted;
-        }
-        return true;
+        return areRequiredPermissionsMet(permissionsHook.micPermissionGranted);
       }
       case 3:
         return hotkey.trim() !== ""; // Activation step for non-signed-in users
@@ -714,12 +734,15 @@ export default function OnboardingFlow({ onComplete }: OnboardingFlowProps) {
     };
   }, []);
 
+  const onboardingPlatform =
+    typeof window !== "undefined" && window.electronAPI?.getPlatform
+      ? window.electronAPI.getPlatform()
+      : "darwin";
+
   return (
     <div
       className="h-screen flex flex-col bg-background"
-      style={{
-        paddingTop: "env(safe-area-inset-top, 0px)",
-      }}
+      style={{ paddingTop: "env(safe-area-inset-top, 0px)" }}
     >
       <ConfirmDialog
         open={confirmDialog.open}
@@ -731,6 +754,17 @@ export default function OnboardingFlow({ onComplete }: OnboardingFlowProps) {
         onConfirm={confirmDialog.onConfirm}
       />
 
+      <ConfirmDialog
+        open={connectivityDialog.open}
+        onOpenChange={(open) => !open && setConnectivityDialog({ open: false, cause: "" })}
+        title={t("onboarding.connectivity.title")}
+        description={t("onboarding.connectivity.body", { cause: connectivityDialog.cause })}
+        confirmText={t("onboarding.connectivity.useLocal")}
+        cancelText={t("onboarding.connectivity.continue")}
+        onConfirm={() => resolveConnectivity(true)}
+        onCancel={() => resolveConnectivity(false)}
+      />
+
       <AlertDialog
         open={alertDialog.open}
         onOpenChange={(open) => !open && hideAlertDialog()}
@@ -739,14 +773,27 @@ export default function OnboardingFlow({ onComplete }: OnboardingFlowProps) {
         onOk={() => {}}
       />
 
-      {/* Title Bar */}
-      <div className="shrink-0 z-10">
-        <TitleBar
-          showTitle={true}
-          className="bg-background backdrop-blur-xl border-b border-border shadow-sm"
-          actions={isSignedIn ? <SupportDropdown /> : undefined}
-        ></TitleBar>
-      </div>
+      {/* Title Bar / drag region */}
+      {currentStep === 0 ? (
+        <div
+          className="flex items-center justify-end w-full h-10 shrink-0"
+          style={{ WebkitAppRegion: "drag" } as React.CSSProperties}
+        >
+          {onboardingPlatform !== "darwin" && (
+            <div className="pr-1" style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}>
+              <WindowControls />
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="shrink-0 z-10">
+          <TitleBar
+            showTitle={true}
+            className="bg-background backdrop-blur-xl border-b border-border shadow-sm"
+            actions={isSignedIn ? <SupportDropdown /> : undefined}
+          ></TitleBar>
+        </div>
+      )}
 
       {/* Progress Bar - hidden on welcome/auth step */}
       {showProgress && (

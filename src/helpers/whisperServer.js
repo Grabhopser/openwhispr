@@ -1,13 +1,16 @@
 const { spawn } = require("child_process");
+const EventEmitter = require("events");
 const fs = require("fs");
-const net = require("net");
-const os = require("os");
 const path = require("path");
 const http = require("http");
+const { app } = require("electron");
 const debugLogger = require("./debugLogger");
 const { killProcess } = require("../utils/process");
+const { isPortAvailable } = require("../utils/serverUtils");
 const { getSafeTempDir } = require("./safeTempDir");
 const { convertToWav } = require("./ffmpegUtils");
+const sidecarPidFile = require("./sidecarPidFile");
+const { sanitizeWhisperVadConfig, DEFAULT_WHISPER_VAD_CONFIG } = require("./whisperVadConfig");
 
 const PORT_RANGE_START = 8178;
 const PORT_RANGE_END = 8199;
@@ -15,25 +18,73 @@ const STARTUP_TIMEOUT_MS = 30000;
 const HEALTH_CHECK_INTERVAL_MS = 5000;
 const HEALTH_CHECK_TIMEOUT_MS = 2000;
 
-class WhisperServerManager {
+function isVadActive(options = {}) {
+  return options.vadEnabled === true && !!options.vadModelPath;
+}
+
+function getVadSignature(options = {}) {
+  if (!isVadActive(options)) return "vad:off";
+  const vadConfig = sanitizeWhisperVadConfig(options.vadConfig || DEFAULT_WHISPER_VAD_CONFIG);
+  return `vad:on:${options.vadModelPath}:${JSON.stringify(vadConfig)}`;
+}
+
+function buildWhisperServerArgs({
+  modelPath,
+  port,
+  language,
+  threads,
+  vadEnabled = false,
+  vadModelPath = null,
+  vadConfig,
+}) {
+  const args = ["--model", modelPath, "--host", "127.0.0.1", "--port", String(port)];
+
+  if (threads) args.push("--threads", String(threads));
+
+  // whisper.cpp defaults to English when --language is omitted;
+  // explicitly pass "auto" to enable language auto-detection
+  args.push("--language", language || "auto");
+
+  if (isVadActive({ vadEnabled, vadModelPath })) {
+    const cfg = sanitizeWhisperVadConfig(vadConfig || DEFAULT_WHISPER_VAD_CONFIG);
+    args.push(
+      "--vad",
+      "--vad-model",
+      vadModelPath,
+      "--vad-threshold",
+      String(cfg.threshold),
+      "--vad-min-speech-duration-ms",
+      String(cfg.minSpeechDurationMs),
+      "--vad-min-silence-duration-ms",
+      String(cfg.minSilenceDurationMs),
+      "--vad-max-speech-duration-s",
+      String(cfg.maxSpeechDurationS),
+      "--vad-speech-pad-ms",
+      String(cfg.speechPadMs),
+      "--vad-samples-overlap",
+      String(cfg.samplesOverlap)
+    );
+  }
+
+  return args;
+}
+
+class WhisperServerManager extends EventEmitter {
   constructor() {
+    super();
     this.process = null;
+    this.hostname = "127.0.0.1";
     this.port = null;
     this.ready = false;
+    this.isRemote = false;
     this.modelPath = null;
     this.startupPromise = null;
     this.healthCheckInterval = null;
     this.cachedServerBinaryPath = null;
     this.cachedFFmpegPath = null;
     this.canConvert = false;
-    this.lastBackendTrace = {
-      launch: null,
-      cudaLibDirs: [],
-      cudaDetected: false,
-      cudaDeviceLines: [],
-      backendLines: [],
-      lastError: null,
-    };
+    this.useCuda = false;
+    this.vadSignature = "vad:off";
   }
 
   getFFmpegPath() {
@@ -126,7 +177,14 @@ class WhisperServerManager {
     return null;
   }
 
-  getServerBinaryPath() {
+  getServerBinaryPath(options = {}) {
+    if (options.preferCuda) {
+      const ext = process.platform === "win32" ? ".exe" : "";
+      const cudaBinary = `whisper-server-${process.platform}-${process.arch}-cuda${ext}`;
+      const cudaPath = path.join(app.getPath("userData"), "bin", cudaBinary);
+      if (fs.existsSync(cudaPath)) return cudaPath;
+    }
+
     if (this.cachedServerBinaryPath) return this.cachedServerBinaryPath;
 
     const platform = process.platform;
@@ -171,34 +229,75 @@ class WhisperServerManager {
     return this.getServerBinaryPath() !== null;
   }
 
-  async findAvailablePort() {
-    for (let port = PORT_RANGE_START; port <= PORT_RANGE_END; port++) {
-      if (await this.isPortAvailable(port)) return port;
-    }
-    throw new Error(`No available ports in range ${PORT_RANGE_START}-${PORT_RANGE_END}`);
-  }
+  async connectRemote(url) {
+    const parsed = new URL(url);
+    const hostname = parsed.hostname;
+    const port = parseInt(parsed.port, 10) || (parsed.protocol === "https:" ? 443 : 80);
 
-  isPortAvailable(port) {
-    return new Promise((resolve) => {
-      const server = net.createServer();
-      server.once("error", () => resolve(false));
-      server.once("listening", () => {
-        server.close();
-        resolve(true);
+    debugLogger.debug("Connecting to remote whisper-server", { hostname, port });
+
+    const reachable = await new Promise((resolve) => {
+      const req = http.request(
+        { hostname, port, path: "/", method: "GET", timeout: HEALTH_CHECK_TIMEOUT_MS },
+        (res) => {
+          resolve(true);
+          res.resume();
+        }
+      );
+      req.on("error", () => resolve(false));
+      req.on("timeout", () => {
+        req.destroy();
+        resolve(false);
       });
-      server.listen(port, "127.0.0.1");
+      req.end();
     });
-  }
 
-  async start(modelPath, options = {}) {
-    if (this.startupPromise) return this.startupPromise;
-
-    if (this.ready && this.modelPath === modelPath) return;
+    if (!reachable) {
+      throw new Error(`Remote whisper-server unreachable at ${hostname}:${port}`);
+    }
 
     if (this.process) {
       await this.stop();
     }
 
+    this.hostname = hostname;
+    this.port = port;
+    this.ready = true;
+    this.isRemote = true;
+    this.canConvert = !!this.getFFmpegPath();
+
+    this.startHealthCheck();
+
+    debugLogger.info("Connected to remote whisper-server", { hostname, port });
+  }
+
+  async findAvailablePort() {
+    for (let port = PORT_RANGE_START; port <= PORT_RANGE_END; port++) {
+      if (await isPortAvailable(port)) return port;
+    }
+    throw new Error(`No available ports in range ${PORT_RANGE_START}-${PORT_RANGE_END}`);
+  }
+
+  async start(modelPath, options = {}) {
+    if (this.startupPromise) return this.startupPromise;
+
+    const nextVadSignature = getVadSignature(options);
+    if (
+      this.ready &&
+      this.modelPath === modelPath &&
+      !this.isRemote &&
+      this.vadSignature === nextVadSignature
+    ) {
+      return;
+    }
+
+    if (this.process || this.isRemote) {
+      await this.stop();
+    }
+
+    this.isRemote = false;
+    this.hostname = "127.0.0.1";
+    this.vadSignature = nextVadSignature;
     this.startupPromise = this._doStart(modelPath, options);
     try {
       await this.startupPromise;
@@ -208,18 +307,19 @@ class WhisperServerManager {
   }
 
   async _doStart(modelPath, options = {}) {
-    const serverBinary = this.getServerBinaryPath();
+    const usingCuda = options.useCuda || false;
+    const serverBinary = this.getServerBinaryPath(usingCuda ? { preferCuda: true } : {});
     if (!serverBinary) throw new Error("whisper-server binary not found");
     if (!fs.existsSync(modelPath)) throw new Error(`Model file not found: ${modelPath}`);
 
     this.port = await this.findAvailablePort();
     this.modelPath = modelPath;
+    this.useCuda = usingCuda;
 
     // Check for FFmpeg first - only use --convert flag if FFmpeg is available
     const ffmpegPath = this.getFFmpegPath();
     const spawnEnv = { ...process.env };
     const pathSep = process.platform === "win32" ? ";" : ":";
-    let resolvedCudaLibDirs = [];
 
     if (process.platform === "win32") {
       const safeTmp = getSafeTempDir();
@@ -231,43 +331,19 @@ class WhisperServerManager {
     const serverBinaryDir = path.dirname(serverBinary);
     spawnEnv.PATH = serverBinaryDir + pathSep + (process.env.PATH || "");
 
-    // Common CUDA runtime library paths (useful on Arch/Cachy and custom CUDA installs).
-    // whisper-server CUDA builds fail at startup if libcudart/libcublas are not on the loader path.
-    if (process.platform === "linux") {
-      const homeDir = os.homedir();
-      const localCuda12Root =
-        process.env.OPENWHISPR_CUDA12_RUNTIME_DIR ||
-        path.join(homeDir, ".cache", "openwhispr", "cuda12-runtime");
-      const cudaLibDirs = [
-        "/opt/cuda/targets/x86_64-linux/lib",
-        "/opt/cuda/lib64",
-        "/usr/local/cuda/targets/x86_64-linux/lib",
-        "/usr/local/cuda/lib64",
-        path.join(localCuda12Root, "nvidia", "cuda_runtime", "lib"),
-        path.join(localCuda12Root, "nvidia", "cublas", "lib"),
-      ].filter((dir) => fs.existsSync(dir));
-      resolvedCudaLibDirs = cudaLibDirs;
-
-      if (cudaLibDirs.length > 0) {
-        const ldLibraryPath = process.env.LD_LIBRARY_PATH || "";
-        const ldParts = ldLibraryPath.split(":").filter(Boolean);
-        const merged = [...cudaLibDirs, ...ldParts].filter(
-          (dir, index, arr) => arr.indexOf(dir) === index
-        );
-        spawnEnv.LD_LIBRARY_PATH = merged.join(":");
-        debugLogger.debug("Configured LD_LIBRARY_PATH for whisper-server", {
-          ldLibraryPath: spawnEnv.LD_LIBRARY_PATH,
-        });
-        debugLogger.info("Whisper CUDA runtime search paths configured", {
-          cudaLibDirs,
-          source: process.env.OPENWHISPR_CUDA12_RUNTIME_DIR
-            ? "OPENWHISPR_CUDA12_RUNTIME_DIR"
-            : "auto",
-        });
-      }
+    if (usingCuda && process.env.TRANSCRIPTION_GPU_INDEX) {
+      spawnEnv.CUDA_VISIBLE_DEVICES = process.env.TRANSCRIPTION_GPU_INDEX;
     }
 
-    const args = ["--model", modelPath, "--host", "127.0.0.1", "--port", String(this.port)];
+    const args = buildWhisperServerArgs({
+      modelPath,
+      port: this.port,
+      language: options.language,
+      threads: options.threads,
+      vadEnabled: options.vadEnabled === true,
+      vadModelPath: options.vadModelPath || null,
+      vadConfig: options.vadConfig,
+    });
 
     // FFmpeg is required for pre-converting audio to 16kHz mono WAV
     this.canConvert = !!ffmpegPath;
@@ -278,99 +354,36 @@ class WhisperServerManager {
       debugLogger.warn("FFmpeg not found - whisper-server will only accept 16kHz mono WAV");
     }
 
-    if (options.threads) args.push("--threads", String(options.threads));
-    // whisper.cpp defaults to English when --language is omitted;
-    // explicitly pass "auto" to enable language auto-detection
-    args.push("--language", options.language || "auto");
-
     debugLogger.debug("Starting whisper-server", {
       port: this.port,
       modelPath,
       args,
       cwd: serverBinaryDir,
+      cuda: usingCuda,
     });
 
-    let serverBinarySizeMb = null;
-    try {
-      serverBinarySizeMb = Math.round(fs.statSync(serverBinary).size / (1024 * 1024));
-    } catch {
-      // ignore stat failures
-    }
-
-    this.lastBackendTrace = {
-      launch: {
-        binaryPath: serverBinary,
-        binarySizeMb: serverBinarySizeMb,
-        gpuRequested: !args.includes("--no-gpu"),
-        platform: process.platform,
-        ldLibraryPathConfigured: Boolean(spawnEnv.LD_LIBRARY_PATH),
-      },
-      cudaLibDirs: resolvedCudaLibDirs,
-      cudaDetected: false,
-      cudaDeviceLines: [],
-      backendLines: [],
-      lastError: null,
-    };
-
-    debugLogger.info("Whisper backend launch trace", this.lastBackendTrace.launch);
+    const startTime = Date.now();
 
     this.process = spawn(serverBinary, args, {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
       env: spawnEnv,
       cwd: serverBinaryDir,
+      detached: process.platform !== "win32",
     });
+    sidecarPidFile.write("whisper", this.process.pid);
 
     let stderrBuffer = "";
     let exitCode = null;
+    let earlyExit = false;
 
     this.process.stdout.on("data", (data) => {
-      const text = data.toString();
-      debugLogger.debug("whisper-server stdout", { data: text.trim() });
-
-      for (const rawLine of text.split(/\r?\n/)) {
-        const line = rawLine.trim();
-        if (!line) continue;
-
-        if (
-          line.includes("ggml_cuda_init:") ||
-          line.includes("CUDA devices:") ||
-          /^Device \d+: /i.test(line)
-        ) {
-          if (line.includes("ggml_cuda_init:") || line.includes("CUDA devices:")) {
-            this.lastBackendTrace.cudaDetected = true;
-          }
-          if (/^Device \d+: /i.test(line) || line.includes("CUDA devices:")) {
-            this.lastBackendTrace.cudaDeviceLines.push(line);
-          }
-          debugLogger.info("Whisper CUDA trace", { line });
-        }
-
-        if (line.startsWith("load_backend:")) {
-          this.lastBackendTrace.backendLines.push(line);
-          debugLogger.info("Whisper backend module", { line });
-        }
-      }
+      debugLogger.debug("whisper-server stdout", { data: data.toString().trim() });
     });
 
     this.process.stderr.on("data", (data) => {
-      const text = data.toString();
-      stderrBuffer += text;
-      debugLogger.debug("whisper-server stderr", { data: text.trim() });
-
-      for (const rawLine of text.split(/\r?\n/)) {
-        const line = rawLine.trim();
-        if (!line) continue;
-
-        if (
-          /libcudart\.so\.12|libcublas\.so\.12|error while loading shared libraries/i.test(line)
-        ) {
-          this.lastBackendTrace.lastError = line;
-          debugLogger.error("Whisper CUDA startup error", { line });
-        } else if (/cuda/i.test(line)) {
-          debugLogger.warn("Whisper CUDA stderr", { line });
-        }
-      }
+      stderrBuffer += data.toString();
+      debugLogger.debug("whisper-server stderr", { data: data.toString().trim() });
     });
 
     this.process.on("error", (error) => {
@@ -380,20 +393,34 @@ class WhisperServerManager {
 
     this.process.on("close", (code) => {
       exitCode = code;
+      if (Date.now() - startTime < 10000) earlyExit = true;
       debugLogger.debug("whisper-server process exited", { code });
       this.ready = false;
       this.process = null;
       this.stopHealthCheck();
+      sidecarPidFile.clear("whisper");
     });
 
-    await this.waitForReady(() => ({ stderr: stderrBuffer, exitCode }));
+    try {
+      await this.waitForReady(() => ({ stderr: stderrBuffer, exitCode }));
+    } catch (err) {
+      if (usingCuda && earlyExit) {
+        debugLogger.warn("CUDA whisper-server failed, falling back to CPU", {
+          exitCode,
+          stderr: stderrBuffer.slice(0, 200),
+        });
+        this.emit("cuda-fallback");
+        return this._doStart(modelPath, { ...options, useCuda: false });
+      }
+      throw err;
+    }
+
     this.startHealthCheck();
 
     debugLogger.info("whisper-server started successfully", {
       port: this.port,
       model: path.basename(modelPath),
-      cudaDetected: this.lastBackendTrace.cudaDetected,
-      cudaDeviceLines: this.lastBackendTrace.cudaDeviceLines,
+      cuda: this.useCuda,
     });
   }
 
@@ -435,7 +462,7 @@ class WhisperServerManager {
     return new Promise((resolve) => {
       const req = http.request(
         {
-          hostname: "127.0.0.1",
+          hostname: this.hostname,
           port: this.port,
           path: "/",
           method: "GET",
@@ -459,7 +486,7 @@ class WhisperServerManager {
   startHealthCheck() {
     this.stopHealthCheck();
     this.healthCheckInterval = setInterval(async () => {
-      if (!this.process) {
+      if (!this.isRemote && !this.process) {
         this.stopHealthCheck();
         return;
       }
@@ -478,7 +505,7 @@ class WhisperServerManager {
   }
 
   async transcribe(audioBuffer, options = {}) {
-    if (!this.ready || !this.process) {
+    if (!this.ready || (!this.process && !this.isRemote)) {
       throw new Error("whisper-server is not running");
     }
 
@@ -547,7 +574,7 @@ class WhisperServerManager {
 
       const req = http.request(
         {
-          hostname: "127.0.0.1",
+          hostname: this.hostname,
           port: this.port,
           path: "/inference",
           method: "POST",
@@ -621,6 +648,15 @@ class WhisperServerManager {
   async stop() {
     this.stopHealthCheck();
 
+    if (this.isRemote) {
+      debugLogger.debug("Disconnecting from remote whisper-server");
+      this.ready = false;
+      this.isRemote = false;
+      this.hostname = "127.0.0.1";
+      this.port = null;
+      return;
+    }
+
     if (!this.process) {
       this.ready = false;
       return;
@@ -662,13 +698,16 @@ class WhisperServerManager {
   getStatus() {
     return {
       available: this.isAvailable(),
-      running: this.ready && this.process !== null,
+      running: this.ready && (this.process !== null || this.isRemote),
       port: this.port,
+      hostname: this.hostname,
+      isRemote: this.isRemote,
       modelPath: this.modelPath,
       modelName: this.modelPath ? path.basename(this.modelPath, ".bin").replace("ggml-", "") : null,
-      backendTrace: this.lastBackendTrace,
     };
   }
 }
 
 module.exports = WhisperServerManager;
+module.exports.buildWhisperServerArgs = buildWhisperServerArgs;
+module.exports.getVadSignature = getVadSignature;

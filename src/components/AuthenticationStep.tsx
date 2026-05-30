@@ -3,19 +3,19 @@ import { useTranslation } from "react-i18next";
 import { useAuth } from "../hooks/useAuth";
 import {
   authClient,
-  NEON_AUTH_URL,
+  AUTH_URL,
   signInWithSocial,
   updateLastSignInTime,
   type SocialProvider,
-} from "../lib/neonAuth";
+} from "../lib/auth";
 import { OPENWHISPR_API_URL } from "../config/constants";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { AlertCircle, ArrowRight, Check, Loader2, ChevronLeft } from "lucide-react";
 import logoIcon from "../assets/icon.png";
 import logger from "../utils/logger";
+import { getCachedPlatform } from "../utils/platform";
 import ForgotPasswordView from "./ForgotPasswordView";
-import ResetPasswordView from "./ResetPasswordView";
 
 interface AuthenticationStepProps {
   onContinueWithoutAccount: () => void;
@@ -24,7 +24,6 @@ interface AuthenticationStepProps {
 }
 
 type AuthMode = "sign-in" | "sign-up" | null;
-type PasswordResetView = "forgot" | "reset" | null;
 
 const GoogleIcon = ({ className }: { className?: string }) => (
   <svg className={className} viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -47,6 +46,26 @@ const GoogleIcon = ({ className }: { className?: string }) => (
   </svg>
 );
 
+const MicrosoftIcon = ({ className }: { className?: string }) => (
+  <svg className={className} viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <path d="M11.4 11.4H2V2h9.4v9.4z" fill="#F25022" />
+    <path d="M22 11.4h-9.4V2H22v9.4z" fill="#7FBA00" />
+    <path d="M11.4 22H2v-9.4h9.4V22z" fill="#00A4EF" />
+    <path d="M22 22h-9.4v-9.4H22V22z" fill="#FFB900" />
+  </svg>
+);
+
+const AppleIcon = ({ className }: { className?: string }) => (
+  <svg
+    className={className}
+    viewBox="0 0 24 24"
+    fill="currentColor"
+    xmlns="http://www.w3.org/2000/svg"
+  >
+    <path d="M17.05 20.28c-.98.95-2.05.8-3.08.35-1.09-.46-2.09-.48-3.24 0-1.44.62-2.2.44-3.06-.35C2.79 15.25 3.51 7.59 9.05 7.31c1.35.07 2.29.74 3.08.8 1.18-.24 2.31-.93 3.57-.84 1.51.12 2.65.72 3.4 1.8-3.12 1.87-2.38 5.98.48 7.13-.57 1.5-1.31 2.99-2.54 4.09zM12.03 7.25c-.15-2.23 1.66-4.07 3.74-4.25.29 2.58-2.34 4.5-3.74 4.25z" />
+  </svg>
+);
+
 export default function AuthenticationStep({
   onContinueWithoutAccount,
   onAuthComplete,
@@ -62,63 +81,23 @@ export default function AuthenticationStep({
   const [isCheckingEmail, setIsCheckingEmail] = useState(false);
   const [isSocialLoading, setIsSocialLoading] = useState<SocialProvider | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [passwordResetView, setPasswordResetView] = useState<PasswordResetView>(null);
-  const [resetToken, setResetToken] = useState<string | null>(null);
+  const [forgotPasswordOpen, setForgotPasswordOpen] = useState(false);
+  const [oauthProtocolRegistered, setOauthProtocolRegistered] = useState(true);
+  const isMacOS = getCachedPlatform() === "darwin";
 
-  const oauthProcessedRef = useRef(false);
-  const resetProcessedRef = useRef(false);
   const needsVerificationRef = useRef(false);
 
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const hasVerifier = params.has("neon_auth_session_verifier");
-    const token = params.get("token");
-    const isResetPassword = params.has("reset_password");
-
-    if (token && isResetPassword && !resetProcessedRef.current) {
-      resetProcessedRef.current = true;
-      setResetToken(token);
-      setPasswordResetView("reset");
-      logger.debug("Password reset token detected, showing reset form", undefined, "auth");
-      return;
-    }
-
-    if (hasVerifier && !oauthProcessedRef.current) {
-      oauthProcessedRef.current = true;
-      setIsSocialLoading("google");
-
-      // Grace period: session cookies take ~10-15s to establish after OAuth
-      updateLastSignInTime();
-      logger.debug("OAuth callback detected, grace period active", undefined, "auth");
-    }
+    window.electronAPI
+      ?.getOAuthProtocolRegistered?.()
+      .then(setOauthProtocolRegistered)
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
     if (!isLoaded || !isSignedIn || needsVerificationRef.current || !user?.id || !user?.email)
       return;
-
-    const initAndComplete = async () => {
-      if (OPENWHISPR_API_URL) {
-        try {
-          const res = await fetch(`${OPENWHISPR_API_URL}/api/auth/init-user`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              userId: user.id,
-              email: user.email,
-              name: user.name || null,
-            }),
-          });
-          if (!res.ok) {
-            logger.error("init-user returned non-OK", { status: res.status }, "auth");
-          }
-        } catch (err) {
-          logger.error("Failed to init user", err, "auth");
-        }
-      }
-      onAuthComplete();
-    };
-    initAndComplete();
+    onAuthComplete();
   }, [isLoaded, isSignedIn, user, onAuthComplete]);
 
   useEffect(() => {
@@ -239,23 +218,6 @@ export default function AuthenticationStep({
             }
           } else {
             updateLastSignInTime();
-
-            if (OPENWHISPR_API_URL) {
-              try {
-                await fetch(`${OPENWHISPR_API_URL}/api/auth/init-user`, {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    userId: result.data?.user?.id,
-                    email: email.trim(),
-                    name: fullName.trim() || email.trim().split("@")[0],
-                  }),
-                });
-              } catch (initErr) {
-                logger.error("Failed to init user", initErr, "auth");
-              }
-            }
-
             onNeedsVerification(email.trim());
           }
         } else {
@@ -284,7 +246,7 @@ export default function AuthenticationStep({
         setIsSubmitting(false);
       }
     },
-    [authMode, email, password, onAuthComplete, onNeedsVerification, t]
+    [authMode, email, fullName, password, onAuthComplete, onNeedsVerification, t]
   );
 
   const handleBack = useCallback(() => {
@@ -295,18 +257,13 @@ export default function AuthenticationStep({
   }, []);
 
   const handleForgotPassword = useCallback(() => {
-    setPasswordResetView("forgot");
+    setForgotPasswordOpen(true);
     setError(null);
   }, []);
 
-  const handleBackFromPasswordReset = useCallback(() => {
-    setPasswordResetView(null);
-    setResetToken(null);
+  const handleBackFromForgotPassword = useCallback(() => {
+    setForgotPasswordOpen(false);
     setError(null);
-    const url = new URL(window.location.href);
-    url.searchParams.delete("token");
-    url.searchParams.delete("reset_password");
-    window.history.replaceState({}, "", url.toString());
   }, []);
 
   const toggleAuthMode = useCallback(() => {
@@ -317,7 +274,7 @@ export default function AuthenticationStep({
   }, []);
 
   // Auth not configured state
-  if (!NEON_AUTH_URL || !authClient) {
+  if (!AUTH_URL || !authClient) {
     return (
       <div className="space-y-3">
         <div className="text-center mb-4">
@@ -335,7 +292,7 @@ export default function AuthenticationStep({
         </div>
 
         <div className="bg-warning/5 p-2.5 rounded border border-warning/20">
-          <p className="text-[10px] text-warning text-center leading-snug">
+          <p className="text-xs text-warning text-center leading-snug">
             {t("auth.cloudNotConfigured")}
           </p>
         </div>
@@ -378,20 +335,8 @@ export default function AuthenticationStep({
     );
   }
 
-  // Password reset flow - show reset form if we have a token
-  if (passwordResetView === "reset" && resetToken) {
-    return (
-      <ResetPasswordView
-        token={resetToken}
-        onSuccess={onAuthComplete}
-        onBack={handleBackFromPasswordReset}
-      />
-    );
-  }
-
-  // Password reset flow - show forgot password form
-  if (passwordResetView === "forgot") {
-    return <ForgotPasswordView email={email} onBack={handleBackFromPasswordReset} />;
+  if (forgotPasswordOpen) {
+    return <ForgotPasswordView email={email} onBack={handleBackFromForgotPassword} />;
   }
 
   // Password form (after email is entered)
@@ -401,7 +346,7 @@ export default function AuthenticationStep({
         <button
           type="button"
           onClick={handleBack}
-          className="text-[10px] text-muted-foreground hover:text-foreground transition-colors flex items-center gap-0.5"
+          className="text-xs text-muted-foreground hover:text-foreground transition-colors flex items-center gap-0.5"
         >
           <ChevronLeft className="w-3 h-3" />
           {t("auth.common.back")}
@@ -445,7 +390,7 @@ export default function AuthenticationStep({
           />
 
           {authMode === "sign-up" && (
-            <p className="text-[9px] text-muted-foreground/70 leading-tight">
+            <p className="text-xs text-muted-foreground/70 leading-tight">
               {t("auth.passwordForm.passwordMinLength")}
             </p>
           )}
@@ -454,7 +399,7 @@ export default function AuthenticationStep({
             <button
               type="button"
               onClick={handleForgotPassword}
-              className="text-[10px] text-primary hover:text-primary/80 transition-colors text-left"
+              className="text-xs text-primary hover:text-primary/80 transition-colors text-left"
               disabled={isSubmitting}
             >
               {t("auth.passwordForm.forgotPassword")}
@@ -464,7 +409,7 @@ export default function AuthenticationStep({
           {error && (
             <div className="px-2.5 py-1.5 rounded bg-destructive/5 border border-destructive/20 flex items-center gap-1.5">
               <AlertCircle className="w-3 h-3 text-destructive shrink-0" />
-              <p className="text-[10px] text-destructive leading-snug">{error}</p>
+              <p className="text-xs text-destructive leading-snug">{error}</p>
             </div>
           )}
 
@@ -492,7 +437,7 @@ export default function AuthenticationStep({
           <button
             type="button"
             onClick={toggleAuthMode}
-            className="text-[10px] text-muted-foreground/70 hover:text-foreground transition-colors"
+            className="text-xs text-muted-foreground/70 hover:text-foreground transition-colors"
             disabled={isSubmitting}
           >
             {authMode === "sign-in" ? (
@@ -533,11 +478,37 @@ export default function AuthenticationStep({
         </p>
       </div>
 
+      {isMacOS && (
+        <Button
+          type="button"
+          variant="social"
+          onClick={() => handleSocialSignIn("apple")}
+          disabled={isSocialLoading !== null || isCheckingEmail || !oauthProtocolRegistered}
+          title={!oauthProtocolRegistered ? t("auth.social.protocolUnavailable") : undefined}
+          className="w-full h-9"
+        >
+          {isSocialLoading === "apple" ? (
+            <>
+              <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />
+              <span className="text-sm font-medium text-muted-foreground">
+                {t("auth.social.completeInBrowser")}
+              </span>
+            </>
+          ) : (
+            <>
+              <AppleIcon className="w-4 h-4" />
+              <span className="text-sm font-medium">{t("auth.social.continueWithApple")}</span>
+            </>
+          )}
+        </Button>
+      )}
+
       <Button
         type="button"
         variant="social"
         onClick={() => handleSocialSignIn("google")}
-        disabled={isSocialLoading !== null || isCheckingEmail}
+        disabled={isSocialLoading !== null || isCheckingEmail || !oauthProtocolRegistered}
+        title={!oauthProtocolRegistered ? t("auth.social.protocolUnavailable") : undefined}
         className="w-full h-9"
       >
         {isSocialLoading === "google" ? (
@@ -555,9 +526,38 @@ export default function AuthenticationStep({
         )}
       </Button>
 
+      <Button
+        type="button"
+        variant="social"
+        onClick={() => handleSocialSignIn("microsoft")}
+        disabled={isSocialLoading !== null || isCheckingEmail || !oauthProtocolRegistered}
+        title={!oauthProtocolRegistered ? t("auth.social.protocolUnavailable") : undefined}
+        className="w-full h-9"
+      >
+        {isSocialLoading === "microsoft" ? (
+          <>
+            <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />
+            <span className="text-sm font-medium text-muted-foreground">
+              {t("auth.social.completeInBrowser")}
+            </span>
+          </>
+        ) : (
+          <>
+            <MicrosoftIcon className="w-4 h-4" />
+            <span className="text-sm font-medium">{t("auth.social.continueWithMicrosoft")}</span>
+          </>
+        )}
+      </Button>
+
+      {!oauthProtocolRegistered && (
+        <p className="text-xs text-muted-foreground/80 leading-tight text-center">
+          {t("auth.social.protocolUnavailable")}
+        </p>
+      )}
+
       <div className="flex items-center gap-2">
         <div className="flex-1 h-px bg-border/50" />
-        <span className="text-[9px] font-medium text-muted-foreground/40 uppercase tracking-widest px-1">
+        <span className="text-xs font-medium text-muted-foreground/40 uppercase tracking-widest px-1">
           {t("auth.common.or")}
         </span>
         <div className="flex-1 h-px bg-border/50" />
@@ -614,7 +614,7 @@ export default function AuthenticationStep({
         </button>
       </div>
 
-      <p className="text-[10px] text-muted-foreground/80 leading-tight text-center">
+      <p className="text-xs text-muted-foreground/80 leading-tight text-center">
         {t("auth.legal.prefix")}{" "}
         <a
           href="https://openwhispr.com/terms"

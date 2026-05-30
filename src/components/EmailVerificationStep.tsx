@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { OPENWHISPR_API_URL } from "../config/constants";
+import { authClient } from "../lib/auth";
 import { Button } from "./ui/button";
 import { Mail, Loader2, Check, RefreshCw } from "lucide-react";
 import logoIcon from "../assets/icon.png";
@@ -41,7 +42,7 @@ export default function EmailVerificationStep({ email, onVerified }: EmailVerifi
           }
         } else if (res.status === 401 || res.status === 400) {
           if (pollRef.current) clearInterval(pollRef.current);
-          setError("Session expired. Please restart the sign-up process.");
+          setError(t("auth.sessionExpired"));
         }
       } catch {
         // Network error — silently retry on next poll
@@ -51,29 +52,25 @@ export default function EmailVerificationStep({ email, onVerified }: EmailVerifi
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
     };
-  }, [email, verified, onVerified]);
+  }, [email, verified, onVerified, t]);
 
   const handleResend = useCallback(async () => {
-    if (resendCooldown > 0 || isResending || !OPENWHISPR_API_URL) return;
+    if (resendCooldown > 0 || isResending) return;
     setIsResending(true);
     setError(null);
     try {
-      const res = await fetch(`${OPENWHISPR_API_URL}/api/auth/send-verification-email`, {
-        method: "POST",
-        credentials: "include",
-      });
-      if (res.ok) {
-        setResendCooldown(60);
+      const result = await authClient.sendVerificationEmail({ email });
+      if (result.error) {
+        setError(result.error.message || t("emailVerification.errors.resendFailed"));
       } else {
-        const data = await res.json();
-        setError(data.error || t("emailVerification.errors.resendFailed"));
+        setResendCooldown(60);
       }
     } catch {
       setError(t("emailVerification.errors.serverUnreachable"));
     } finally {
       setIsResending(false);
     }
-  }, [resendCooldown, isResending, t]);
+  }, [resendCooldown, isResending, email, t]);
 
   if (verified) {
     return (
@@ -120,12 +117,12 @@ export default function EmailVerificationStep({ email, onVerified }: EmailVerifi
 
       <div className="flex items-center justify-center gap-1.5 py-1">
         <Loader2 className="w-3 h-3 animate-spin text-muted-foreground/50" />
-        <p className="text-[10px] text-muted-foreground/50">{t("emailVerification.waiting")}</p>
+        <p className="text-xs text-muted-foreground/50">{t("emailVerification.waiting")}</p>
       </div>
 
       {error && (
         <div className="px-2.5 py-1.5 rounded bg-destructive/5 border border-destructive/20 flex items-center gap-1.5">
-          <p className="text-[10px] text-destructive leading-snug">{error}</p>
+          <p className="text-xs text-destructive leading-snug">{error}</p>
         </div>
       )}
 

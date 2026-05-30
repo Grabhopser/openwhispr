@@ -369,6 +369,7 @@ class ModelManager {
       await this.serverManager.start(modelPath, {
         contextSize: options.contextSize || modelInfo.model.contextLength || 4096,
         threads: options.threads || 4,
+        gpuLayers: 99,
       });
       this.currentServerModelId = modelId;
 
@@ -394,6 +395,7 @@ class ModelManager {
       const result = await this.serverManager.inference(messages, {
         temperature: options.temperature ?? 0.7,
         max_tokens: options.maxTokens ?? 512,
+        disableThinking: options.disableThinking,
       });
 
       const totalTime = Date.now() - startTime;
@@ -441,6 +443,7 @@ class ModelManager {
       await this.serverManager.start(modelPath, {
         contextSize: modelInfo.model.contextLength || 4096,
         threads: 4,
+        gpuLayers: 99,
       });
       this.currentServerModelId = modelId;
       debugLogger.info("llama-server pre-warmed", { modelId });

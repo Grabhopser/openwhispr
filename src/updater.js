@@ -1,5 +1,9 @@
 const { autoUpdater } = require("electron-updater");
 
+const FORK_UPDATE_CHECKS_DISABLED =
+  process.env.OPENWHISPR_ENABLE_UPSTREAM_UPDATES !== "1" &&
+  process.env.OPENWHISPR_ENABLE_UPSTREAM_UPDATES !== "true";
+
 class UpdateManager {
   constructor() {
     this.mainWindow = null;
@@ -10,6 +14,9 @@ class UpdateManager {
     this.isInstalling = false;
     this.isDownloading = false;
     this.eventListeners = [];
+    this.updateCheckInterval = null;
+    this.windowManager = null;
+    this._suppressNotification = false;
 
     this.setupAutoUpdater();
   }
@@ -19,14 +26,20 @@ class UpdateManager {
     this.controlPanelWindow = controlPanelWindow;
   }
 
+  setWindowManager(windowManager) {
+    this.windowManager = windowManager;
+  }
+
   setupAutoUpdater() {
-    // Only configure auto-updater in production
-    if (process.env.NODE_ENV === "development") {
-      // Auto-updater disabled in development mode
+    if (process.env.NODE_ENV === "development" || FORK_UPDATE_CHECKS_DISABLED) {
+      if (FORK_UPDATE_CHECKS_DISABLED) {
+        console.log(
+          "OpenWhispr fork update checks disabled; official upstream builds do not include Parakeet CUDA"
+        );
+      }
       return;
     }
 
-    // Configure auto-updater for GitHub releases
     autoUpdater.setFeedURL({
       provider: "github",
       owner: "OpenWhispr",
@@ -34,18 +47,40 @@ class UpdateManager {
       private: false,
     });
 
-    // Disable auto-download - let user control when to download
+    // Use arch-specific update channel on macOS to prevent arm64/x64
+    // from downloading mismatched artifacts. Both builds publish to the
+    // same GitHub release, so without this they race on latest-mac.yml.
+    // Setting channel to e.g. 'latest-arm64' makes the updater look for
+    // 'latest-arm64-mac.yml' instead of the shared 'latest-mac.yml'.
+    if (process.platform === "darwin") {
+      let nativeArch = process.arch;
+
+      // Detect Rosetta: if an x64 build is running on Apple Silicon,
+      // sysctl.proc_translated returns "1". This self-heals users who
+      // got stuck on the x64 build from older releases.
+      if (process.arch === "x64") {
+        try {
+          const { execSync } = require("child_process");
+          const translated = execSync("sysctl -n sysctl.proc_translated", {
+            encoding: "utf8",
+            timeout: 3000,
+          }).trim();
+          if (translated === "1") {
+            console.log("🔄 Rosetta detected — switching update channel to arm64");
+            nativeArch = "arm64";
+          }
+        } catch {
+          // sysctl.proc_translated doesn't exist on real Intel Macs — ignore
+        }
+      }
+
+      autoUpdater.channel = nativeArch === "arm64" ? "latest-arm64" : "latest-x64";
+    }
+
     autoUpdater.autoDownload = false;
-
-    // Enable auto-install on quit - if user ignores update and quits normally,
-    // the update will install automatically (best UX)
-    // User can also manually trigger install with "Install & Restart" button
     autoUpdater.autoInstallOnAppQuit = true;
-
-    // Enable logging in production for debugging (logs are user-accessible)
     autoUpdater.logger = console;
 
-    // Set up event handlers
     this.setupEventHandlers();
   }
 
@@ -65,16 +100,25 @@ class UpdateManager {
           };
         }
         this.notifyRenderers("update-available", info);
+        if (this.windowManager && info && !this._suppressNotification) {
+          this.windowManager.showUpdateNotification(info).catch((err) => {
+            console.error("Failed to show update notification:", err);
+          });
+        }
+        this._suppressNotification = false;
       },
       "update-not-available": (info) => {
         this.updateAvailable = false;
-        this.updateDownloaded = false;
-        this.isDownloading = false;
-        this.lastUpdateInfo = null;
+        this._suppressNotification = false;
+        if (!this.updateDownloaded) {
+          this.isDownloading = false;
+          this.lastUpdateInfo = null;
+        }
         this.notifyRenderers("update-not-available", info);
       },
       error: (err) => {
         console.error("❌ Auto-updater error:", err);
+        this._suppressNotification = false;
         this.isDownloading = false;
         this.notifyRenderers("update-error", err);
       },
@@ -100,7 +144,6 @@ class UpdateManager {
       },
     };
 
-    // Register and track event listeners for cleanup
     Object.entries(handlers).forEach(([event, handler]) => {
       autoUpdater.on(event, handler);
       this.eventListeners.push({ event, handler });
@@ -129,15 +172,20 @@ class UpdateManager {
         };
       }
 
+      if (FORK_UPDATE_CHECKS_DISABLED) {
+        return {
+          updateAvailable: false,
+          message:
+            "Update checks are disabled in this Parakeet CUDA fork to avoid installing official non-CUDA builds",
+        };
+      }
+
       console.log("🔍 Checking for updates...");
+      this._suppressNotification = true;
       const result = await autoUpdater.checkForUpdates();
 
       if (result?.isUpdateAvailable && result?.updateInfo) {
         console.log("📋 Update available:", result.updateInfo.version);
-        console.log(
-          "📦 Download size:",
-          result.updateInfo.files?.map((f) => `${(f.size / 1024 / 1024).toFixed(2)}MB`).join(", ")
-        );
         return {
           updateAvailable: true,
           version: result.updateInfo.version,
@@ -164,6 +212,14 @@ class UpdateManager {
         return {
           success: false,
           message: "Update downloads are disabled in development mode",
+        };
+      }
+
+      if (FORK_UPDATE_CHECKS_DISABLED) {
+        return {
+          success: false,
+          message:
+            "Update downloads are disabled in this Parakeet CUDA fork to avoid installing official non-CUDA builds",
         };
       }
 
@@ -203,6 +259,14 @@ class UpdateManager {
         };
       }
 
+      if (FORK_UPDATE_CHECKS_DISABLED) {
+        return {
+          success: false,
+          message:
+            "Update installation is disabled in this Parakeet CUDA fork to avoid installing official non-CUDA builds",
+        };
+      }
+
       if (!this.updateDownloaded) {
         return {
           success: false,
@@ -222,8 +286,8 @@ class UpdateManager {
 
       const { app, BrowserWindow } = require("electron");
 
-      // Remove listeners that prevent windows from closing
-      // so quitAndInstall can shut down cleanly
+      // Set windowManager.isQuitting before removing close listeners
+      app.emit("before-quit");
       app.removeAllListeners("window-all-closed");
       BrowserWindow.getAllWindows().forEach((win) => {
         win.removeAllListeners("close");
@@ -256,6 +320,7 @@ class UpdateManager {
         updateAvailable: this.updateAvailable,
         updateDownloaded: this.updateDownloaded,
         isDevelopment: process.env.NODE_ENV === "development",
+        updatesDisabled: FORK_UPDATE_CHECKS_DISABLED,
       };
     } catch (error) {
       console.error("❌ Error getting update status:", error);
@@ -273,6 +338,13 @@ class UpdateManager {
   }
 
   checkForUpdatesOnStartup() {
+    if (FORK_UPDATE_CHECKS_DISABLED) {
+      console.log(
+        "Skipping startup update check; official upstream updates are disabled for this Parakeet CUDA fork"
+      );
+      return;
+    }
+
     if (process.env.NODE_ENV !== "development") {
       setTimeout(() => {
         console.log("🔄 Checking for updates on startup...");
@@ -280,10 +352,22 @@ class UpdateManager {
           console.error("Startup update check failed:", err);
         });
       }, 3000);
+
+      const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
+      this.updateCheckInterval = setInterval(() => {
+        console.log("🔄 Periodic update check...");
+        autoUpdater.checkForUpdates().catch((err) => {
+          console.error("Periodic update check failed:", err);
+        });
+      }, FOUR_HOURS_MS);
     }
   }
 
   cleanup() {
+    if (this.updateCheckInterval) {
+      clearInterval(this.updateCheckInterval);
+      this.updateCheckInterval = null;
+    }
     this.eventListeners.forEach(({ event, handler }) => {
       autoUpdater.removeListener(event, handler);
     });

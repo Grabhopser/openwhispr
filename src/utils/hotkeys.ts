@@ -5,10 +5,14 @@
 
 import { getPlatform, type Platform } from "./platform";
 
-/**
- * Maps Electron accelerator parts to user-friendly labels.
- * Automatically adapts to the current platform (macOS vs Windows/Linux).
- */
+export function isGlobeLikeHotkey(hotkey: string): boolean {
+  return hotkey === "GLOBE" || hotkey === "Fn";
+}
+
+export function isMouseButtonHotkey(hotkey: string): boolean {
+  return /^MouseButton[45]$/i.test(hotkey || "");
+}
+
 function formatModifierPart(part: string, platform: Platform): string {
   switch (part) {
     case "CommandOrControl":
@@ -60,8 +64,12 @@ export function formatHotkeyLabelForPlatform(hotkey: string, platform: Platform)
     return "";
   }
 
-  if (hotkey === "GLOBE") {
+  if (isGlobeLikeHotkey(hotkey)) {
     return "Globe/Fn";
+  }
+
+  if (isMouseButtonHotkey(hotkey)) {
+    return hotkey === "MouseButton4" ? "Mouse Button 4" : "Mouse Button 5";
   }
 
   // Right-side single modifiers
@@ -148,8 +156,7 @@ export function isValidHotkeyFormat(hotkey: string): boolean {
     return false;
   }
 
-  // Special keys are always valid
-  if (hotkey === "GLOBE") {
+  if (isGlobeLikeHotkey(hotkey) || isMouseButtonHotkey(hotkey)) {
     return true;
   }
 

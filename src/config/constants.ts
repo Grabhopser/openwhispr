@@ -37,6 +37,12 @@ export const buildApiUrl = (base: string, path: string): string => {
   return `${normalizedBase}${normalizedPath}`;
 };
 
+export const ensureV1Suffix = (base: string): string => {
+  if (!base) return base;
+  const normalized = normalizeBaseUrl(base) || base;
+  return normalized.endsWith("/v1") ? normalized : `${normalized}/v1`;
+};
+
 const env = (typeof import.meta !== "undefined" && (import.meta as any).env) || {};
 
 const computeBaseUrl = (candidates: Array<string | undefined>, fallback: string): string => {
@@ -88,7 +94,7 @@ export const MODEL_CONSTRAINTS = {
 
 // Token Limits
 export const TOKEN_LIMITS = {
-  MIN_TOKENS: 100,
+  MIN_TOKENS: 512,
   MAX_TOKENS: 2048,
   MIN_TOKENS_ANTHROPIC: 100,
   MAX_TOKENS_ANTHROPIC: 4096,

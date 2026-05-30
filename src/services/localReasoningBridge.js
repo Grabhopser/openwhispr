@@ -40,6 +40,7 @@ class LocalReasoningService {
         contextSize: config.contextSize || 4096,
         threads: config.threads || 4,
         systemPrompt: config.systemPrompt || "",
+        disableThinking: config.disableThinking !== false,
       };
 
       debugLogger.logReasoning("LOCAL_BRIDGE_INFERENCE", {
@@ -48,17 +49,24 @@ class LocalReasoningService {
       });
 
       const result = await modelManager.runInference(modelId, text, inferenceConfig);
+      const stripThinking = config.disableThinking !== false;
+      const cleanResult = stripThinking
+        ? result
+            .replace(/<think>[\s\S]*?<\/think>/g, "")
+            .replace(/<think>[\s\S]*$/, "")
+            .trim()
+        : result.trim();
 
       const processingTime = Date.now() - startTime;
 
       debugLogger.logReasoning("LOCAL_BRIDGE_SUCCESS", {
         modelId,
         processingTimeMs: processingTime,
-        resultLength: result.length,
-        resultPreview: result.substring(0, 100) + (result.length > 100 ? "..." : ""),
+        resultLength: cleanResult.length,
+        resultPreview: cleanResult.substring(0, 100) + (cleanResult.length > 100 ? "..." : ""),
       });
 
-      return result;
+      return cleanResult;
     } catch (error) {
       const processingTime = Date.now() - startTime;
 
@@ -75,7 +83,7 @@ class LocalReasoningService {
     }
   }
 
-  calculateMaxTokens(textLength, minTokens = 100, maxTokens = 2048, multiplier = 2) {
+  calculateMaxTokens(textLength, minTokens = 512, maxTokens = 2048, multiplier = 2) {
     return Math.max(minTokens, Math.min(textLength * multiplier, maxTokens));
   }
 }

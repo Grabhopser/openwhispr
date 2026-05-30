@@ -60,12 +60,77 @@ function hasUinputHeaders() {
   return false;
 }
 
+function hasGio() {
+  try {
+    const result = spawnSync("pkg-config", ["--exists", "gio-2.0"], {
+      stdio: "pipe",
+    });
+    return result.status === 0;
+  } catch {}
+  return false;
+}
+
+function getGioFlags() {
+  try {
+    const cflags = spawnSync("pkg-config", ["--cflags", "gio-2.0"], {
+      stdio: "pipe",
+    });
+    const libs = spawnSync("pkg-config", ["--libs", "gio-2.0"], {
+      stdio: "pipe",
+    });
+    if (cflags.status === 0 && libs.status === 0) {
+      return [
+        ...cflags.stdout.toString().trim().split(/\s+/),
+        ...libs.stdout.toString().trim().split(/\s+/),
+      ].filter(Boolean);
+    }
+  } catch {}
+  return [];
+}
+
+function hasAtspi() {
+  try {
+    const result = spawnSync("pkg-config", ["--exists", "atspi-2"], {
+      stdio: "pipe",
+    });
+    return result.status === 0;
+  } catch {}
+  return false;
+}
+
+function getAtspiFlags() {
+  try {
+    const cflags = spawnSync("pkg-config", ["--cflags", "atspi-2"], {
+      stdio: "pipe",
+    });
+    const libs = spawnSync("pkg-config", ["--libs", "atspi-2"], {
+      stdio: "pipe",
+    });
+    if (cflags.status === 0 && libs.status === 0) {
+      return [
+        ...cflags.stdout.toString().trim().split(/\s+/),
+        ...libs.stdout.toString().trim().split(/\s+/),
+      ].filter(Boolean);
+    }
+  } catch {}
+  return [];
+}
+
 const uinputAvailable = hasUinputHeaders();
+const gioAvailable = hasGio();
+const atspiAvailable = hasAtspi();
 
 function computeBuildHash() {
   const sourceContent = fs.readFileSync(cSource, "utf8");
-  const flags = uinputAvailable ? "uinput" : "nouinput";
-  return crypto.createHash("sha256").update(sourceContent + flags).digest("hex");
+  const flags = [
+    uinputAvailable ? "uinput" : "nouinput",
+    gioAvailable ? "gio" : "nogio",
+    atspiAvailable ? "atspi" : "noatspi",
+  ].join("+");
+  return crypto
+    .createHash("sha256")
+    .update(sourceContent + flags)
+    .digest("hex");
 }
 
 if (!needsBuild && fs.existsSync(outputBinary)) {
@@ -99,20 +164,27 @@ function attemptCompile(command, args) {
   });
 }
 
-const compileArgs = [
-  "-O2",
-  cSource,
-  "-o",
-  outputBinary,
-  "-lX11",
-  "-lXtst",
-];
+const compileArgs = ["-O2", cSource, "-o", outputBinary, "-lX11", "-lXtst"];
 
 if (uinputAvailable) {
   log("uinput headers found, enabling uinput support");
   compileArgs.push("-DHAVE_UINPUT");
 } else {
   log("uinput headers not found, building without uinput support");
+}
+
+if (gioAvailable) {
+  log("gio-2.0 found, enabling portal support");
+  compileArgs.push("-DHAVE_GIO", ...getGioFlags());
+} else {
+  log("gio-2.0 not found, building without portal support");
+}
+
+if (atspiAvailable) {
+  log("atspi-2 found, enabling AT-SPI2 terminal detection");
+  compileArgs.push("-DHAVE_ATSPI", ...getAtspiFlags());
+} else {
+  log("atspi-2 not found, building without AT-SPI2 terminal detection");
 }
 
 let result = attemptCompile("gcc", compileArgs);
@@ -122,7 +194,9 @@ if (result.status !== 0) {
 }
 
 if (result.status !== 0) {
-  console.warn("[linux-fast-paste] Failed to compile Linux fast-paste binary. Install libx11-dev and libxtst-dev to enable native paste. Falling back to system tools.");
+  console.warn(
+    "[linux-fast-paste] Failed to compile Linux fast-paste binary. Install libx11-dev and libxtst-dev to enable native paste. Falling back to system tools."
+  );
   process.exit(0);
 }
 
