@@ -177,6 +177,119 @@ let globeKeyManager = null;
 let windowsKeyManager = null;
 let globeKeyAlertShown = false;
 let authBridgeServer = null;
+let shutdownCleanupPromise = null;
+let shutdownCleanupComplete = false;
+let signalShutdownInProgress = false;
+
+function logShutdownTrace(event, details = {}) {
+  const payload = {
+    pid: process.pid,
+    ...details,
+  };
+
+  try {
+    console.log(`[ShutdownTrace] ${event}`, payload);
+  } catch {}
+
+  try {
+    debugLogger?.info?.(`[ShutdownTrace] ${event}`, payload);
+  } catch {}
+}
+
+async function performShutdownCleanup(source = "unknown") {
+  if (shutdownCleanupComplete) return;
+  if (shutdownCleanupPromise) return shutdownCleanupPromise;
+
+  shutdownCleanupPromise = (async () => {
+    try {
+      logShutdownTrace("cleanup-start", {
+        source,
+        whisperServerRunning: Boolean(whisperManager?.serverManager?.process),
+        parakeetServerRunning: Boolean(parakeetManager?.serverManager?.wsServer?.process),
+      });
+
+      if (authBridgeServer) {
+        try {
+          authBridgeServer.close();
+        } catch {}
+        authBridgeServer = null;
+      }
+
+      if (hotkeyManager) {
+        try {
+          hotkeyManager.unregisterAll();
+        } catch {}
+      } else {
+        try {
+          globalShortcut.unregisterAll();
+        } catch {}
+      }
+
+      try {
+        globeKeyManager?.stop?.();
+      } catch {}
+
+      try {
+        windowsKeyManager?.stop?.();
+      } catch {}
+
+      try {
+        updateManager?.cleanup?.();
+      } catch {}
+
+      const tasks = [];
+
+      if (whisperManager) {
+        tasks.push(Promise.resolve().then(() => whisperManager.stopServer()));
+      }
+      if (parakeetManager) {
+        tasks.push(Promise.resolve().then(() => parakeetManager.stopServer()));
+      }
+
+      try {
+        const modelManager = require("./src/helpers/modelManagerBridge").default;
+        if (modelManager) {
+          tasks.push(Promise.resolve().then(() => modelManager.stopServer()));
+        }
+      } catch {}
+
+      if (tasks.length > 0) {
+        await Promise.allSettled(tasks);
+      }
+
+      logShutdownTrace("cleanup-complete", { source });
+    } finally {
+      shutdownCleanupComplete = true;
+    }
+  })();
+
+  return shutdownCleanupPromise;
+}
+
+function registerSignalShutdownHandlers() {
+  const handleSignal = (signal) => {
+    if (signalShutdownInProgress) return;
+    signalShutdownInProgress = true;
+
+    logShutdownTrace("signal-received", { signal });
+
+    void Promise.race([
+      performShutdownCleanup(`signal:${signal}`),
+      new Promise((resolve) => setTimeout(resolve, 8000)),
+    ]).finally(() => {
+      try {
+        app.exit(0);
+      } catch {
+        process.exit(0);
+      }
+    });
+  };
+
+  process.on("SIGTERM", () => handleSignal("SIGTERM"));
+  process.on("SIGINT", () => handleSignal("SIGINT"));
+}
+
+registerSignalShutdownHandlers();
 
 function parseAuthBridgePort() {
   const raw = (process.env.OPENWHISPR_AUTH_BRIDGE_PORT || "").trim();
@@ -802,6 +915,7 @@ if (gotSingleInstanceLock) {
     });
 
   app.on("window-all-closed", () => {
+    logShutdownTrace("app-window-all-closed", { platform: process.platform });
     // Don't quit on macOS when all windows are closed
     // The app should stay in the dock/menu bar
     if (process.platform !== "darwin") {
@@ -854,35 +968,20 @@ if (gotSingleInstanceLock) {
     }
   });
 
-  app.on("will-quit", () => {
-    if (authBridgeServer) {
-      authBridgeServer.close();
-      authBridgeServer = null;
+  app.on("will-quit", (event) => {
+    logShutdownTrace("app-will-quit", { cleanupComplete: shutdownCleanupComplete });
+    if (shutdownCleanupComplete) {
+      return;
     }
-    if (hotkeyManager) {
-      hotkeyManager.unregisterAll();
-    } else {
-      globalShortcut.unregisterAll();
-    }
-    if (globeKeyManager) {
-      globeKeyManager.stop();
-    }
-    if (windowsKeyManager) {
-      windowsKeyManager.stop();
-    }
-    if (updateManager) {
-      updateManager.cleanup();
-    }
-    // Stop whisper server if running
-    if (whisperManager) {
-      whisperManager.stopServer().catch(() => {});
-    }
-    // Stop parakeet WS server if running
-    if (parakeetManager) {
-      parakeetManager.stopServer().catch(() => {});
-    }
-    // Stop llama-server if running
-    const modelManager = require("./src/helpers/modelManagerBridge").default;
-    modelManager.stopServer().catch(() => {});
+
+    event.preventDefault();
+    void Promise.race([
+      performShutdownCleanup("app:will-quit"),
+      new Promise((resolve) => setTimeout(resolve, 8000)),
+    ]).finally(() => {
+      shutdownCleanupComplete = true;
+      logShutdownTrace("app-will-quit-finalize", {});
+      app.quit();
+    });
   });
 }

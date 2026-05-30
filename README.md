@@ -605,6 +605,8 @@ For local processing, OpenWhispr uses OpenAI's Whisper model via whisper.cpp - a
 
 **From Source**: When running locally (not a packaged build), download the binary with `npm run download:whisper-cpp` so `resources/bin/` has your platform executable.
 
+On Linux/Windows x64, you can force the CUDA-enabled whisper-server binary with `npm run download:whisper-cpp -- --variant cuda --force` (default `--variant auto` prefers CUDA when `nvidia-smi` detects an NVIDIA GPU on the current host).
+
 **Requirements**:
 
 - Sufficient disk space for models (75MB - 3GB depending on model)

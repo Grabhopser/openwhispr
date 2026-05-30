@@ -50,6 +50,16 @@ This puts the binary in `resources/bin/`. For multi-platform packaging from a si
 npm run download:whisper-cpp:all
 ```
 
+### CUDA (NVIDIA) builds
+
+On Linux/Windows x64, the downloader can fetch the CUDA-enabled `whisper-server` build.
+
+```bash
+npm run download:whisper-cpp -- --variant cuda --force
+```
+
+`--variant auto` (default) prefers CUDA for the current host if an NVIDIA GPU is detected via `nvidia-smi`.
+
 ## File Locations
 
 | Data              | macOS                                        | Windows                              | Linux                           |

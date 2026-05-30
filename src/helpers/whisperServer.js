@@ -1,6 +1,7 @@
 const { spawn } = require("child_process");
 const fs = require("fs");
 const net = require("net");
+const os = require("os");
 const path = require("path");
 const http = require("http");
 const debugLogger = require("./debugLogger");
@@ -25,6 +26,14 @@ class WhisperServerManager {
     this.cachedServerBinaryPath = null;
     this.cachedFFmpegPath = null;
     this.canConvert = false;
+    this.lastBackendTrace = {
+      launch: null,
+      cudaLibDirs: [],
+      cudaDetected: false,
+      cudaDeviceLines: [],
+      backendLines: [],
+      lastError: null,
+    };
   }
 
   getFFmpegPath() {
@@ -210,6 +219,7 @@ class WhisperServerManager {
     const ffmpegPath = this.getFFmpegPath();
     const spawnEnv = { ...process.env };
     const pathSep = process.platform === "win32" ? ";" : ":";
+    let resolvedCudaLibDirs = [];
 
     if (process.platform === "win32") {
       const safeTmp = getSafeTempDir();
@@ -220,6 +230,42 @@ class WhisperServerManager {
     // Add the whisper-server directory to PATH so any companion DLLs are found
     const serverBinaryDir = path.dirname(serverBinary);
     spawnEnv.PATH = serverBinaryDir + pathSep + (process.env.PATH || "");
+
+    // Common CUDA runtime library paths (useful on Arch/Cachy and custom CUDA installs).
+    // whisper-server CUDA builds fail at startup if libcudart/libcublas are not on the loader path.
+    if (process.platform === "linux") {
+      const homeDir = os.homedir();
+      const localCuda12Root =
+        process.env.OPENWHISPR_CUDA12_RUNTIME_DIR ||
+        path.join(homeDir, ".cache", "openwhispr", "cuda12-runtime");
+      const cudaLibDirs = [
+        "/opt/cuda/targets/x86_64-linux/lib",
+        "/opt/cuda/lib64",
+        "/usr/local/cuda/targets/x86_64-linux/lib",
+        "/usr/local/cuda/lib64",
+        path.join(localCuda12Root, "nvidia", "cuda_runtime", "lib"),
+        path.join(localCuda12Root, "nvidia", "cublas", "lib"),
+      ].filter((dir) => fs.existsSync(dir));
+      resolvedCudaLibDirs = cudaLibDirs;
+
+      if (cudaLibDirs.length > 0) {
+        const ldLibraryPath = process.env.LD_LIBRARY_PATH || "";
+        const ldParts = ldLibraryPath.split(":").filter(Boolean);
+        const merged = [...cudaLibDirs, ...ldParts].filter(
+          (dir, index, arr) => arr.indexOf(dir) === index
+        );
+        spawnEnv.LD_LIBRARY_PATH = merged.join(":");
+        debugLogger.debug("Configured LD_LIBRARY_PATH for whisper-server", {
+          ldLibraryPath: spawnEnv.LD_LIBRARY_PATH,
+        });
+        debugLogger.info("Whisper CUDA runtime search paths configured", {
+          cudaLibDirs,
+          source: process.env.OPENWHISPR_CUDA12_RUNTIME_DIR
+            ? "OPENWHISPR_CUDA12_RUNTIME_DIR"
+            : "auto",
+        });
+      }
+    }
 
     const args = ["--model", modelPath, "--host", "127.0.0.1", "--port", String(this.port)];
 
@@ -244,6 +290,30 @@ class WhisperServerManager {
       cwd: serverBinaryDir,
     });
 
+    let serverBinarySizeMb = null;
+    try {
+      serverBinarySizeMb = Math.round(fs.statSync(serverBinary).size / (1024 * 1024));
+    } catch {
+      // ignore stat failures
+    }
+
+    this.lastBackendTrace = {
+      launch: {
+        binaryPath: serverBinary,
+        binarySizeMb: serverBinarySizeMb,
+        gpuRequested: !args.includes("--no-gpu"),
+        platform: process.platform,
+        ldLibraryPathConfigured: Boolean(spawnEnv.LD_LIBRARY_PATH),
+      },
+      cudaLibDirs: resolvedCudaLibDirs,
+      cudaDetected: false,
+      cudaDeviceLines: [],
+      backendLines: [],
+      lastError: null,
+    };
+
+    debugLogger.info("Whisper backend launch trace", this.lastBackendTrace.launch);
+
     this.process = spawn(serverBinary, args, {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
@@ -255,12 +325,52 @@ class WhisperServerManager {
     let exitCode = null;
 
     this.process.stdout.on("data", (data) => {
-      debugLogger.debug("whisper-server stdout", { data: data.toString().trim() });
+      const text = data.toString();
+      debugLogger.debug("whisper-server stdout", { data: text.trim() });
+
+      for (const rawLine of text.split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line) continue;
+
+        if (
+          line.includes("ggml_cuda_init:") ||
+          line.includes("CUDA devices:") ||
+          /^Device \d+: /i.test(line)
+        ) {
+          if (line.includes("ggml_cuda_init:") || line.includes("CUDA devices:")) {
+            this.lastBackendTrace.cudaDetected = true;
+          }
+          if (/^Device \d+: /i.test(line) || line.includes("CUDA devices:")) {
+            this.lastBackendTrace.cudaDeviceLines.push(line);
+          }
+          debugLogger.info("Whisper CUDA trace", { line });
+        }
+
+        if (line.startsWith("load_backend:")) {
+          this.lastBackendTrace.backendLines.push(line);
+          debugLogger.info("Whisper backend module", { line });
+        }
+      }
     });
 
     this.process.stderr.on("data", (data) => {
-      stderrBuffer += data.toString();
-      debugLogger.debug("whisper-server stderr", { data: data.toString().trim() });
+      const text = data.toString();
+      stderrBuffer += text;
+      debugLogger.debug("whisper-server stderr", { data: text.trim() });
+
+      for (const rawLine of text.split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line) continue;
+
+        if (
+          /libcudart\.so\.12|libcublas\.so\.12|error while loading shared libraries/i.test(line)
+        ) {
+          this.lastBackendTrace.lastError = line;
+          debugLogger.error("Whisper CUDA startup error", { line });
+        } else if (/cuda/i.test(line)) {
+          debugLogger.warn("Whisper CUDA stderr", { line });
+        }
+      }
     });
 
     this.process.on("error", (error) => {
@@ -282,6 +392,8 @@ class WhisperServerManager {
     debugLogger.info("whisper-server started successfully", {
       port: this.port,
       model: path.basename(modelPath),
+      cudaDetected: this.lastBackendTrace.cudaDetected,
+      cudaDeviceLines: this.lastBackendTrace.cudaDeviceLines,
     });
   }
 
@@ -554,6 +666,7 @@ class WhisperServerManager {
       port: this.port,
       modelPath: this.modelPath,
       modelName: this.modelPath ? path.basename(this.modelPath, ".bin").replace("ggml-", "") : null,
+      backendTrace: this.lastBackendTrace,
     };
   }
 }

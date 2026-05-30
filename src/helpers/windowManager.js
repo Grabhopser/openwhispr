@@ -28,6 +28,11 @@ class WindowManager {
     this._floatingIconAutoHide = false;
 
     app.on("before-quit", () => {
+      try {
+        console.log("[WindowTrace] app before-quit -> WindowManager.isQuitting = true", {
+          pid: process.pid,
+        });
+      } catch {}
       this.isQuitting = true;
     });
   }
@@ -493,13 +498,31 @@ class WindowManager {
     });
 
     this.controlPanelWindow.on("close", (event) => {
+      try {
+        console.log("[WindowTrace] controlPanel close event", {
+          pid: process.pid,
+          isQuitting: this.isQuitting,
+          platform: process.platform,
+        });
+      } catch {}
+
       if (!this.isQuitting) {
         event.preventDefault();
         if (process.platform === "darwin") {
+          try {
+            console.log("[WindowTrace] controlPanel close intercepted -> hide to tray");
+          } catch {}
           this.hideControlPanelToTray();
         } else {
+          try {
+            console.log("[WindowTrace] controlPanel close intercepted -> minimize");
+          } catch {}
           this.controlPanelWindow.minimize();
         }
+      } else {
+        try {
+          console.log("[WindowTrace] controlPanel close allowed (app quitting)");
+        } catch {}
       }
     });
 

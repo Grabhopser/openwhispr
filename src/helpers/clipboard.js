@@ -87,11 +87,25 @@ class ClipboardManager {
     return isWayland;
   }
 
-  _writeClipboardWayland(text, webContents) {
+  _writePrimaryWayland(text) {
+    if (!this.commandExists("wl-copy")) return false;
+    try {
+      const result = spawnSync("wl-copy", ["--primary", "--", text], { timeout: 2000 });
+      return result.status === 0;
+    } catch {}
+    return false;
+  }
+
+  _writeClipboardWayland(text, webContents, options = {}) {
+    const { mirrorPrimary = false } = options;
+
     if (this.commandExists("wl-copy")) {
       try {
         const result = spawnSync("wl-copy", ["--", text], { timeout: 2000 });
         if (result.status === 0) {
+          if (mirrorPrimary) {
+            this._writePrimaryWayland(text);
+          }
           clipboard.writeText(text);
           return;
         }
@@ -102,6 +116,9 @@ class ClipboardManager {
       writeClipboardInRenderer(webContents, text).catch(() => {});
     }
 
+    if (mirrorPrimary) {
+      this._writePrimaryWayland(text);
+    }
     clipboard.writeText(text);
   }
 
@@ -308,7 +325,7 @@ class ClipboardManager {
       );
 
       if (platform === "linux" && this._isWayland()) {
-        this._writeClipboardWayland(text, webContents);
+        this._writeClipboardWayland(text, webContents, { mirrorPrimary: true });
       } else {
         clipboard.writeText(text);
       }
@@ -736,6 +753,7 @@ class ClipboardManager {
     const ydotoolExists = this.commandExists("ydotool");
     const ydotoolDaemonRunning = ydotoolExists && this._isYdotoolDaemonRunning();
     const linuxFastPaste = this.resolveLinuxFastPasteBinary();
+    const forceTerminalPaste = process.env.OPENWHISPR_FORCE_TERMINAL_PASTE === "1";
 
     debugLogger.debug(
       "Linux paste environment",
@@ -751,6 +769,7 @@ class ClipboardManager {
         wtypeExists,
         ydotoolExists,
         ydotoolDaemonRunning,
+        forceTerminalPaste,
         display: process.env.DISPLAY,
         waylandDisplay: process.env.WAYLAND_DISPLAY,
         xdgSessionType: process.env.XDG_SESSION_TYPE,
@@ -823,9 +842,11 @@ class ClipboardManager {
     const xdotoolWindowClass = preDetectWindowClass(targetWindowId);
 
     if (linuxFastPaste) {
-      const earlyIsTerminal = xdotoolWindowClass
-        ? terminalClasses.some((t) => xdotoolWindowClass.includes(t))
-        : false;
+      const earlyIsTerminal = forceTerminalPaste
+        ? true
+        : xdotoolWindowClass
+          ? terminalClasses.some((t) => xdotoolWindowClass.includes(t))
+          : false;
 
       const spawnFastPaste = (args, label) =>
         new Promise((resolve, reject) => {
@@ -971,7 +992,7 @@ class ClipboardManager {
       return false;
     };
 
-    const inTerminal = isTerminal();
+    const inTerminal = forceTerminalPaste || isTerminal();
     const pasteKeys = inTerminal ? "ctrl+shift+v" : "ctrl+v";
 
     const canUseWtype = isWayland && isWlroots;
@@ -1182,34 +1203,36 @@ class ClipboardManager {
         ? `\n\nAttempted tools: ${failedAttempts.map((f) => `${f.tool} (${f.error})`).join(", ")}`
         : "";
 
+    const manualPasteHint = inTerminal
+      ? "Please paste manually with Ctrl+Shift+V or middle-click."
+      : "Please paste manually with Ctrl+V.";
+
     let errorMsg;
     if (isWayland) {
       if (isGnome || isKde) {
         if (!xwaylandAvailable && !ydotoolDaemonRunning) {
           errorMsg =
-            "Clipboard copied, but automatic pasting on Wayland requires xdotool (with XWayland) or ydotool (with ydotoold daemon running). Please paste manually with Ctrl+V.";
+            `Clipboard copied, but automatic pasting on Wayland requires xdotool (with XWayland) or ydotool (with ydotoold daemon running). ${manualPasteHint}`;
         } else if (!xdotoolExists && !ydotoolDaemonRunning) {
           errorMsg =
-            "Clipboard copied, but automatic pasting requires xdotool (recommended) or ydotool. Please install xdotool or paste manually with Ctrl+V.";
+            `Clipboard copied, but automatic pasting requires xdotool (recommended) or ydotool. Please install xdotool or ${manualPasteHint.replace("Please paste manually with ", "paste manually with ")}`;
         } else {
-          errorMsg =
-            "Clipboard copied, but paste simulation failed. Please paste manually with Ctrl+V.";
+          errorMsg = `Clipboard copied, but paste simulation failed. ${manualPasteHint}`;
         }
       } else if (isWlroots) {
         if (!wtypeExists && !xdotoolExists && !ydotoolDaemonRunning) {
           errorMsg =
-            "Clipboard copied, but automatic pasting requires wtype (recommended for your compositor) or xdotool. Please install one or paste manually with Ctrl+V.";
+            `Clipboard copied, but automatic pasting requires wtype (recommended for your compositor) or xdotool. Please install one or ${manualPasteHint.replace("Please paste manually with ", "paste manually with ")}`;
         } else {
-          errorMsg =
-            "Clipboard copied, but paste simulation failed. Please paste manually with Ctrl+V.";
+          errorMsg = `Clipboard copied, but paste simulation failed. ${manualPasteHint}`;
         }
       } else {
         errorMsg =
-          "Clipboard copied, but paste simulation failed on Wayland. Please install xdotool or paste manually with Ctrl+V.";
+          `Clipboard copied, but paste simulation failed on Wayland. Please install xdotool or ${manualPasteHint.replace("Please paste manually with ", "paste manually with ")}`;
       }
     } else {
       errorMsg =
-        "Clipboard copied, but paste simulation failed on X11. Please install xdotool or paste manually with Ctrl+V.";
+        `Clipboard copied, but paste simulation failed on X11. Please install xdotool or ${manualPasteHint.replace("Please paste manually with ", "paste manually with ")}`;
     }
 
     if (ydotoolExists && !ydotoolDaemonRunning) {
