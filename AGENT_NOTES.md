@@ -22,3 +22,12 @@
   - `OPENWHISPR_PARAKEET_PROVIDER=cuda` starts with `--provider=cuda`, reports `providerUsed: cuda`.
   - `OPENWHISPR_PARAKEET_PROVIDER=auto` chooses `providerAttempts: [cuda, cpu]`, starts with `--provider=cuda`, reports `providerUsed: cuda`.
 - Existing packaged AppImage sidecar remains running from `/tmp/.mount_OpenWh...` on port 6006; repo runtime tests used port 6007 and cleaned up after stop.
+
+## 2026-05-30 Packaged Proof
+
+- Built local AppImage successfully with `npm run build:linux:appimage`.
+- Artifact: `dist/OpenWhispr-1.7.2-parakeet-cuda.1-linux-x86_64.AppImage` (~863 MB).
+- `dist/linux-unpacked/resources/bin` contains `sherpa-onnx-ws-linux-x64`, `libonnxruntime.so`, `libonnxruntime_providers_cuda.so`, `libonnxruntime_providers_shared.so`, and `libonnxruntime_providers_tensorrt.so`.
+- Extracted app metadata from `dist/linux-unpacked/resources/app.asar`; package version is `1.7.2-parakeet-cuda.1`.
+- Simulated packaged resource resolution with `process.resourcesPath=dist/linux-unpacked/resources`; `OPENWHISPR_PARAKEET_PROVIDER=auto` selected CUDA and launched packaged `resources/bin/sherpa-onnx-ws-linux-x64` with `--provider=cuda`.
+- Packaged-resource simulation cleaned up the repo-launched sidecar. Existing unrelated AppImage sidecar on port 6006 was left untouched.
