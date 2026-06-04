@@ -42,6 +42,14 @@ const BINARIES = {
     diarizeOutputName: "sherpa-onnx-diarize-linux-x64",
     libPattern: "*.so*",
   },
+  "linux-arm64": {
+    archiveName: `sherpa-onnx-v${SHERPA_ONNX_VERSION}-linux-aarch64-shared-cpu.tar.bz2`,
+    binaryPath: "sherpa-onnx-offline-websocket-server",
+    outputName: "sherpa-onnx-ws-linux-arm64",
+    diarizeBinaryPath: "sherpa-onnx-offline-speaker-diarization",
+    diarizeOutputName: "sherpa-onnx-diarize-linux-arm64",
+    libPattern: "*.so*",
+  },
 };
 
 const BIN_DIR = path.join(__dirname, "..", "resources", "bin");

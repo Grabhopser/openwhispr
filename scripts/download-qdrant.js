@@ -32,6 +32,11 @@ const BINARIES = {
     binaryName: "qdrant",
     outputName: "qdrant-linux-x64",
   },
+  "linux-arm64": {
+    archiveName: "qdrant-aarch64-unknown-linux-musl.tar.gz",
+    binaryName: "qdrant",
+    outputName: "qdrant-linux-arm64",
+  },
   "win32-x64": {
     archiveName: "qdrant-x86_64-pc-windows-msvc.zip",
     binaryName: "qdrant.exe",

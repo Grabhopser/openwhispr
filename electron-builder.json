@@ -113,6 +113,7 @@
         "linux-text-monitor",
         "linux-key-listener*",
         "meeting-aec-helper-*",
+        "whisper-vad/**/*",
         "windows-key-listener*",
         "windows-mic-listener*",
         "windows-text-monitor*",
