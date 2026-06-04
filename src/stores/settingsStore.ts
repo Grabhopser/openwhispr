@@ -54,6 +54,30 @@ function readStringArray(key: string, fallback: string[]): string[] {
   }
 }
 
+const DEFAULT_PARAKEET_MODEL = "parakeet-tdt-0.6b-v3";
+
+function isLinuxArm64Runtime(): boolean {
+  if (!isBrowser) return false;
+  return (
+    window.electronAPI?.getPlatform?.() === "linux" && window.electronAPI?.getArch?.() === "arm64"
+  );
+}
+
+function getDefaultLocalTranscriptionProvider(): LocalTranscriptionProvider {
+  return isLinuxArm64Runtime() ? "nvidia" : "whisper";
+}
+
+function readLocalTranscriptionProvider(
+  key: string,
+  fallback: LocalTranscriptionProvider = getDefaultLocalTranscriptionProvider()
+): LocalTranscriptionProvider {
+  return readString(key, fallback) === "nvidia" ? "nvidia" : "whisper";
+}
+
+function getDefaultParakeetModel(): string {
+  return isLinuxArm64Runtime() ? DEFAULT_PARAKEET_MODEL : "";
+}
+
 // One-time migration for legacy `meetingFollows{Transcription,Reasoning}` flags.
 // When the flag was true (the default), meeting/note recordings inherited the
 // main dictation/intelligence settings. We've removed the toggle; copy the
@@ -689,10 +713,8 @@ export const useSettingsStore = create<SettingsState>()((set, get) => ({
   uiLanguage: normalizeUiLanguage(isBrowser ? localStorage.getItem("uiLanguage") : null),
   useLocalWhisper: readBoolean("useLocalWhisper", false),
   whisperModel: readString("whisperModel", "base"),
-  localTranscriptionProvider: (readString("localTranscriptionProvider", "whisper") === "nvidia"
-    ? "nvidia"
-    : "whisper") as LocalTranscriptionProvider,
-  parakeetModel: readString("parakeetModel", ""),
+  localTranscriptionProvider: readLocalTranscriptionProvider("localTranscriptionProvider"),
+  parakeetModel: readString("parakeetModel", getDefaultParakeetModel()),
   allowOpenAIFallback: readBoolean("allowOpenAIFallback", false),
   allowLocalFallback: readBoolean("allowLocalFallback", false),
   fallbackWhisperModel: readString("fallbackWhisperModel", "base"),
@@ -859,11 +881,10 @@ export const useSettingsStore = create<SettingsState>()((set, get) => ({
   })(),
   meetingUseLocalWhisper: readBoolean("meetingUseLocalWhisper", false),
   meetingWhisperModel: readString("meetingWhisperModel", ""),
-  meetingLocalTranscriptionProvider: (readString("meetingLocalTranscriptionProvider", "whisper") ===
-  "nvidia"
-    ? "nvidia"
-    : "whisper") as LocalTranscriptionProvider,
-  meetingParakeetModel: readString("meetingParakeetModel", ""),
+  meetingLocalTranscriptionProvider: readLocalTranscriptionProvider(
+    "meetingLocalTranscriptionProvider"
+  ),
+  meetingParakeetModel: readString("meetingParakeetModel", getDefaultParakeetModel()),
   meetingCloudTranscriptionProvider: readString("meetingCloudTranscriptionProvider", ""),
   meetingCloudTranscriptionModel: readString("meetingCloudTranscriptionModel", ""),
   meetingCloudTranscriptionBaseUrl: readString("meetingCloudTranscriptionBaseUrl", ""),

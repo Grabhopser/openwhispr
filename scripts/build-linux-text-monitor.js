@@ -113,7 +113,7 @@ function getPkgConfigFlags() {
     });
     if (check.status !== 0) return null;
 
-    const result = spawnSync("pkg-config", ["--cflags", "--libs", "atspi-2"], {
+    const result = spawnSync("pkg-config", ["--cflags", "--libs", "atspi-2", "gobject-2.0"], {
       stdio: ["pipe", "pipe", "pipe"],
       env: process.env,
     });

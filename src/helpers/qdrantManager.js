@@ -1,4 +1,4 @@
-const { spawn } = require("child_process");
+const { execFileSync, spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const http = require("http");
@@ -20,6 +20,17 @@ const HEALTH_CHECK_TIMEOUT_MS = 2000;
 
 const STORAGE_DIR = path.join(os.homedir(), ".cache", "openwhispr", "qdrant-data");
 
+function hasUnsupportedQdrantPageSize() {
+  if (process.platform !== "linux" || process.arch !== "arm64") return false;
+
+  try {
+    const pageSize = Number(execFileSync("getconf", ["PAGESIZE"], { encoding: "utf8" }).trim());
+    return Number.isFinite(pageSize) && pageSize > 4096;
+  } catch {}
+
+  return false;
+}
+
 class QdrantManager {
   constructor() {
     this.process = null;
@@ -28,9 +39,24 @@ class QdrantManager {
     this.startupPromise = null;
     this.healthCheckInterval = null;
     this.cachedBinaryPath = null;
+    this.unsupportedReason = null;
+    this.hasLoggedUnsupported = false;
   }
 
   getBinaryPath() {
+    if (hasUnsupportedQdrantPageSize()) {
+      this.unsupportedReason =
+        "Qdrant linux-arm64 release binary is incompatible with this system page size";
+      if (!this.hasLoggedUnsupported) {
+        this.hasLoggedUnsupported = true;
+        debugLogger.warn("Qdrant disabled", {
+          reason: this.unsupportedReason,
+          fallback: "keyword search",
+        });
+      }
+      return null;
+    }
+
     if (this.cachedBinaryPath) return this.cachedBinaryPath;
 
     const platformArch = `${process.platform}-${process.arch}`;
@@ -236,6 +262,7 @@ class QdrantManager {
       available: this.isAvailable(),
       running: this.ready && this.process !== null,
       port: this.port,
+      unsupportedReason: this.unsupportedReason,
     };
   }
 }

@@ -283,6 +283,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
   snapToMeetingMode: () => ipcRenderer.invoke("snap-to-meeting-mode"),
   restoreFromMeetingMode: () => ipcRenderer.invoke("restore-from-meeting-mode"),
   getPlatform: () => process.platform,
+  getArch: () => process.arch,
   appQuit: () => ipcRenderer.invoke("app-quit"),
 
   // Cleanup function

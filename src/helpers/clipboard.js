@@ -1395,18 +1395,21 @@ class ClipboardManager {
           return false;
         };
 
-        // KDE with XWayland: portal first because clipboard and input are both
-        // on X11. uinput causes clipboard desync (X11 clipboard vs Wayland input).
+        // KDE shows a persistent "Control input devices" notification for the
+        // RemoteDesktop portal path. Prefer uinput when available and keep the
+        // portal fallback for setups where /dev/uinput is not configured.
         // GNOME: uinput first because the portal often times out or shows a
         // confusing permission dialog, causing a 10s+ delay (issue #494).
-        if (isKde && linuxFastPaste && !this.portalDenied) {
-          if (await tryPortalPaste()) return "portal";
-          try {
-            await tryUinputPaste();
-            return "uinput";
-          } catch (uinputError) {
-            debugLogger.warn("uinput paste failed", { error: uinputError?.message }, "clipboard");
+        if (isKde && linuxFastPaste) {
+          if (this._canAccessUinput()) {
+            try {
+              await tryUinputPaste();
+              return "uinput";
+            } catch (uinputError) {
+              debugLogger.warn("uinput paste failed", { error: uinputError?.message }, "clipboard");
+            }
           }
+          if (!this.portalDenied && (await tryPortalPaste())) return "portal";
         } else if (isGnome && linuxFastPaste) {
           try {
             await tryUinputPaste();
