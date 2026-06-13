@@ -34,6 +34,8 @@ owns the React UI, settings, notes, model pickers, and client-side state.
 - Local Parakeet transcription is managed by `src/helpers/parakeet*.js` and uses
   bundled `sherpa-onnx-*` sidecars.
 - Local semantic search uses Qdrant through `src/helpers/qdrantManager.js`.
+- `npm run benchmark:parakeet -- <audio-file>` measures the same Parakeet
+  sidecar path used by the app and reports timing as JSON.
 
 ## Native And Packaging
 
@@ -49,9 +51,9 @@ owns the React UI, settings, notes, model pickers, and client-side state.
 
 The first Asahi Linux target is a CPU-only local transcription build. It relies
 on the existing Linux ARM64 `sherpa-onnx` sidecar for Parakeet and does not
-require bundled `whisper-server` or `llama-server`. Full bundled local Whisper
-and bundled local LLM support are deferred until Linux ARM64 sidecar binaries
-exist and are verified.
+require bundled `whisper-server`, `llama-server`, or Qdrant. Full bundled local
+Whisper, bundled local LLM support, and local semantic vector search are
+deferred until Linux ARM64 sidecar binaries exist and are verified.
 
 Use `docs/asahi-linux.md` for the current build matrix, prerequisites, and
 runtime verification checklist.

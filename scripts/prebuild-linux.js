@@ -1,10 +1,13 @@
 #!/usr/bin/env node
+const fs = require("fs");
+const path = require("path");
 const { spawnSync } = require("child_process");
 
 const isLinuxArm64 = process.platform === "linux" && process.arch === "arm64";
 const includeOptionalLinuxArm64Sidecars =
   process.env.OPENWHISPR_LINUX_ARM64_FULL === "1" ||
   process.env.OPENWHISPR_LINUX_ARM64_FULL === "true";
+const useLinuxArm64MinimalProfile = isLinuxArm64 && !includeOptionalLinuxArm64Sidecars;
 
 function run(script, args = [], options = {}) {
   const result = spawnSync("npm", ["run", script, ...args], {
@@ -24,9 +27,9 @@ function run(script, args = [], options = {}) {
 
 run("compile:native");
 
-if (isLinuxArm64 && !includeOptionalLinuxArm64Sidecars) {
+if (useLinuxArm64MinimalProfile) {
   console.log(
-    "[prebuild:linux] linux-arm64 minimal profile: skipping bundled whisper-server and llama-server"
+    "[prebuild:linux] linux-arm64 minimal profile: skipping bundled whisper-server, llama-server, and qdrant"
   );
   console.log(
     "[prebuild:linux] Set OPENWHISPR_LINUX_ARM64_FULL=1 to attempt optional sidecar downloads"
@@ -36,7 +39,15 @@ if (isLinuxArm64 && !includeOptionalLinuxArm64Sidecars) {
   run("download:llama-server");
 }
 run("download:sherpa-onnx");
-run("download:qdrant");
+if (useLinuxArm64MinimalProfile) {
+  const qdrantArm64Path = path.join(__dirname, "..", "resources", "bin", "qdrant-linux-arm64");
+  if (fs.existsSync(qdrantArm64Path)) {
+    fs.unlinkSync(qdrantArm64Path);
+    console.log("[prebuild:linux] Removed qdrant-linux-arm64 from minimal package resources");
+  }
+} else {
+  run("download:qdrant");
+}
 run("download:meeting-aec-helper", [], {
   optional: isLinuxArm64,
 });

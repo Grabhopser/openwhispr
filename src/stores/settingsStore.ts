@@ -78,6 +78,10 @@ function getDefaultParakeetModel(): string {
   return isLinuxArm64Runtime() ? DEFAULT_PARAKEET_MODEL : "";
 }
 
+function getDefaultTranscriptionMode(): InferenceMode {
+  return isLinuxArm64Runtime() ? "local" : "openwhispr";
+}
+
 // One-time migration for legacy `meetingFollows{Transcription,Reasoning}` flags.
 // When the flag was true (the default), meeting/note recordings inherited the
 // main dictation/intelligence settings. We've removed the toggle; copy the
@@ -711,7 +715,7 @@ function invalidateApiKeyCaches(
 
 export const useSettingsStore = create<SettingsState>()((set, get) => ({
   uiLanguage: normalizeUiLanguage(isBrowser ? localStorage.getItem("uiLanguage") : null),
-  useLocalWhisper: readBoolean("useLocalWhisper", false),
+  useLocalWhisper: readBoolean("useLocalWhisper", isLinuxArm64Runtime()),
   whisperModel: readString("whisperModel", "base"),
   localTranscriptionProvider: readLocalTranscriptionProvider("localTranscriptionProvider"),
   parakeetModel: readString("parakeetModel", getDefaultParakeetModel()),
@@ -851,9 +855,10 @@ export const useSettingsStore = create<SettingsState>()((set, get) => ({
   isSignedIn: readBoolean("isSignedIn", false),
 
   transcriptionMode: (() => {
-    const v = readString("transcriptionMode", "openwhispr");
+    const fallback = getDefaultTranscriptionMode();
+    const v = readString("transcriptionMode", fallback);
     if (v === "openwhispr" || v === "providers" || v === "local" || v === "self-hosted") return v;
-    return "openwhispr" as InferenceMode;
+    return fallback;
   })(),
   remoteTranscriptionType: (() => {
     const v = readString("remoteTranscriptionType", "lan");
@@ -875,11 +880,12 @@ export const useSettingsStore = create<SettingsState>()((set, get) => ({
   cleanupRemoteUrl: readString("cleanupRemoteUrl", ""),
 
   meetingTranscriptionMode: (() => {
-    const v = readString("meetingTranscriptionMode", "openwhispr");
+    const fallback = getDefaultTranscriptionMode();
+    const v = readString("meetingTranscriptionMode", fallback);
     if (v === "openwhispr" || v === "providers" || v === "local" || v === "self-hosted") return v;
-    return "openwhispr" as InferenceMode;
+    return fallback;
   })(),
-  meetingUseLocalWhisper: readBoolean("meetingUseLocalWhisper", false),
+  meetingUseLocalWhisper: readBoolean("meetingUseLocalWhisper", isLinuxArm64Runtime()),
   meetingWhisperModel: readString("meetingWhisperModel", ""),
   meetingLocalTranscriptionProvider: readLocalTranscriptionProvider(
     "meetingLocalTranscriptionProvider"

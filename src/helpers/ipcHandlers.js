@@ -6100,7 +6100,7 @@ class IPCHandlers {
     ipcMain.handle("get-stt-config", async (event) => {
       try {
         const apiUrl = getApiUrl();
-        if (!apiUrl) throw new Error("OpenWhispr API URL not configured");
+        if (!apiUrl) return { success: false, code: "UNCONFIGURED" };
 
         const authHeader = await getAuthHeader(event);
         if (!Object.keys(authHeader).length) throw new Error("Not authenticated");
@@ -6130,7 +6130,7 @@ class IPCHandlers {
     ipcMain.handle("get-note-recording-config", async (event) => {
       try {
         const apiUrl = getApiUrl();
-        if (!apiUrl) throw new Error("OpenWhispr API URL not configured");
+        if (!apiUrl) return { success: true, providers: [] };
 
         const authHeader = await getAuthHeader(event);
         if (!Object.keys(authHeader).length) throw new Error("Not authenticated");

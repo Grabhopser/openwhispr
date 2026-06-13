@@ -382,7 +382,9 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       this.recordingMimeType = this.mediaRecorder.mimeType || "audio/webm";
 
       this.mediaRecorder.ondataavailable = (event) => {
-        this.audioChunks.push(event.data);
+        if (event.data?.size > 0) {
+          this.audioChunks.push(event.data);
+        }
       };
 
       this.mediaRecorder.onstop = async () => {
@@ -422,7 +424,7 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         micStream.getTracks().forEach((track) => track.stop());
       };
 
-      this.mediaRecorder.start();
+      this.mediaRecorder.start(250);
       this.isRecording = true;
       this.onStateChange?.({ isRecording: true, isProcessing: false });
 
@@ -485,7 +487,14 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
 
   stopRecording() {
     if (this.mediaRecorder?.state === "recording") {
-      this.mediaRecorder.stop();
+      try {
+        this.mediaRecorder.requestData();
+      } catch {}
+      setTimeout(() => {
+        if (this.mediaRecorder?.state === "recording") {
+          this.mediaRecorder.stop();
+        }
+      }, 75);
       return true;
     }
     return false;
@@ -528,11 +537,14 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
     const speechGateDecision = getLocalSpeechGateDecision(this._localSpeechGateState);
     this._localSpeechGateState = null;
 
+    const isLocalParakeet =
+      settings.useLocalWhisper && settings.localTranscriptionProvider === "nvidia";
     const shouldUseStrongLocalWhisperGate =
       settings.useLocalWhisper && settings.localTranscriptionProvider === "whisper";
     if (
       speechGateDecision.skip &&
-      (speechGateDecision.reason === "silence" || shouldUseStrongLocalWhisperGate)
+      ((speechGateDecision.reason === "silence" && !isLocalParakeet) ||
+        shouldUseStrongLocalWhisperGate)
     ) {
       logger.info(
         "Speech gate skipped transcription",
@@ -575,9 +587,13 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       if (useLocalWhisper) {
         if (localProvider === "nvidia") {
           activeModel = parakeetModel;
+          metadata.provider = "local-parakeet";
+          metadata.model = activeModel;
           result = await this.processWithLocalParakeet(audioBlob, parakeetModel, metadata);
         } else {
           activeModel = whisperModel;
+          metadata.provider = "local-whisper";
+          metadata.model = activeModel;
           result = await this.processWithLocalWhisper(audioBlob, whisperModel, metadata);
         }
       } else if (isOpenWhisprCloudMode) {
@@ -590,9 +606,13 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
           throw err;
         }
         activeModel = "openwhispr-cloud";
+        metadata.provider = "openwhispr";
+        metadata.model = activeModel;
         result = await this.processWithOpenWhisprCloud(audioBlob, metadata);
       } else {
         activeModel = this.getTranscriptionModel();
+        metadata.provider = "cloud";
+        metadata.model = activeModel;
         result = await this.processWithOpenAIAPI(audioBlob, metadata);
       }
 
@@ -648,7 +668,11 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         "performance"
       );
 
-      if (error.message !== "No audio detected") {
+      if (error.message === "No audio detected") {
+        if (this.lastAudioBlob) {
+          this.saveFailedTranscription(error.message, error.code || "NO_AUDIO_DETECTED", metadata);
+        }
+      } else {
         this.onError?.({
           title: "Transcription Error",
           description: `Transcription failed: ${error.message}`,
@@ -724,12 +748,15 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
           throw new Error("No text transcribed");
         }
       } else if (result.success === false && result.message === "No audio detected") {
-        throw new Error("No audio detected");
+        const noAudioError = new Error("No audio detected");
+        noAudioError.code = result.error || "NO_AUDIO_DETECTED";
+        throw noAudioError;
       } else {
         throw new Error(result.message || result.error || "Local Whisper transcription failed");
       }
     } catch (error) {
       if (error.message === "No audio detected") {
+        error.code ||= "NO_AUDIO_DETECTED";
         throw error;
       }
 
@@ -799,12 +826,15 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
           throw new Error("No text transcribed");
         }
       } else if (result.success === false && result.message === "No audio detected") {
-        throw new Error("No audio detected");
+        const noAudioError = new Error("No audio detected");
+        noAudioError.code = result.error || "NO_AUDIO_DETECTED";
+        throw noAudioError;
       } else {
         throw new Error(result.message || result.error || "Parakeet transcription failed");
       }
     } catch (error) {
       if (error.message === "No audio detected") {
+        error.code ||= "NO_AUDIO_DETECTED";
         throw error;
       }
 
@@ -1998,8 +2028,8 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
           const arrayBuffer = await this.lastAudioBlob.arrayBuffer();
           await window.electronAPI.saveTranscriptionAudio(result.id, arrayBuffer, {
             durationMs,
-            provider: null,
-            model: null,
+            provider: metadata?.provider || null,
+            model: metadata?.model || null,
           });
         } catch (audioErr) {
           logger.warn(

@@ -14,9 +14,16 @@ const ParakeetWsServer = require("./parakeetWsServer");
 
 const SAMPLE_RATE = 16000;
 const BYTES_PER_SAMPLE = 4; // float32
-const MAX_SEGMENT_SECONDS = 15;
+const MAX_SEGMENT_SECONDS = 25;
+const SEGMENT_OVERLAP_SECONDS = 1;
 const MAX_SEGMENT_BYTES = MAX_SEGMENT_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE;
+const SEGMENT_OVERLAP_BYTES = SEGMENT_OVERLAP_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE;
 const SILENCE_RMS_THRESHOLD = 0.001;
+const EMPTY_RETRY_MIN_RMS = 0.0015;
+
+function hasText(result) {
+  return Boolean(result?.text?.trim());
+}
 
 class ParakeetServerManager {
   constructor() {
@@ -112,35 +119,41 @@ class ParakeetServerManager {
       }
 
       if (samples.length <= MAX_SEGMENT_BYTES) {
-        const result = await this.wsServer.transcribe(samples, SAMPLE_RATE);
-        if (!result.text?.trim()) {
-          debugLogger.warn("Parakeet returned empty text for non-silent audio", {
-            durationSeconds,
-            rms,
-            samplesBytes: samples.length,
-          });
-        }
-        return result;
+        return await this._transcribeSegmentWithRetry(samples, SAMPLE_RATE, {
+          modelName,
+          modelDir,
+          durationSeconds,
+          rms,
+          segmentIndex: 0,
+        });
       }
 
       debugLogger.debug("Parakeet segmenting long audio", {
         durationSeconds,
-        segmentCount: Math.ceil(samples.length / MAX_SEGMENT_BYTES),
+        segmentCount: Math.ceil(samples.length / (MAX_SEGMENT_BYTES - SEGMENT_OVERLAP_BYTES)),
+        segmentOverlapSeconds: SEGMENT_OVERLAP_SECONDS,
       });
 
       const texts = [];
       let totalElapsed = 0;
 
-      for (let offset = 0; offset < samples.length; offset += MAX_SEGMENT_BYTES) {
+      const stepBytes = MAX_SEGMENT_BYTES - SEGMENT_OVERLAP_BYTES;
+      for (let offset = 0; offset < samples.length; offset += stepBytes) {
         const end = Math.min(offset + MAX_SEGMENT_BYTES, samples.length);
         const segment = samples.subarray(offset, end);
-        const result = await this.wsServer.transcribe(segment, SAMPLE_RATE);
+        const result = await this._transcribeSegmentWithRetry(segment, SAMPLE_RATE, {
+          modelName,
+          modelDir,
+          durationSeconds: segment.length / BYTES_PER_SAMPLE / SAMPLE_RATE,
+          rms: computeFloat32RMS(segment),
+          segmentIndex: offset / stepBytes,
+        });
         totalElapsed += result.elapsed || 0;
-        if (result.text) {
+        if (hasText(result)) {
           texts.push(result.text);
         } else {
           debugLogger.warn("Parakeet segment returned empty text", {
-            segmentIndex: offset / MAX_SEGMENT_BYTES,
+            segmentIndex: offset / stepBytes,
             segmentDuration: segment.length / BYTES_PER_SAMPLE / SAMPLE_RATE,
           });
         }
@@ -150,6 +163,35 @@ class ParakeetServerManager {
     } finally {
       this._cleanupFiles(filesToCleanup);
     }
+  }
+
+  async _transcribeSegmentWithRetry(samples, sampleRate, context) {
+    const first = await this.wsServer.transcribe(samples, sampleRate);
+    if (hasText(first) || context.rms < EMPTY_RETRY_MIN_RMS) return first;
+
+    debugLogger.warn("Parakeet returned empty text for non-silent audio, restarting sidecar", {
+      modelName: context.modelName,
+      durationSeconds: context.durationSeconds,
+      rms: context.rms,
+      samplesBytes: samples.length,
+      segmentIndex: context.segmentIndex,
+    });
+
+    await this.wsServer.stop();
+    await this.wsServer.start(context.modelName, context.modelDir);
+
+    const retry = await this.wsServer.transcribe(samples, sampleRate);
+    if (!hasText(retry)) {
+      debugLogger.warn("Parakeet retry also returned empty text", {
+        modelName: context.modelName,
+        durationSeconds: context.durationSeconds,
+        rms: context.rms,
+        samplesBytes: samples.length,
+        segmentIndex: context.segmentIndex,
+      });
+    }
+    retry.elapsed = (first.elapsed || 0) + (retry.elapsed || 0);
+    return retry;
   }
 
   _cleanupFiles(filePaths) {

@@ -19,8 +19,10 @@ The first Asahi target is a CPU-only local transcription build:
   still be used when configured.
 
 `npm run prebuild:linux` uses this minimal profile automatically on
-`linux-arm64`. It skips bundled `whisper-server` and `llama-server` downloads
-because the currently pinned release assets do not provide Linux ARM64 binaries.
+`linux-arm64`. It skips bundled `whisper-server`, `llama-server`, and Qdrant
+downloads because the currently pinned Whisper/llama release assets do not
+provide Linux ARM64 binaries and the upstream Qdrant ARM64 binary is not usable
+on Fedora Asahi's 16K-page kernels.
 To explicitly attempt the fuller sidecar set, run:
 
 ```bash
@@ -38,8 +40,8 @@ What works:
 - The renderer builds successfully.
 - `npm run prebuild:linux` completes on `linux-arm64`.
 - ARM64 Linux sherpa-onnx sidecars download and package successfully.
-- ARM64 Linux qdrant downloads and packages, but is disabled at runtime on
-  16K-page Asahi kernels to avoid a known jemalloc startup abort.
+- ARM64 Linux qdrant is skipped by the minimal prebuild profile and disabled at
+  runtime on 16K-page Asahi kernels to avoid a known jemalloc startup abort.
 - Electron Builder can package a native Linux ARM64 tarball with:
 
   ```bash
@@ -101,6 +103,17 @@ After building the tarball on Asahi, verify:
 - Paste works in at least one XWayland or Wayland text field.
 - Notes open and keyword search works. Semantic search is deferred on 16K-page
   Asahi kernels until a compatible Qdrant binary is available.
+
+For a repeatable Parakeet timing check, run the benchmark against a known audio
+file:
+
+```bash
+npm run benchmark:parakeet -- /path/to/audio.wav
+```
+
+The benchmark prints JSON with audio duration, transcription time, real-time
+factor, and transcribed text. WAV input reports duration directly; other formats
+are converted through the same app path but may not report duration.
 
 ## Deferred work
 
