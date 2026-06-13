@@ -86,10 +86,10 @@ class ParakeetServerManager {
     await convertToWav(tempInputPath, tempWavPath, {
       sampleRate: 16000,
       channels: 1,
-      // Chromium/PipeWire mic captures can expose speech on the first channel
-      // and near-silence on the second. FFmpeg's default stereo downmix can
-      // weaken those recordings enough for Parakeet to return empty text.
-      audioFilter: "pan=mono|c0=c0",
+      // Preserve true stereo by downmixing when channels are similar, but pick
+      // the dominant channel for Chromium/PipeWire mic captures where one
+      // channel carries speech and the other is near-silent.
+      monoChannelMode: "auto",
     });
 
     const wavBuffer = fs.readFileSync(tempWavPath);

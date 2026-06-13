@@ -1,9 +1,11 @@
-const { spawn } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const debugLogger = require("./debugLogger");
 
 let cachedFFmpegPath = null;
+const CHANNEL_DOMINANCE_DB = 12;
+const CHANNEL_ANALYSIS_SECONDS = 3;
 
 function getFFmpegPath() {
   if (cachedFFmpegPath) return cachedFFmpegPath;
@@ -107,8 +109,89 @@ function isWavFormat(buffer) {
   );
 }
 
+function parseChannelRmsLevels(stderr) {
+  const levels = [];
+  let currentChannel = null;
+
+  for (const line of stderr.split(/\r?\n/)) {
+    if (line.includes("Overall")) {
+      currentChannel = null;
+      continue;
+    }
+
+    const channelMatch = line.match(/Channel:\s*(\d+)/);
+    if (channelMatch) {
+      currentChannel = Number(channelMatch[1]) - 1;
+      continue;
+    }
+
+    const rmsMatch = line.match(/RMS level dB:\s*(-?inf|-?\d+(?:\.\d+)?)/i);
+    if (rmsMatch && currentChannel !== null) {
+      levels[currentChannel] =
+        rmsMatch[1].toLowerCase() === "-inf" ? Number.NEGATIVE_INFINITY : Number(rmsMatch[1]);
+    }
+  }
+
+  return levels.filter((level) => Number.isFinite(level) || level === Number.NEGATIVE_INFINITY);
+}
+
+function resolveAutoMonoFilter(inputPath, ffmpegPath) {
+  const result = spawnSync(
+    ffmpegPath,
+    [
+      "-hide_banner",
+      "-nostats",
+      "-t",
+      String(CHANNEL_ANALYSIS_SECONDS),
+      "-i",
+      inputPath,
+      "-af",
+      "astats=metadata=1:reset=0",
+      "-f",
+      "null",
+      "-",
+    ],
+    { encoding: "utf8", maxBuffer: 1024 * 1024 }
+  );
+
+  const stderr = result.stderr || "";
+  const rmsLevels = parseChannelRmsLevels(stderr);
+  if (result.status !== 0 || rmsLevels.length < 2) {
+    debugLogger.debug("Auto mono channel analysis skipped", {
+      status: result.status,
+      channels: rmsLevels.length,
+      stderr: stderr.slice(-300).trim(),
+    });
+    return null;
+  }
+
+  const [leftRms, rightRms] = rmsLevels;
+  const diffDb = leftRms - rightRms;
+  let audioFilter = null;
+  let mode = "downmix";
+
+  if (diffDb >= CHANNEL_DOMINANCE_DB) {
+    audioFilter = "pan=mono|c0=c0";
+    mode = "left";
+  } else if (diffDb <= -CHANNEL_DOMINANCE_DB) {
+    audioFilter = "pan=mono|c0=c1";
+    mode = "right";
+  }
+
+  debugLogger.debug("Auto mono channel analysis", {
+    mode,
+    leftRmsDb: leftRms,
+    rightRmsDb: rightRms,
+    diffDb,
+    thresholdDb: CHANNEL_DOMINANCE_DB,
+  });
+
+  return audioFilter;
+}
+
 function convertToWav(inputPath, outputPath, options = {}) {
-  const { sampleRate = 16000, channels = 1, audioFilter = null } = options;
+  const { sampleRate = 16000, channels = 1, audioFilter = null, monoChannelMode = "downmix" } =
+    options;
 
   return new Promise((resolve, reject) => {
     const ffmpegPath = getFFmpegPath();
@@ -117,9 +200,14 @@ function convertToWav(inputPath, outputPath, options = {}) {
       return;
     }
 
+    const resolvedAudioFilter =
+      audioFilter || (channels === 1 && monoChannelMode === "auto"
+        ? resolveAutoMonoFilter(inputPath, ffmpegPath)
+        : null);
+
     const args = ["-i", inputPath];
-    if (audioFilter) {
-      args.push("-af", audioFilter);
+    if (resolvedAudioFilter) {
+      args.push("-af", resolvedAudioFilter);
     }
     args.push(
       "-ar",
@@ -137,7 +225,8 @@ function convertToWav(inputPath, outputPath, options = {}) {
       output: outputPath,
       sampleRate,
       channels,
-      audioFilter,
+      audioFilter: resolvedAudioFilter,
+      monoChannelMode,
     });
 
     const proc = spawn(ffmpegPath, args, {
