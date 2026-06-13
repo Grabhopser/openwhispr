@@ -83,7 +83,14 @@ class ParakeetServerManager {
     const inputStats = fs.statSync(tempInputPath);
     debugLogger.debug("Converting audio to WAV", { inputSize: inputStats.size });
 
-    await convertToWav(tempInputPath, tempWavPath, { sampleRate: 16000, channels: 1 });
+    await convertToWav(tempInputPath, tempWavPath, {
+      sampleRate: 16000,
+      channels: 1,
+      // Chromium/PipeWire mic captures can expose speech on the first channel
+      // and near-silence on the second. FFmpeg's default stereo downmix can
+      // weaken those recordings enough for Parakeet to return empty text.
+      audioFilter: "pan=mono|c0=c0",
+    });
 
     const wavBuffer = fs.readFileSync(tempWavPath);
     return { wavBuffer, filesToCleanup: [tempInputPath, tempWavPath] };
