@@ -1263,7 +1263,6 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
 
         logger.logReasoning("REASONING_SUCCESS", {
           resultLength: result.length,
-          resultPreview: result.substring(0, 100) + (result.length > 100 ? "..." : ""),
           processingTime: new Date().toISOString(),
         });
 
