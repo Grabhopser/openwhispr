@@ -144,6 +144,7 @@ export const useAudioRecording = (toast, options = {}) => {
               ...(isStreaming ? { fromStreaming: true } : {}),
               restoreClipboard: !keepTranscriptionInClipboard,
               allowClipboardFallback: isAccessibilitySkipped(),
+              recordingId: result.recordingId,
             });
             logger.info(
               "Paste timing",
@@ -160,6 +161,7 @@ export const useAudioRecording = (toast, options = {}) => {
 
           audioManagerRef.current.saveTranscription(result.text, result.rawText ?? result.text, {
             clientTranscriptionId: result.clientTranscriptionId,
+            recordingId: result.recordingId,
           });
 
           if (result.source === "openai" && getSettings().useLocalWhisper) {

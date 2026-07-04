@@ -709,6 +709,9 @@ declare global {
       readClipboard: () => Promise<string>;
       writeClipboard: (text: string) => Promise<{ success: boolean }>;
       checkPasteTools: () => Promise<PasteToolsResult>;
+      writeTranscriptionDiagnostic?: (event: string, meta?: Record<string, any>) => Promise<{
+        success: boolean;
+      }>;
 
       // Audio
       onNoAudioDetected: (callback: (event: any, data?: any) => void) => () => void;
@@ -760,7 +763,7 @@ declare global {
       // Parakeet operations (NVIDIA via sherpa-onnx)
       transcribeLocalParakeet: (
         audioBlob: ArrayBuffer,
-        options?: { model?: string }
+        options?: { model?: string; recordingId?: string }
       ) => Promise<ParakeetTranscriptionResult>;
       checkParakeetInstallation: () => Promise<ParakeetCheckResult>;
       downloadParakeetModel: (modelName: string) => Promise<ParakeetModelResult>;

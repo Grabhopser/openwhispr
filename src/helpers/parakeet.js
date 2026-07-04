@@ -5,6 +5,10 @@ const { spawn } = require("child_process");
 const { pipeline } = require("stream/promises");
 const debugLogger = require("./debugLogger");
 const {
+  classifySuspiciousSuccess,
+  classifyTranscriptionFailure,
+} = require("./transcriptionFailureClassifier");
+const {
   downloadFile,
   createDownloadSignal,
   cleanupStaleDownloads,
@@ -180,8 +184,10 @@ class ParakeetManager {
   }
 
   async transcribeLocalParakeet(audioBlob, options = {}) {
+    const recordingId = options.recordingId || null;
     debugLogger.logSTTPipeline("transcribeLocalParakeet - start", {
       options,
+      recordingId,
       audioBlobType: audioBlob?.constructor?.name,
       audioBlobSize: audioBlob?.byteLength || audioBlob?.size || 0,
       serverAvailable: this.serverManager.isAvailable(),
@@ -221,20 +227,51 @@ class ParakeetManager {
     }
 
     debugLogger.logSTTPipeline("transcribeLocalParakeet - processing", {
+      recordingId,
       bufferSize: audioBuffer.length,
       model,
     });
 
     const startTime = Date.now();
-    const result = await this.serverManager.transcribe(audioBuffer, { modelName: model });
+    const result = await this.serverManager.transcribe(audioBuffer, {
+      modelName: model,
+      recordingId,
+    });
     const elapsed = Date.now() - startTime;
+    const textLength = result.text?.trim()?.length || 0;
 
     debugLogger.logSTTPipeline("transcribeLocalParakeet - completed", {
+      recordingId,
       elapsed,
-      textLength: result.text?.length || 0,
+      textLength,
     });
 
-    return this.parseParakeetResult(result);
+    const parsed = this.parseParakeetResult(result);
+    const suspiciousClass = classifySuspiciousSuccess({
+      durationMs: Number.isFinite(result.durationSeconds)
+        ? Math.round(result.durationSeconds * 1000)
+        : null,
+      rms: result.rms,
+      textLength,
+    });
+    if (suspiciousClass) {
+      debugLogger.writeDiagnostic("transcription_suspicious_success", {
+        service: "parakeet",
+        recordingId,
+        stage: "inference",
+        status: "suspicious",
+        errorClass: suspiciousClass,
+        model,
+        durationMs: Number.isFinite(result.durationSeconds)
+          ? Math.round(result.durationSeconds * 1000)
+          : null,
+        rms: result.rms,
+        textLength,
+        elapsedMs: elapsed,
+      });
+    }
+
+    return parsed;
   }
 
   parseParakeetResult(output) {
@@ -245,13 +282,31 @@ class ParakeetManager {
     });
 
     if (!output || !output.text) {
-      return { success: false, message: "No audio detected" };
+      return {
+        success: false,
+        message: "No audio detected",
+        error: "model_empty_non_silent",
+        errorClass: classifyTranscriptionFailure({
+          message: "No audio detected",
+          rms: output?.rms,
+          textLength: 0,
+        }),
+      };
     }
 
     const text = output.text.trim();
 
     if (!text || text.length === 0) {
-      return { success: false, message: "No audio detected" };
+      return {
+        success: false,
+        message: "No audio detected",
+        error: "model_empty_non_silent",
+        errorClass: classifyTranscriptionFailure({
+          message: "No audio detected",
+          rms: output?.rms,
+          textLength: 0,
+        }),
+      };
     }
 
     return { success: true, text };

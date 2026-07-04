@@ -25,6 +25,17 @@ const PREFERRED_RECORDING_MIME_TYPES = [
   "audio/ogg",
 ];
 
+function createRecordingId() {
+  const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 17);
+  const random =
+    globalThis.crypto?.getRandomValues
+      ? Array.from(globalThis.crypto.getRandomValues(new Uint8Array(3)))
+          .map((value) => value.toString(16).padStart(2, "0"))
+          .join("")
+      : Math.random().toString(16).slice(2, 8);
+  return `rec_${stamp}_${random}`;
+}
+
 function resolveReasoningRoute(text, settings, agentName) {
   const cleanupReachable =
     !!settings.useCleanupModel && (!!settings.cleanupModel?.trim() || isCloudCleanupMode());
@@ -167,6 +178,11 @@ class AudioManager {
     this._localSpeechGateState = null;
     this.audioChunkStats = [];
     this.recordingStopRequestedAt = null;
+    this.currentRecordingId = null;
+  }
+
+  writeDiagnostic(event, meta = {}) {
+    window.electronAPI?.writeTranscriptionDiagnostic?.(event, meta).catch(() => {});
   }
 
   getSupportedRecordingMimeType() {
@@ -401,12 +417,27 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       this.audioChunkStats = [];
       this.recordingStopRequestedAt = null;
       this.recordingStartTime = Date.now();
+      this.currentRecordingId = createRecordingId();
       this.recordingMimeType = this.mediaRecorder.mimeType || "audio/webm";
+
+      this.writeDiagnostic("capture_started", {
+        recordingId: this.currentRecordingId,
+        stage: "capture",
+        status: "started",
+        mimeType: this.recordingMimeType,
+        timesliceMs: RECORDER_TIMESLICE_MS,
+      });
 
       this.mediaRecorder.ondataavailable = (event) => {
         const size = event.data?.size || 0;
         if (size <= 0) {
           logger.debug("Recorder emitted empty audio chunk", {}, "audio");
+          this.writeDiagnostic("capture_chunk_empty", {
+            recordingId: this.currentRecordingId,
+            stage: "capture",
+            status: "skipped",
+            errorClass: "capture_empty",
+          });
           return;
         }
 
@@ -414,6 +445,14 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         this.audioChunkStats.push({
           index: this.audioChunkStats.length,
           size,
+          elapsedMs: this.recordingStartTime ? Date.now() - this.recordingStartTime : null,
+        });
+        this.writeDiagnostic("capture_chunk", {
+          recordingId: this.currentRecordingId,
+          stage: "capture",
+          status: "success",
+          chunkIndex: this.audioChunkStats.length - 1,
+          chunkBytes: size,
           elapsedMs: this.recordingStartTime ? Date.now() - this.recordingStartTime : null,
         });
       };
@@ -455,11 +494,32 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
           "audio"
         );
 
+        const recordingId = this.currentRecordingId;
+        this.writeDiagnostic("capture_stopped", {
+          recordingId,
+          stage: "capture",
+          status: audioBlob.size > 0 ? "success" : "failure",
+          errorClass: audioBlob.size > 0 ? null : "capture_empty",
+          blobBytes: audioBlob.size,
+          mimeType: audioBlob.type,
+          chunkCount: this.audioChunks.length,
+          totalChunkBytes: this.audioChunkStats.reduce((sum, chunk) => sum + chunk.size, 0),
+          durationMs: durationSeconds ? Math.round(durationSeconds * 1000) : null,
+          stopFlushDelayMs,
+        });
+
         this.recordingStartTime = null;
         this.recordingStopRequestedAt = null;
         try {
-          await this.processAudio(audioBlob, { durationSeconds });
+          await this.processAudio(audioBlob, {
+            durationSeconds,
+            recordingId,
+            chunkCount: this.audioChunks.length,
+            totalChunkBytes: this.audioChunkStats.reduce((sum, chunk) => sum + chunk.size, 0),
+            stopFlushDelayMs,
+          });
         } finally {
+          this.currentRecordingId = null;
           micStream.getTracks().forEach((track) => track.stop());
         }
       };
@@ -572,6 +632,7 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
 
   async processAudio(audioBlob, metadata = {}) {
     const pipelineStart = performance.now();
+    const recordingId = metadata.recordingId || null;
     const settings = getSettings();
     const speechGateDecision = getLocalSpeechGateDecision(this._localSpeechGateState);
     this._localSpeechGateState = null;
@@ -600,7 +661,14 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       );
       this.isProcessing = false;
       this.onStateChange?.({ isRecording: false, isProcessing: false });
-      this.onTranscriptionComplete?.({ success: true, text: "" });
+      this.writeDiagnostic("transcription_skipped", {
+        recordingId,
+        stage: "analysis",
+        status: "skipped",
+        errorClass: "backend_silence",
+        reason: speechGateDecision.reason,
+      });
+      this.onTranscriptionComplete?.({ success: true, text: "", recordingId });
       return;
     }
 
@@ -673,9 +741,22 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
           : Math.round(performance.now() - pipelineStart),
         provider: result?.source || (useLocalWhisper ? localProvider : "cloud"),
         model: activeModel || null,
+        recordingId,
       };
 
-      this.onTranscriptionComplete?.(result);
+      this.writeDiagnostic("transcription_complete", {
+        recordingId,
+        stage: "inference",
+        status: result?.success ? "success" : "failure",
+        provider: result?.source || (useLocalWhisper ? localProvider : "cloud"),
+        model: activeModel || null,
+        durationMs: this.lastAudioMetadata.durationMs,
+        textLength: result?.text?.length || 0,
+        roundTripDurationMs: Math.round(performance.now() - pipelineStart),
+        errorClass: result?.errorClass || null,
+      });
+
+      this.onTranscriptionComplete?.({ ...result, recordingId });
 
       if (result?.source === "openwhispr") {
         window.dispatchEvent(new Event("usage-changed"));
@@ -711,9 +792,18 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         {
           errorAtMs,
           error: error.message,
+          recordingId,
         },
         "performance"
       );
+      this.writeDiagnostic("transcription_failed", {
+        recordingId,
+        stage: "inference",
+        status: "failure",
+        errorClass: error.errorClass || error.code || "unknown_failure",
+        errorMessage: error.message,
+        elapsedMs: errorAtMs,
+      });
 
       if (error.message !== "No audio detected") {
         this.onError?.({
@@ -834,7 +924,10 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       );
 
       const transcriptionStart = performance.now();
-      const result = await window.electronAPI.transcribeLocalParakeet(arrayBuffer, { model });
+      const result = await window.electronAPI.transcribeLocalParakeet(arrayBuffer, {
+        model,
+        recordingId: metadata.recordingId || null,
+      });
       timings.transcriptionProcessingDurationMs = Math.round(
         performance.now() - transcriptionStart
       );
@@ -866,7 +959,9 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
           throw new Error("No text transcribed");
         }
       } else if (result.success === false && result.message === "No audio detected") {
-        throw new Error("No audio detected");
+        const error = new Error("No audio detected");
+        error.errorClass = result.errorClass || result.error || "model_empty_non_silent";
+        throw error;
       } else {
         throw new Error(result.message || result.error || "Parakeet transcription failed");
       }
@@ -1985,8 +2080,16 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
   }
 
   async safePaste(text, options = {}) {
+    const pasteStart = performance.now();
     try {
       await window.electronAPI.pasteText(text, options);
+      this.writeDiagnostic("paste_complete", {
+        recordingId: options.recordingId || null,
+        stage: "paste",
+        status: "success",
+        textLength: text?.length || 0,
+        elapsedMs: Math.round(performance.now() - pasteStart),
+      });
       return true;
     } catch (error) {
       const message =
@@ -1996,23 +2099,45 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         title: "Paste Error",
         description: `Failed to paste text. Please check accessibility permissions. ${message}`,
       });
+      this.writeDiagnostic("paste_failed", {
+        recordingId: options.recordingId || null,
+        stage: "paste",
+        status: "failure",
+        errorClass: "paste_failed",
+        textLength: text?.length || 0,
+        elapsedMs: Math.round(performance.now() - pasteStart),
+        errorMessage: message,
+      });
       return false;
     }
   }
 
-  async saveTranscription(text, rawText = null, { clientTranscriptionId } = {}) {
+  async saveTranscription(text, rawText = null, { clientTranscriptionId, recordingId } = {}) {
     if (!getSettings().dataRetentionEnabled) {
       logger.debug("Skipping transcription save — data retention disabled", {}, "audio");
       this.lastAudioBlob = null;
       this.lastAudioMetadata = null;
+      this.writeDiagnostic("persistence_skipped", {
+        recordingId: recordingId || null,
+        stage: "persistence",
+        status: "skipped",
+      });
       return true;
     }
 
     try {
       const result = await window.electronAPI.saveTranscription(text, rawText, {
-        clientTranscriptionId,
+        clientTranscriptionId: clientTranscriptionId || recordingId,
       });
       if (result?.id) syncService.debouncedPush("transcription", result.id);
+      this.writeDiagnostic("persistence_complete", {
+        recordingId: recordingId || null,
+        stage: "persistence",
+        status: "success",
+        transcriptionId: result?.id || null,
+        hasAudio: Boolean(result?.id && this.lastAudioBlob),
+        textLength: text?.length || 0,
+      });
 
       // Save audio if we have a captured blob and the transcription was saved successfully
       if (result?.id && this.lastAudioBlob) {
@@ -2033,6 +2158,13 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
 
       return true;
     } catch (error) {
+      this.writeDiagnostic("persistence_failed", {
+        recordingId: recordingId || null,
+        stage: "persistence",
+        status: "failure",
+        errorClass: "unknown_failure",
+        errorMessage: error.message,
+      });
       return false;
     }
   }
@@ -2050,8 +2182,16 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         status: "failed",
         errorMessage,
         errorCode,
+        clientTranscriptionId: metadata.recordingId || undefined,
       });
       if (result?.id) syncService.debouncedPush("transcription", result.id);
+      this.writeDiagnostic("persistence_failed_transcription_saved", {
+        recordingId: metadata.recordingId || null,
+        stage: "persistence",
+        status: "success",
+        transcriptionId: result?.id || null,
+        errorClass: errorCode || "unknown_failure",
+      });
 
       if (result?.id && this.lastAudioBlob) {
         try {

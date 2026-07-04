@@ -1503,6 +1503,14 @@ class IPCHandlers {
       return this.clipboardManager.checkPasteTools();
     });
 
+    ipcMain.handle("write-transcription-diagnostic", async (_event, eventName, meta = {}) => {
+      debugLogger.writeDiagnostic(eventName, {
+        service: "renderer",
+        ...meta,
+      });
+      return { success: true };
+    });
+
     ipcMain.handle("transcribe-local-whisper", async (event, audioBlob, options = {}) => {
       debugLogger.log("transcribe-local-whisper called", {
         audioBlobType: typeof audioBlob,

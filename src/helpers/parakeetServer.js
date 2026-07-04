@@ -145,6 +145,8 @@ class ParakeetServerManager {
           ...meta,
           attempt,
           retryKind,
+          status: textLength > 0 ? "success" : "failure",
+          errorClass: textLength > 0 ? null : "model_empty_non_silent",
           textLength,
           elapsedMs: result.elapsed || 0,
           totalWallMs: Date.now() - startedAt,
@@ -165,6 +167,8 @@ class ParakeetServerManager {
           ...meta,
           attempt,
           retryKind,
+          status: "failure",
+          errorClass: "model_empty_non_silent",
           retryLimit: NON_SILENT_EMPTY_RETRY_LIMIT,
         });
       } catch (error) {
@@ -178,6 +182,10 @@ class ParakeetServerManager {
           ...meta,
           attempt,
           retryKind,
+          status: "failure",
+          errorClass: error.message?.includes("timed out")
+            ? "model_timeout"
+            : "sidecar_unavailable",
           error: error.message,
         });
 
@@ -197,7 +205,7 @@ class ParakeetServerManager {
   }
 
   async transcribe(audioBuffer, options = {}) {
-    const { modelName = "parakeet-tdt-0.6b-v3" } = options;
+    const { modelName = "parakeet-tdt-0.6b-v3", recordingId = null } = options;
 
     const modelDir = path.join(this.getModelsDir(), modelName);
     if (!this.isModelDownloaded(modelName)) {
@@ -225,6 +233,9 @@ class ParakeetServerManager {
         samplesBytes: samples.length,
       });
       this._writeDiagnostic("parakeet_audio_analysis", {
+        recordingId,
+        stage: "analysis",
+        status: "success",
         modelName,
         durationSeconds,
         rms,
@@ -234,24 +245,30 @@ class ParakeetServerManager {
       });
       if (rms < SILENCE_RMS_THRESHOLD) {
         this._writeDiagnostic("parakeet_skip_silence", {
+          recordingId,
+          stage: "analysis",
+          status: "skipped",
+          errorClass: "backend_silence",
           modelName,
           durationSeconds,
           rms,
           samplesBytes: samples.length,
         });
-        return { text: "", elapsed: 0 };
+        return { text: "", elapsed: 0, durationSeconds, rms };
       }
 
       if (samples.length <= MAX_UNSEGMENTED_BYTES) {
         const result = await this._transcribeNonSilentSamples(samples, modelName, modelDir, {
           mode: "single",
+          recordingId,
+          stage: "inference",
           modelName,
           durationSeconds,
           rms,
           samplesBytes: samples.length,
           maxUnsegmentedSeconds: MAX_UNSEGMENTED_SECONDS,
         });
-        return result;
+        return { ...result, durationSeconds, rms };
       }
 
       const segmentStepBytes = Math.max(MAX_SEGMENT_BYTES - SEGMENT_OVERLAP_BYTES, MIN_SEGMENT_BYTES);
@@ -304,6 +321,8 @@ class ParakeetServerManager {
 
         const result = await this._transcribeNonSilentSamples(segment, modelName, modelDir, {
           mode: "segment",
+          recordingId,
+          stage: "inference",
           modelName,
           segmentIndex,
           segmentCount,
@@ -340,7 +359,7 @@ class ParakeetServerManager {
         totalElapsed,
       });
 
-      return { text, elapsed: totalElapsed };
+      return { text, elapsed: totalElapsed, durationSeconds, rms };
     } finally {
       this._cleanupFiles(filesToCleanup);
     }

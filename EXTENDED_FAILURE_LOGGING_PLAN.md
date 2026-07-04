@@ -238,3 +238,9 @@ Reason:
 - They avoid storing audio until the metadata path is proven.
 - They let us measure whether failed-audio retention is worth enabling.
 
+## Implementation Status
+
+- Phase 1 started: renderer generates `recordingId`; capture, transcription, paste, and persistence events write metadata diagnostics.
+- Phase 2 started: Parakeet no-audio paths now return stable failure classes such as `backend_silence`, `model_empty_non_silent`, `model_timeout`, and `sidecar_unavailable`.
+- Phase 5 started: `npm run diagnostics:summary` summarizes the local JSONL diagnostics without transcript text.
+- Phase 4 is intentionally deferred until metadata-only diagnostics prove the value of retaining failed audio.
