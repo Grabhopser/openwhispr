@@ -77,9 +77,33 @@ class ParakeetWsServer {
         timeout: 3000,
       });
       return Boolean(output && output.trim());
-    } catch {
-      return false;
+    } catch (error) {
+      debugLogger.warn("nvidia-smi GPU probe failed; checking fallback GPU probes", {
+        error: error.message,
+      });
     }
+
+    try {
+      const procGpuDir = "/proc/driver/nvidia/gpus";
+      if (fs.existsSync(procGpuDir) && fs.readdirSync(procGpuDir).length > 0) {
+        debugLogger.info("NVIDIA GPU detected via /proc fallback");
+        return true;
+      }
+    } catch {}
+
+    try {
+      const output = execFileSync("lspci", {
+        stdio: ["ignore", "pipe", "ignore"],
+        encoding: "utf8",
+        timeout: 3000,
+      });
+      if (/nvidia/i.test(output)) {
+        debugLogger.info("NVIDIA GPU detected via lspci fallback");
+        return true;
+      }
+    } catch {}
+
+    return false;
   }
 
   buildSpawnEnv(wsBinaryDir) {
@@ -468,7 +492,6 @@ class ParakeetWsServer {
           elapsed,
           code,
           resultLength: result.length,
-          resultPreview: result.slice(0, 200),
         });
 
         try {

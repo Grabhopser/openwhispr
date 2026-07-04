@@ -37,3 +37,12 @@
 - Renderer `MediaRecorder.stop()` previously relied on a final implicit chunk only. Stabilized by calling `requestData()` before stop, using 1s recorder timeslices, filtering empty chunks, and logging chunk sizes/duration/flush delay.
 - Parakeet local mode should not trust the renderer speech gate for hard no-audio decisions. The Parakeet backend already performs RMS silence detection after FFmpeg conversion, so renderer gate now logs but allows Parakeet transcription.
 - Long Parakeet recordings previously used hard 15s cuts with no overlap. Segmentation now uses 0.75s overlap and per-segment RMS/duration/text diagnostics to expose partial-transcript failures.
+
+## 2026-06-30 Parakeet Tail Loss Regression
+
+- Recent saved WebM files decoded to full expected duration, so the regression was not recorder truncation.
+- Diagnostic replay found Parakeet returning empty text for energetic trailing segments after 15s segmentation, e.g. 22.32s audio segmented to 118 chars while full-chunk transcription returned 179 chars.
+- Fix direction: allow Parakeet to transcribe recordings up to 25s as one chunk; keep 15s overlapped segmentation only for longer recordings.
+- On 2026-06-30 `nvidia-smi -L` failed with `Driver/library version mismatch`, causing Parakeet `auto` provider detection to choose CPU despite packaged CUDA libraries being present. Added fallback NVIDIA probes via `/proc/driver/nvidia/gpus` and `lspci` so `auto` can attempt CUDA then fall back to CPU if CUDA launch fails.
+- Added a metadata-only `transcription-diagnostics.jsonl` flight recorder under the OpenWhispr logs directory. It records Parakeet durations/RMS/provider/retry outcomes, not transcript text.
+- 2026-07-04 diagnostics showed short, non-silent CUDA clips can return empty while surrounding clips transcribe normally. Blocking sidecar restart on empty output added 4-5s delay and did not recover text. Empty non-silent output now uses a fast padded-silence retry; sidecar restart remains for transport/timeouts. Removed transcript preview from `parakeet-ws` debug logging.

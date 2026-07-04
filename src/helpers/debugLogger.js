@@ -38,12 +38,47 @@ class DebugLogger {
     this.debugMode = this.isDebugEnabled();
     this.logFile = null;
     this.logStream = null;
+    this.diagnosticLogFile = null;
     this.fileLoggingEnabled = false;
     this.fileLoggingPending = this.debugMode; // Track if we need to initialize file logging later
 
     // IMPORTANT: Do NOT call initializeFileLogging() here!
     // It uses app.getPath() which is unsafe before app.whenReady().
     // File logging will be initialized on first log write or via ensureFileLogging().
+  }
+
+  getDiagnosticLogFile() {
+    if (this.diagnosticLogFile) return this.diagnosticLogFile;
+    if (!app?.isReady?.()) return null;
+
+    try {
+      const logsDir = path.join(app.getPath("userData"), "logs");
+      if (!fs.existsSync(logsDir)) {
+        fs.mkdirSync(logsDir, { recursive: true });
+      }
+      this.diagnosticLogFile = path.join(logsDir, "transcription-diagnostics.jsonl");
+      return this.diagnosticLogFile;
+    } catch {
+      return null;
+    }
+  }
+
+  writeDiagnostic(event, meta = {}) {
+    const logFile = this.getDiagnosticLogFile();
+    if (!logFile) return;
+
+    try {
+      fs.appendFileSync(
+        logFile,
+        `${JSON.stringify({
+          timestamp: new Date().toISOString(),
+          event,
+          ...this.serializeValue(meta),
+        })}\n`
+      );
+    } catch {
+      // Diagnostic logging must never affect transcription.
+    }
   }
 
   initializeFileLogging() {
