@@ -70,7 +70,7 @@ export const useAudioRecording = (toast, options = {}) => {
         return await audioManagerRef.current.stopStreamingRecording();
       }
 
-      const didStop = audioManagerRef.current.stopRecording();
+      const didStop = await audioManagerRef.current.stopRecording();
 
       if (didStop) {
         void playStopCue();

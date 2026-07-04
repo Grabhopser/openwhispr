@@ -57,6 +57,56 @@ function printCounts(title, counts) {
   }
 }
 
+function buildRecordingRollup(rows) {
+  const recordings = new Map();
+  for (const row of rows) {
+    if (!row.recordingId) continue;
+    const recording = recordings.get(row.recordingId) || {
+      id: row.recordingId,
+      first: row.timestamp || "",
+      last: row.timestamp || "",
+      success: false,
+      pasted: false,
+      persisted: false,
+      transcriptionFailed: false,
+      suspicious: false,
+      modelEmptyEvents: 0,
+      tailFailures: 0,
+      textLength: null,
+      durationMs: null,
+      provider: null,
+      failureClasses: new Set(),
+    };
+
+    if (row.timestamp && (!recording.first || row.timestamp < recording.first)) {
+      recording.first = row.timestamp;
+    }
+    if (row.timestamp && (!recording.last || row.timestamp > recording.last)) {
+      recording.last = row.timestamp;
+    }
+    if (row.event === "transcription_complete" && row.status === "success") {
+      recording.success = true;
+      recording.textLength = row.textLength ?? recording.textLength;
+      recording.durationMs = row.durationMs ?? recording.durationMs;
+      recording.provider = row.provider || recording.provider;
+    }
+    if (row.event === "paste_complete") recording.pasted = true;
+    if (row.event === "persistence_complete") recording.persisted = true;
+    if (row.event === "transcription_failed") recording.transcriptionFailed = true;
+    if (row.status === "suspicious") recording.suspicious = true;
+    if (row.errorClass && row.errorClass !== "capture_empty") {
+      recording.failureClasses.add(row.errorClass);
+    }
+    if (row.errorClass === "model_empty_non_silent") {
+      recording.modelEmptyEvents += 1;
+      if (row.tailSegment) recording.tailFailures += 1;
+    }
+    recordings.set(row.recordingId, recording);
+  }
+
+  return [...recordings.values()];
+}
+
 function main() {
   const logFile = process.argv[2] || DEFAULT_LOG;
   const rows = readRows(logFile);
@@ -66,10 +116,18 @@ function main() {
 
   if (!rows.length) return;
 
-  const failures = rows.filter((row) => row.status === "failure" || row.errorClass);
+  const failures = rows.filter(
+    (row) =>
+      (row.status === "failure" || row.errorClass) &&
+      row.event !== "capture_final_empty_chunk" &&
+      !(row.event === "capture_chunk_empty" && row.status === "skipped")
+  );
   const suspicious = rows.filter((row) => row.status === "suspicious");
   const attempts = rows.filter((row) => row.event === "parakeet_attempt_complete");
   const latencies = attempts.map((row) => row.elapsedMs || row.totalWallMs).filter(Number.isFinite);
+  const recordingRollup = buildRecordingRollup(rows);
+  const trueFailures = recordingRollup.filter((row) => !row.success || row.transcriptionFailed);
+  const partialTailRisks = recordingRollup.filter((row) => row.success && row.tailFailures > 0);
 
   printCounts("Events by type", countBy(rows, "event").slice(0, 20));
   printCounts("Status counts", countBy(rows, "status"));
@@ -83,9 +141,22 @@ function main() {
   console.log(`  p95Ms: ${percentile(latencies, 95) ?? "n/a"}`);
   console.log(`  maxMs: ${latencies.length ? Math.max(...latencies) : "n/a"}`);
 
+  console.log("\nRecording rollup");
+  console.log(`  recordings: ${recordingRollup.length}`);
+  console.log(`  successful: ${recordingRollup.filter((row) => row.success).length}`);
+  console.log(`  pasted: ${recordingRollup.filter((row) => row.pasted).length}`);
+  console.log(`  persisted: ${recordingRollup.filter((row) => row.persisted).length}`);
+  console.log(`  trueFailures: ${trueFailures.length}`);
+  console.log(`  partialTailRisks: ${partialTailRisks.length}`);
+
   console.log("\nRecent suspicious/failure events");
   const recent = rows
-    .filter((row) => row.status === "failure" || row.status === "suspicious" || row.errorClass)
+    .filter(
+      (row) =>
+        (row.status === "failure" || row.status === "suspicious" || row.errorClass) &&
+        row.event !== "capture_final_empty_chunk" &&
+        !(row.event === "capture_chunk_empty" && row.status === "skipped")
+    )
     .slice(-20);
   if (!recent.length) {
     console.log("  none");

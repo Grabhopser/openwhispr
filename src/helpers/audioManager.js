@@ -18,6 +18,7 @@ import { syncService } from "../services/SyncService.js";
 const REASONING_CACHE_TTL = 30000; // 30 seconds
 const REALTIME_MODELS = new Set(["gpt-4o-mini-transcribe", "gpt-4o-transcribe"]);
 const RECORDER_TIMESLICE_MS = 1000;
+const STOP_GRACE_DELAY_MS = 250;
 const PREFERRED_RECORDING_MIME_TYPES = [
   "audio/webm;codecs=opus",
   "audio/webm",
@@ -432,11 +433,13 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         const size = event.data?.size || 0;
         if (size <= 0) {
           logger.debug("Recorder emitted empty audio chunk", {}, "audio");
-          this.writeDiagnostic("capture_chunk_empty", {
+          const isFinalFlush = Boolean(this.recordingStopRequestedAt);
+          this.writeDiagnostic(isFinalFlush ? "capture_final_empty_chunk" : "capture_chunk_empty", {
             recordingId: this.currentRecordingId,
             stage: "capture",
             status: "skipped",
-            errorClass: "capture_empty",
+            errorClass: isFinalFlush ? null : "capture_empty",
+            finalFlush: isFinalFlush,
           });
           return;
         }
@@ -585,9 +588,19 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
     }
   }
 
-  stopRecording() {
+  async stopRecording() {
     if (this.mediaRecorder?.state === "recording") {
       this.recordingStopRequestedAt = Date.now();
+      this.writeDiagnostic("capture_stop_requested", {
+        recordingId: this.currentRecordingId,
+        stage: "capture",
+        status: "started",
+        stopGraceDelayMs: STOP_GRACE_DELAY_MS,
+      });
+      await new Promise((resolve) => setTimeout(resolve, STOP_GRACE_DELAY_MS));
+      if (this.mediaRecorder?.state !== "recording") {
+        return true;
+      }
       try {
         this.mediaRecorder.requestData();
       } catch (error) {
@@ -3002,7 +3015,7 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       this.cleanupStreaming();
     }
     if (this.mediaRecorder?.state === "recording") {
-      this.stopRecording();
+      void this.stopRecording();
     }
     if (this.persistentAudioContext && this.persistentAudioContext.state !== "closed") {
       this.persistentAudioContext.close().catch(() => {});

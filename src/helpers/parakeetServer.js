@@ -26,6 +26,9 @@ const SILENCE_RMS_THRESHOLD = 0.001;
 const NON_SILENT_EMPTY_RETRY_LIMIT = 1;
 const EMPTY_RETRY_PADDING_SECONDS = 0.5;
 const EMPTY_RETRY_PADDING_BYTES = EMPTY_RETRY_PADDING_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE;
+const TAIL_CONTEXT_SECONDS = 5;
+const TAIL_CONTEXT_BYTES = TAIL_CONTEXT_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE;
+const SHORT_TAIL_SEGMENT_SECONDS = 8;
 
 function padSamplesWithSilence(samples, paddingBytes = EMPTY_RETRY_PADDING_BYTES) {
   if (!paddingBytes) return samples;
@@ -292,6 +295,7 @@ class ParakeetServerManager {
         const end = Math.min(offset + MAX_SEGMENT_BYTES, samples.length);
         const segment = samples.subarray(offset, end);
         const segmentDurationSeconds = segment.length / BYTES_PER_SAMPLE / SAMPLE_RATE;
+        const isTailSegment = end === samples.length;
         if (segment.length < MIN_SEGMENT_BYTES) {
           debugLogger.debug("Skipping very short Parakeet trailing segment", {
             segmentIndex,
@@ -326,23 +330,95 @@ class ParakeetServerManager {
           modelName,
           segmentIndex,
           segmentCount,
+          tailSegment: isTailSegment,
           offsetSeconds: offset / BYTES_PER_SAMPLE / SAMPLE_RATE,
           segmentDurationSeconds,
           segmentRms,
           samplesBytes: segment.length,
         });
         totalElapsed += result.elapsed || 0;
-        if (result.text?.trim()) {
-          texts.push(result.text.trim());
+        let segmentText = result.text?.trim() || "";
+
+        if (
+          !segmentText &&
+          isTailSegment &&
+          segmentDurationSeconds <= SHORT_TAIL_SEGMENT_SECONDS &&
+          offset > 0
+        ) {
+          const contextStart = Math.max(0, offset - TAIL_CONTEXT_BYTES);
+          const tailContext = samples.subarray(contextStart, end);
+          const tailContextDurationSeconds = tailContext.length / BYTES_PER_SAMPLE / SAMPLE_RATE;
+          const tailContextRms = computeFloat32RMS(tailContext);
+
+          this._writeDiagnostic("parakeet_tail_context_retry", {
+            recordingId,
+            stage: "inference",
+            status: "started",
+            modelName,
+            segmentIndex,
+            segmentCount,
+            tailSegment: true,
+            originalOffsetSeconds: offset / BYTES_PER_SAMPLE / SAMPLE_RATE,
+            contextOffsetSeconds: contextStart / BYTES_PER_SAMPLE / SAMPLE_RATE,
+            segmentDurationSeconds,
+            tailContextDurationSeconds,
+            segmentRms,
+            tailContextRms,
+            contextSeconds: TAIL_CONTEXT_SECONDS,
+          });
+
+          const tailResult = await this._transcribeNonSilentSamples(
+            tailContext,
+            modelName,
+            modelDir,
+            {
+              mode: "tail_context",
+              recordingId,
+              stage: "inference",
+              modelName,
+              segmentIndex,
+              segmentCount,
+              tailSegment: true,
+              originalOffsetSeconds: offset / BYTES_PER_SAMPLE / SAMPLE_RATE,
+              offsetSeconds: contextStart / BYTES_PER_SAMPLE / SAMPLE_RATE,
+              segmentDurationSeconds: tailContextDurationSeconds,
+              segmentRms: tailContextRms,
+              originalSegmentDurationSeconds: segmentDurationSeconds,
+              originalSegmentRms: segmentRms,
+              samplesBytes: tailContext.length,
+              contextSeconds: TAIL_CONTEXT_SECONDS,
+            }
+          );
+          totalElapsed += tailResult.elapsed || 0;
+          segmentText = tailResult.text?.trim() || "";
+
+          this._writeDiagnostic("parakeet_tail_context_complete", {
+            recordingId,
+            stage: "inference",
+            status: segmentText ? "success" : "failure",
+            errorClass: segmentText ? null : "model_empty_non_silent",
+            modelName,
+            segmentIndex,
+            segmentCount,
+            tailSegment: true,
+            textLength: segmentText.length,
+            tailContextDurationSeconds,
+            tailContextRms,
+          });
+        }
+
+        if (segmentText) {
+          texts.push(segmentText);
           debugLogger.debug("Parakeet segment transcription complete", {
             segmentIndex,
-            textLength: result.text.length,
+            textLength: segmentText.length,
             elapsed: result.elapsed || 0,
           });
         } else {
           debugLogger.warn("Parakeet segment returned empty text", {
             segmentIndex,
             segmentCount,
+            tailSegment: isTailSegment,
             segmentDurationSeconds,
             segmentRms,
           });
