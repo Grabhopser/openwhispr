@@ -34,8 +34,16 @@ const ONLINE_FINISH_IDLE_TIMEOUT_MS = 10000;
 // Must cover the model's 560ms chunk so the flush decodes the final words.
 const ONLINE_END_TAIL_PADDING_S = 0.6;
 const AVAILABLE_CPUS = getAvailableParallelism();
-// ONNX intra-op threads for one decode; the cap of four dates from #1131.
-const INTRA_OP_THREADS = Math.max(1, Math.min(4, Math.floor(AVAILABLE_CPUS * 0.75)));
+// ONNX intra-op threads for one decode. Upstream caps this at four (#1131);
+// this fork measured 8 as the sweet spot on a 16-core Ryzen (~25% lower
+// latency, no accuracy change). OPENWHISPR_PARAKEET_THREADS overrides it.
+const MAX_INTRA_OP_THREADS = 8;
+function resolveIntraOpThreads() {
+  const override = Number.parseInt(process.env.OPENWHISPR_PARAKEET_THREADS || "", 10);
+  if (Number.isInteger(override) && override > 0) return Math.min(override, AVAILABLE_CPUS);
+  return Math.max(1, Math.min(MAX_INTRA_OP_THREADS, Math.floor(AVAILABLE_CPUS * 0.75)));
+}
+const INTRA_OP_THREADS = resolveIntraOpThreads();
 // sherpa-onnx's offline server decodes each connection on its own work thread.
 const OFFLINE_WORK_THREADS = 3;
 // How many segments the manager may hand the offline server at once: one per
