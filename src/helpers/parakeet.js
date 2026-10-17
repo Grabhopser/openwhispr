@@ -285,12 +285,14 @@ class ParakeetManager {
       return {
         success: false,
         message: "No audio detected",
-        error: "model_empty_non_silent",
-        errorClass: classifyTranscriptionFailure({
-          message: "No audio detected",
-          rms: output?.rms,
-          textLength: 0,
-        }),
+        error: output?.errorClass || "model_empty_non_silent",
+        errorClass:
+          output?.errorClass ||
+          classifyTranscriptionFailure({
+            message: "No audio detected",
+            rms: output?.rms,
+            textLength: 0,
+          }),
       };
     }
 
@@ -300,12 +302,14 @@ class ParakeetManager {
       return {
         success: false,
         message: "No audio detected",
-        error: "model_empty_non_silent",
-        errorClass: classifyTranscriptionFailure({
-          message: "No audio detected",
-          rms: output?.rms,
-          textLength: 0,
-        }),
+        error: output?.errorClass || "model_empty_non_silent",
+        errorClass:
+          output?.errorClass ||
+          classifyTranscriptionFailure({
+            message: "No audio detected",
+            rms: output?.rms,
+            textLength: 0,
+          }),
       };
     }
 

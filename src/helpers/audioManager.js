@@ -18,7 +18,7 @@ import { syncService } from "../services/SyncService.js";
 const REASONING_CACHE_TTL = 30000; // 30 seconds
 const REALTIME_MODELS = new Set(["gpt-4o-mini-transcribe", "gpt-4o-transcribe"]);
 const RECORDER_TIMESLICE_MS = 1000;
-const STOP_GRACE_DELAY_MS = 250;
+const STOP_GRACE_DELAY_MS = 500;
 const PREFERRED_RECORDING_MIME_TYPES = [
   "audio/webm;codecs=opus",
   "audio/webm",

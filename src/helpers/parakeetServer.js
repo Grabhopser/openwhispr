@@ -22,22 +22,69 @@ const SEGMENT_OVERLAP_SECONDS = 0.75;
 const SEGMENT_OVERLAP_BYTES = SEGMENT_OVERLAP_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE;
 const MIN_SEGMENT_SECONDS = 0.25;
 const MIN_SEGMENT_BYTES = MIN_SEGMENT_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE;
+const MIN_STANDALONE_TAIL_SECONDS = 3;
+const MIN_STANDALONE_TAIL_BYTES = MIN_STANDALONE_TAIL_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE;
 const SILENCE_RMS_THRESHOLD = 0.001;
 const NON_SILENT_EMPTY_RETRY_LIMIT = 1;
 const EMPTY_RETRY_PADDING_SECONDS = 0.5;
 const EMPTY_RETRY_PADDING_BYTES = EMPTY_RETRY_PADDING_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE;
+const FINALIZATION_PADDING_SECONDS = 0.8;
+const FINALIZATION_PADDING_BYTES = FINALIZATION_PADDING_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE;
+const SUSPICIOUS_SHORT_MIN_SECONDS = 2.5;
+const SUSPICIOUS_SHORT_TEXT_LENGTH = 8;
 const TAIL_CONTEXT_SECONDS = 5;
 const TAIL_CONTEXT_BYTES = TAIL_CONTEXT_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE;
 const SHORT_TAIL_SEGMENT_SECONDS = 8;
+const SEGMENT_RECOVERY_CONTEXT_SECONDS = 5;
+const SEGMENT_RECOVERY_CONTEXT_BYTES =
+  SEGMENT_RECOVERY_CONTEXT_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE;
+const DEFAULT_HEALTH_WINDOW_MS = 120000;
+const DEFAULT_HEALTH_FAILURE_THRESHOLD = 3;
+const DEFAULT_HEALTH_RESTART_COOLDOWN_MS = 30000;
+
+function parsePositiveIntEnv(name, fallback) {
+  const parsed = Number.parseInt(process.env[name] || "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseBooleanEnv(name, fallback) {
+  const value = process.env[name];
+  if (value === undefined) return fallback;
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
 
 function padSamplesWithSilence(samples, paddingBytes = EMPTY_RETRY_PADDING_BYTES) {
   if (!paddingBytes) return samples;
   return Buffer.concat([Buffer.alloc(paddingBytes), samples, Buffer.alloc(paddingBytes)]);
 }
 
+function appendSamplesWithSilence(samples, paddingBytes = FINALIZATION_PADDING_BYTES) {
+  if (!paddingBytes) return samples;
+  return Buffer.concat([samples, Buffer.alloc(paddingBytes)]);
+}
+
 class ParakeetServerManager {
   constructor() {
     this.wsServer = new ParakeetWsServer();
+    this.healthEvents = [];
+    this.healthDegraded = false;
+    this.lastAutoRestartAt = 0;
+    this.autoRestartEnabled = parseBooleanEnv("OPENWHISPR_PARAKEET_AUTO_RESTART", true);
+    this.healthWindowMs = parsePositiveIntEnv(
+      "OPENWHISPR_PARAKEET_RESTART_WINDOW_MS",
+      DEFAULT_HEALTH_WINDOW_MS
+    );
+    this.healthFailureThreshold = parsePositiveIntEnv(
+      "OPENWHISPR_PARAKEET_RESTART_FAILURES",
+      DEFAULT_HEALTH_FAILURE_THRESHOLD
+    );
+    this.healthRestartCooldownMs = parsePositiveIntEnv(
+      "OPENWHISPR_PARAKEET_RESTART_COOLDOWN_MS",
+      DEFAULT_HEALTH_RESTART_COOLDOWN_MS
+    );
   }
 
   getBinaryPath() {
@@ -131,32 +178,247 @@ class ParakeetServerManager {
     await this.wsServer.start(modelName, modelDir);
   }
 
+  _pruneHealthEvents(now = Date.now()) {
+    const cutoff = now - this.healthWindowMs;
+    this.healthEvents = this.healthEvents.filter((event) => event.at >= cutoff);
+  }
+
+  _getHealthSnapshot(now = Date.now()) {
+    this._pruneHealthEvents(now);
+
+    const failures = this.healthEvents.filter((event) => event.status === "failure");
+    const successes = this.healthEvents.filter((event) => event.status === "success");
+    const failureClassCounts = {};
+
+    for (const event of failures) {
+      failureClassCounts[event.errorClass] = (failureClassCounts[event.errorClass] || 0) + 1;
+    }
+
+    const dominantFailureClass =
+      Object.entries(failureClassCounts).sort((a, b) => b[1] - a[1])[0]?.[0] || null;
+
+    return {
+      windowMs: this.healthWindowMs,
+      failureCount: failures.length,
+      successCount: successes.length,
+      dominantFailureClass,
+      failureClassCounts,
+      threshold: this.healthFailureThreshold,
+      cooldownMs: this.healthRestartCooldownMs,
+      autoRestartEnabled: this.autoRestartEnabled,
+      degraded: failures.length >= this.healthFailureThreshold,
+      sidecarPid: this.wsServer.process?.pid || null,
+    };
+  }
+
+  _recordHealthSuccess(meta = {}) {
+    const now = Date.now();
+    this.healthEvents.push({
+      at: now,
+      status: "success",
+      mode: meta.mode || null,
+      recordingId: meta.recordingId || null,
+    });
+
+    const snapshot = this._getHealthSnapshot(now);
+    this._writeDiagnostic("parakeet_health_window_update", {
+      ...meta,
+      status: "success",
+      health: snapshot,
+    });
+
+    if (this.healthDegraded && snapshot.failureCount === 0) {
+      this.healthDegraded = false;
+      this._writeDiagnostic("parakeet_health_recovered", {
+        ...meta,
+        status: "success",
+        health: snapshot,
+      });
+    }
+  }
+
+  async _recordHealthFailure(errorClass, modelName, modelDir, meta = {}) {
+    if (
+      ![
+        "model_empty_non_silent",
+        "model_suspicious_short",
+        "model_timeout",
+        "sidecar_unavailable",
+      ].includes(errorClass)
+    ) {
+      return;
+    }
+
+    const now = Date.now();
+    this.healthEvents.push({
+      at: now,
+      status: "failure",
+      errorClass,
+      mode: meta.mode || null,
+      recordingId: meta.recordingId || null,
+    });
+
+    const snapshot = this._getHealthSnapshot(now);
+    this._writeDiagnostic("parakeet_health_window_update", {
+      ...meta,
+      status: "failure",
+      errorClass,
+      health: snapshot,
+    });
+
+    const shouldRestartImmediately = ["model_timeout", "sidecar_unavailable"].includes(errorClass);
+    const shouldRestartForCluster = snapshot.degraded;
+    if (!shouldRestartImmediately && !shouldRestartForCluster) return;
+
+    if (shouldRestartForCluster && !this.healthDegraded) {
+      this.healthDegraded = true;
+      this._writeDiagnostic("parakeet_health_degraded", {
+        ...meta,
+        status: "failure",
+        errorClass,
+        health: snapshot,
+      });
+    }
+
+    if (!this.autoRestartEnabled) return;
+
+    const msSinceRestart = now - this.lastAutoRestartAt;
+    if (this.lastAutoRestartAt && msSinceRestart < this.healthRestartCooldownMs) {
+      this._writeDiagnostic("parakeet_health_restart_skipped_cooldown", {
+        ...meta,
+        status: "skipped",
+        errorClass,
+        msSinceRestart,
+        health: snapshot,
+      });
+      return;
+    }
+
+    const restartReason = shouldRestartImmediately
+      ? "sidecar_transport_failure"
+      : "clustered_non_silent_model_failures";
+
+    this.lastAutoRestartAt = now;
+    this._writeDiagnostic("parakeet_health_restart_requested", {
+      ...meta,
+      status: "started",
+      errorClass,
+      reason: restartReason,
+      health: snapshot,
+    });
+
+    try {
+      this._writeDiagnostic("parakeet_health_restart_started", {
+        ...meta,
+        status: "started",
+        errorClass,
+        reason: restartReason,
+        oldSidecarPid: this.wsServer.process?.pid || null,
+      });
+      await this._restartServer(modelName, modelDir, restartReason, {
+        ...meta,
+        errorClass,
+        failureCount: snapshot.failureCount,
+        windowMs: snapshot.windowMs,
+      });
+      this.healthEvents = [];
+      this.healthDegraded = false;
+      this._writeDiagnostic("parakeet_health_restart_complete", {
+        ...meta,
+        status: "success",
+        errorClass,
+        reason: restartReason,
+        newSidecarPid: this.wsServer.process?.pid || null,
+      });
+    } catch (error) {
+      this._writeDiagnostic("parakeet_health_restart_failed", {
+        ...meta,
+        status: "failure",
+        errorClass: "sidecar_unavailable",
+        reason: restartReason,
+        error: error.message,
+      });
+      throw error;
+    }
+  }
+
   async _transcribeNonSilentSamples(samples, modelName, modelDir, meta = {}) {
     let lastEmptyResult = null;
+    let lastSuspiciousShortResult = null;
     const startedAt = Date.now();
+    const originalDurationSeconds = samples.length / BYTES_PER_SAMPLE / SAMPLE_RATE;
 
     for (let attempt = 0; attempt <= NON_SILENT_EMPTY_RETRY_LIMIT; attempt += 1) {
-      const attemptSamples = attempt === 0 ? samples : padSamplesWithSilence(samples);
-      const retryKind = attempt === 0 ? "initial" : "padded_silence";
+      const attemptSamples =
+        attempt === 0 ? appendSamplesWithSilence(samples) : padSamplesWithSilence(samples);
+      const retryKind = attempt === 0 ? "initial_trailing_silence" : "padded_silence";
 
       try {
         await this._ensureServerReady(modelName, modelDir);
         const result = await this.wsServer.transcribe(attemptSamples, SAMPLE_RATE);
         const textLength = result.text?.trim()?.length || 0;
+        const isSuspiciousShort =
+          textLength > 0 &&
+          originalDurationSeconds >= SUSPICIOUS_SHORT_MIN_SECONDS &&
+          textLength < SUSPICIOUS_SHORT_TEXT_LENGTH;
 
         this._writeDiagnostic("parakeet_attempt_complete", {
           ...meta,
           attempt,
           retryKind,
-          status: textLength > 0 ? "success" : "failure",
-          errorClass: textLength > 0 ? null : "model_empty_non_silent",
+          status: textLength > 0 && !isSuspiciousShort ? "success" : "failure",
+          errorClass:
+            textLength === 0
+              ? "model_empty_non_silent"
+              : isSuspiciousShort
+                ? "model_suspicious_short"
+                : null,
           textLength,
           elapsedMs: result.elapsed || 0,
           totalWallMs: Date.now() - startedAt,
+          finalizationPaddingSeconds: attempt === 0 ? FINALIZATION_PADDING_SECONDS : 0,
+          suspiciousShortMinSeconds: SUSPICIOUS_SHORT_MIN_SECONDS,
+          suspiciousShortTextLength: SUSPICIOUS_SHORT_TEXT_LENGTH,
         });
 
-        if (textLength > 0) {
+        if (textLength > 0 && !isSuspiciousShort) {
+          this._recordHealthSuccess({
+            ...meta,
+            attempt,
+            retryKind,
+            textLength,
+          });
           return result;
+        }
+
+        if (isSuspiciousShort) {
+          lastSuspiciousShortResult = result;
+          debugLogger.warn("Parakeet returned suspiciously short text for non-silent audio", {
+            ...meta,
+            attempt,
+            retryKind,
+            durationSeconds: originalDurationSeconds,
+            textLength,
+          });
+          this._writeDiagnostic("parakeet_suspicious_short", {
+            ...meta,
+            attempt,
+            retryKind,
+            status: "failure",
+            errorClass: "model_suspicious_short",
+            durationSeconds: originalDurationSeconds,
+            textLength,
+            suspiciousShortMinSeconds: SUSPICIOUS_SHORT_MIN_SECONDS,
+            suspiciousShortTextLength: SUSPICIOUS_SHORT_TEXT_LENGTH,
+          });
+          await this._recordHealthFailure("model_suspicious_short", modelName, modelDir, {
+            ...meta,
+            attempt,
+            retryKind,
+            durationSeconds: originalDurationSeconds,
+            textLength,
+          });
+          continue;
         }
 
         lastEmptyResult = result;
@@ -174,7 +436,16 @@ class ParakeetServerManager {
           errorClass: "model_empty_non_silent",
           retryLimit: NON_SILENT_EMPTY_RETRY_LIMIT,
         });
+        await this._recordHealthFailure("model_empty_non_silent", modelName, modelDir, {
+          ...meta,
+          attempt,
+          retryKind,
+          durationSeconds: originalDurationSeconds,
+        });
       } catch (error) {
+        const errorClass = error.message?.includes("timed out")
+          ? "model_timeout"
+          : "sidecar_unavailable";
         debugLogger.warn("Parakeet transcription attempt failed", {
           ...meta,
           attempt,
@@ -186,22 +457,28 @@ class ParakeetServerManager {
           attempt,
           retryKind,
           status: "failure",
-          errorClass: error.message?.includes("timed out")
-            ? "model_timeout"
-            : "sidecar_unavailable",
+          errorClass,
+          error: error.message,
+        });
+        await this._recordHealthFailure(errorClass, modelName, modelDir, {
+          ...meta,
+          attempt,
+          retryKind,
           error: error.message,
         });
 
         if (attempt >= NON_SILENT_EMPTY_RETRY_LIMIT) {
           throw error;
         }
-
-        await this._restartServer(modelName, modelDir, "transcription_attempt_failed", {
-          ...meta,
-          attempt,
-          error: error.message,
-        });
       }
+    }
+
+    if (lastSuspiciousShortResult) {
+      return {
+        ...lastSuspiciousShortResult,
+        text: "",
+        errorClass: "model_suspicious_short",
+      };
     }
 
     return lastEmptyResult || { text: "", elapsed: Date.now() - startedAt };
@@ -275,9 +552,35 @@ class ParakeetServerManager {
       }
 
       const segmentStepBytes = Math.max(MAX_SEGMENT_BYTES - SEGMENT_OVERLAP_BYTES, MIN_SEGMENT_BYTES);
-      const segmentCount = Math.ceil(
-        Math.max(samples.length - SEGMENT_OVERLAP_BYTES, 0) / segmentStepBytes
-      );
+      const segments = [];
+      for (let offset = 0; offset < samples.length; offset += segmentStepBytes) {
+        const end = Math.min(offset + MAX_SEGMENT_BYTES, samples.length);
+        if (end - offset < MIN_SEGMENT_BYTES) break;
+        segments.push({ offset, end });
+      }
+
+      const lastSegment = segments[segments.length - 1];
+      const previousSegment = segments[segments.length - 2];
+      if (
+        previousSegment &&
+        lastSegment?.end === samples.length &&
+        lastSegment.end - lastSegment.offset < MIN_STANDALONE_TAIL_BYTES
+      ) {
+        previousSegment.end = samples.length;
+        segments.pop();
+        this._writeDiagnostic("parakeet_short_tail_merged", {
+          recordingId,
+          stage: "segmentation",
+          status: "success",
+          modelName,
+          tailDurationSeconds: (lastSegment.end - lastSegment.offset) / BYTES_PER_SAMPLE / SAMPLE_RATE,
+          mergedSegmentDurationSeconds:
+            (previousSegment.end - previousSegment.offset) / BYTES_PER_SAMPLE / SAMPLE_RATE,
+          minStandaloneTailSeconds: MIN_STANDALONE_TAIL_SECONDS,
+        });
+      }
+
+      const segmentCount = segments.length;
 
       debugLogger.debug("Parakeet segmenting long audio", {
         durationSeconds,
@@ -285,14 +588,14 @@ class ParakeetServerManager {
         maxUnsegmentedSeconds: MAX_UNSEGMENTED_SECONDS,
         maxSegmentSeconds: MAX_SEGMENT_SECONDS,
         overlapSeconds: SEGMENT_OVERLAP_SECONDS,
+        minStandaloneTailSeconds: MIN_STANDALONE_TAIL_SECONDS,
       });
 
       const texts = [];
       let totalElapsed = 0;
       let segmentIndex = 0;
 
-      for (let offset = 0; offset < samples.length; offset += segmentStepBytes) {
-        const end = Math.min(offset + MAX_SEGMENT_BYTES, samples.length);
+      for (const { offset, end } of segments) {
         const segment = samples.subarray(offset, end);
         const segmentDurationSeconds = segment.length / BYTES_PER_SAMPLE / SAMPLE_RATE;
         const isTailSegment = end === samples.length;
@@ -339,60 +642,66 @@ class ParakeetServerManager {
         totalElapsed += result.elapsed || 0;
         let segmentText = result.text?.trim() || "";
 
-        if (
-          !segmentText &&
-          isTailSegment &&
-          segmentDurationSeconds <= SHORT_TAIL_SEGMENT_SECONDS &&
-          offset > 0
-        ) {
-          const contextStart = Math.max(0, offset - TAIL_CONTEXT_BYTES);
-          const tailContext = samples.subarray(contextStart, end);
-          const tailContextDurationSeconds = tailContext.length / BYTES_PER_SAMPLE / SAMPLE_RATE;
-          const tailContextRms = computeFloat32RMS(tailContext);
+        if (!segmentText) {
+          const contextBeforeBytes =
+            isTailSegment && segmentDurationSeconds <= SHORT_TAIL_SEGMENT_SECONDS
+              ? TAIL_CONTEXT_BYTES
+              : SEGMENT_RECOVERY_CONTEXT_BYTES;
+          const contextStart = Math.max(0, offset - contextBeforeBytes);
+          const contextEnd = Math.min(samples.length, end + SEGMENT_RECOVERY_CONTEXT_BYTES);
+          const recoveryContext = samples.subarray(contextStart, contextEnd);
+          const recoveryContextDurationSeconds =
+            recoveryContext.length / BYTES_PER_SAMPLE / SAMPLE_RATE;
+          const recoveryContextRms = computeFloat32RMS(recoveryContext);
+          const recoveryEventPrefix =
+            isTailSegment && segmentDurationSeconds <= SHORT_TAIL_SEGMENT_SECONDS
+              ? "parakeet_tail_context"
+              : "parakeet_segment_context";
 
-          this._writeDiagnostic("parakeet_tail_context_retry", {
+          this._writeDiagnostic(`${recoveryEventPrefix}_retry`, {
             recordingId,
             stage: "inference",
             status: "started",
             modelName,
             segmentIndex,
             segmentCount,
-            tailSegment: true,
+            tailSegment: isTailSegment,
             originalOffsetSeconds: offset / BYTES_PER_SAMPLE / SAMPLE_RATE,
             contextOffsetSeconds: contextStart / BYTES_PER_SAMPLE / SAMPLE_RATE,
+            contextEndSeconds: contextEnd / BYTES_PER_SAMPLE / SAMPLE_RATE,
             segmentDurationSeconds,
-            tailContextDurationSeconds,
+            recoveryContextDurationSeconds,
             segmentRms,
-            tailContextRms,
-            contextSeconds: TAIL_CONTEXT_SECONDS,
+            recoveryContextRms,
+            contextSeconds: (contextEnd - contextStart) / BYTES_PER_SAMPLE / SAMPLE_RATE,
           });
 
-          const tailResult = await this._transcribeNonSilentSamples(
-            tailContext,
+          const recoveryResult = await this._transcribeNonSilentSamples(
+            recoveryContext,
             modelName,
             modelDir,
             {
-              mode: "tail_context",
+              mode: isTailSegment ? "tail_context" : "segment_context",
               recordingId,
               stage: "inference",
               modelName,
               segmentIndex,
               segmentCount,
-              tailSegment: true,
+              tailSegment: isTailSegment,
               originalOffsetSeconds: offset / BYTES_PER_SAMPLE / SAMPLE_RATE,
               offsetSeconds: contextStart / BYTES_PER_SAMPLE / SAMPLE_RATE,
-              segmentDurationSeconds: tailContextDurationSeconds,
-              segmentRms: tailContextRms,
+              segmentDurationSeconds: recoveryContextDurationSeconds,
+              segmentRms: recoveryContextRms,
               originalSegmentDurationSeconds: segmentDurationSeconds,
               originalSegmentRms: segmentRms,
-              samplesBytes: tailContext.length,
-              contextSeconds: TAIL_CONTEXT_SECONDS,
+              samplesBytes: recoveryContext.length,
+              contextSeconds: (contextEnd - contextStart) / BYTES_PER_SAMPLE / SAMPLE_RATE,
             }
           );
-          totalElapsed += tailResult.elapsed || 0;
-          segmentText = tailResult.text?.trim() || "";
+          totalElapsed += recoveryResult.elapsed || 0;
+          segmentText = recoveryResult.text?.trim() || "";
 
-          this._writeDiagnostic("parakeet_tail_context_complete", {
+          this._writeDiagnostic(`${recoveryEventPrefix}_complete`, {
             recordingId,
             stage: "inference",
             status: segmentText ? "success" : "failure",
@@ -400,10 +709,10 @@ class ParakeetServerManager {
             modelName,
             segmentIndex,
             segmentCount,
-            tailSegment: true,
+            tailSegment: isTailSegment,
             textLength: segmentText.length,
-            tailContextDurationSeconds,
-            tailContextRms,
+            recoveryContextDurationSeconds,
+            recoveryContextRms,
           });
         }
 

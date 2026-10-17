@@ -48,3 +48,34 @@
 - 2026-07-04 diagnostics showed short, non-silent CUDA clips can return empty while surrounding clips transcribe normally. Blocking sidecar restart on empty output added 4-5s delay and did not recover text. Empty non-silent output now uses a fast padded-silence retry; sidecar restart remains for transport/timeouts. Removed transcript preview from `parakeet-ws` debug logging.
 - Extended failure logging phase 1/2/5 adds renderer-generated `recordingId`, capture/paste/persistence diagnostic events, Parakeet failure classes, and `npm run diagnostics:summary`. Keep transcript text out of diagnostics.
 - Tail-loss hardening: stop now waits briefly before final MediaRecorder flush, final empty stop chunks are classified as benign `capture_final_empty_chunk`, and short non-silent tail segments get a context retry before being treated as empty.
+- 2026-07-05 tail-loss hardening: Parakeet segmentation now merges final standalone tails shorter than 3s into the previous segment and logs `parakeet_short_tail_merged`, avoiding fragile isolated tail decodes for last words.
+- 2026-07-05 tail-loss follow-up: Recent post-deploy losses were single-shot Parakeet decodes (<25s), not segmented tails. Increased recorder stop grace to 500ms and added 0.8s trailing-silence finalization padding to initial Parakeet decode attempts.
+- 2026-07-05 suspicious-short hardening: Parakeet now retries non-silent outputs under 8 chars for recordings >=2.5s; persistent suspicious-short outputs fail with `model_suspicious_short` instead of being pasted.
+- 2026-08-02 diagnostics: Degradation is Parakeet inference instability, not capture loss. Recent failed/hole cases have normal WebM blobs and strong RMS but CUDA Parakeet returns empty on non-silent single/segment windows. Added wider segment-context recovery for any failed non-silent segment, not only short tails, with `parakeet_segment_context_*` diagnostics.
+
+## 2026-08-02 OpenWhispr CUDA instability package provenance
+- Live Parakeet CUDA sidecar loads mixed dependencies: packaged AppImage ONNXRuntime, cached CUDA 12 cublas/cufft/cudart, system `/usr/lib/libcuda.so.580.173.02`, system `/usr/lib/libcudnn.so.9.25.0`, system `/usr/lib/libcudnn_graph.so.9.25.0`, and `/opt/cuda/targets/x86_64-linux/lib/libcurand.so.10.4.3.29`.
+- This means system NVIDIA driver, cuDNN, and selected CUDA libraries can influence OpenWhispr behavior despite the AppImage bundle.
+
+## 2026-08-02 ASR model options note
+- AMD Ryzen AI ASR material currently centers on Whisper models exported/optimized for Ryzen AI NPU, not a distinct AMD-native ASR model that is clearly better than Parakeet.
+- OpenWhispr host currently uses NVIDIA TITAN X Pascal; AMD NPU paths are only relevant on Ryzen AI hardware and likely Windows-first in AMD docs.
+
+## 2026-08-02 Parakeet CUDA hardening deployed
+- Added runtime-library provenance diagnostics for the Parakeet CUDA sidecar via `/proc/<pid>/maps`; logs `parakeet_runtime_libraries` with provider, PID, library paths, source counts, and NVIDIA driver version.
+- Added Parakeet health tracking and auto-restart controls: `OPENWHISPR_PARAKEET_AUTO_RESTART`, `OPENWHISPR_PARAKEET_RESTART_FAILURES`, `OPENWHISPR_PARAKEET_RESTART_WINDOW_MS`, and `OPENWHISPR_PARAKEET_RESTART_COOLDOWN_MS`.
+- Extended `npm run diagnostics:summary` with daily/hourly buckets, attempt modes, restart reasons, current AppImage/process state, package versions, and latest runtime library provenance.
+- Rebuilt and restarted `/home/ga73dir/tools/openwhispr/dist/OpenWhispr.AppImage`; live sidecar verified on CUDA with PID 140797 and cuDNN 9.25.0 loaded from `/usr/lib`.
+
+## 2026-08-08 Parakeet post-hardening trial analysis
+- Five-day diagnostics show hardening did not materially fix the regression. Since the Aug 2 deploy there were 420 recordings, with Aug 8 at 82 recordings, 6 hard failures (~7.3%), 6 suspicious successes, and 11 recordings containing `model_empty_non_silent` events.
+- Hidden partial-risk signal increased: successful recordings with internal Parakeet attempt failures rose from 1.4% on Aug 3 to 11.5% on Aug 7 and 10.3% on Aug 8.
+- Attempt failures remain CUDA `model_empty_non_silent`; current runtime provenance is stable and always loads system `/usr/lib/libcudnn.so.9.25.0` plus NVIDIA driver `580.173.02`.
+- Segment attempts are worse than single attempts post-deploy: single fail rate ~6.6%, segment fail rate ~13.8%, padded retry fail rate ~32.3%. This supports the user-observed missing middle/tail portions.
+- No relevant CUDA/cuDNN/NVIDIA/kernel/GStreamer package updates were found after Aug 2; likely persistent July 31 cuDNN/runtime regression rather than a new update.
+
+## 2026-08-08 upstream upgrade assessment
+- Fetched upstream; latest release tag is `v1.8.1`, upstream/main at `1866ecf6`. Local fork remains based on `v1.7.2` plus Parakeet CUDA/hardening commits.
+- Full upgrade is large: `v1.7.2..v1.8.1` changes 607 files; local HEAD to upstream/main changes 711 files.
+- Upstream has directly relevant Parakeet fixes: `7a3bc345` retries/surfaces silently dropped audible segments, and newer online Parakeet runtime files (`parakeetModelInfo.js`, `parakeetWsResult.js`, online ws server path).
+- Recommendation: do not production-upgrade during cuDNN rollback trial. First finish rollback trial, commit current state, then cherry-pick dropped-segment warning or test full v1.8.1 on separate branch.

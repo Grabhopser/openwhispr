@@ -3,6 +3,7 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { execFileSync } = require("child_process");
 
 const DEFAULT_LOG = path.join(
   os.homedir(),
@@ -34,8 +35,9 @@ function readRows(filePath) {
 function countBy(rows, key) {
   const counts = new Map();
   for (const row of rows) {
-    const value = row[key] ?? "unknown";
-    counts.set(value, (counts.get(value) || 0) + 1);
+    const value = typeof key === "function" ? key(row) : row[key];
+    const normalized = value ?? "unknown";
+    counts.set(normalized, (counts.get(normalized) || 0) + 1);
   }
   return [...counts.entries()].sort((a, b) => b[1] - a[1]);
 }
@@ -54,6 +56,137 @@ function printCounts(title, counts) {
   }
   for (const [key, count] of counts) {
     console.log(`  ${key}: ${count}`);
+  }
+}
+
+function safeExec(command, args, options = {}) {
+  try {
+    return execFileSync(command, args, {
+      stdio: ["ignore", "pipe", "ignore"],
+      encoding: "utf8",
+      timeout: 3000,
+      ...options,
+    }).trim();
+  } catch {
+    return "";
+  }
+}
+
+function getDayBucket(timestamp) {
+  if (!timestamp) return "unknown";
+  return String(timestamp).slice(0, 10);
+}
+
+function getHourBucket(timestamp) {
+  if (!timestamp) return "unknown";
+  return String(timestamp).slice(0, 13) + ":00Z";
+}
+
+function formatRate(numerator, denominator) {
+  if (!denominator) return "n/a";
+  return `${((numerator / denominator) * 100).toFixed(1)}%`;
+}
+
+function printRecordingBuckets(recordingRollup) {
+  const days = new Map();
+  for (const recording of recordingRollup) {
+    const day = getDayBucket(recording.first);
+    const bucket = days.get(day) || { recordings: 0, failures: 0, suspicious: 0 };
+    bucket.recordings += 1;
+    if (!recording.success || recording.transcriptionFailed) bucket.failures += 1;
+    if (recording.suspicious) bucket.suspicious += 1;
+    days.set(day, bucket);
+  }
+
+  console.log("\nDaily recording buckets");
+  for (const [day, bucket] of [...days.entries()].slice(-14)) {
+    console.log(
+      `  ${day}: recordings=${bucket.recordings} failures=${bucket.failures} ` +
+        `failureRate=${formatRate(bucket.failures, bucket.recordings)} suspicious=${bucket.suspicious}`
+    );
+  }
+
+  const latestDay = [...days.keys()].sort().at(-1);
+  if (!latestDay) return;
+
+  const hours = new Map();
+  for (const recording of recordingRollup.filter((row) => getDayBucket(row.first) === latestDay)) {
+    const hour = getHourBucket(recording.first);
+    const bucket = hours.get(hour) || { recordings: 0, failures: 0, suspicious: 0 };
+    bucket.recordings += 1;
+    if (!recording.success || recording.transcriptionFailed) bucket.failures += 1;
+    if (recording.suspicious) bucket.suspicious += 1;
+    hours.set(hour, bucket);
+  }
+
+  console.log(`\nHourly recording buckets for ${latestDay} (UTC)`);
+  for (const [hour, bucket] of [...hours.entries()].slice(-12)) {
+    console.log(
+      `  ${hour}: recordings=${bucket.recordings} failures=${bucket.failures} ` +
+        `failureRate=${formatRate(bucket.failures, bucket.recordings)} suspicious=${bucket.suspicious}`
+    );
+  }
+}
+
+function printRuntimeState(rows) {
+  const latestRuntime = rows.filter((row) => row.event === "parakeet_runtime_libraries").at(-1);
+  const appImagePath = path.join(process.cwd(), "dist", "OpenWhispr.AppImage");
+  const appImageTarget = fs.existsSync(appImagePath) ? fs.realpathSync(appImagePath) : "not found";
+  const sidecarLines = safeExec("ps", ["-eo", "pid,etime,cmd"])
+    .split(/\n/)
+    .filter((line) => /sherpa-onnx-ws|OpenWhispr\.AppImage|open-whispr/.test(line))
+    .filter((line) => !/diagnostics-summary/.test(line));
+
+  console.log("\nCurrent runtime state");
+  console.log(`  AppImage: ${appImageTarget}`);
+  if (sidecarLines.length) {
+    for (const line of sidecarLines.slice(0, 8)) {
+      console.log(`  process: ${line.trim()}`);
+    }
+  } else {
+    console.log("  process: none detected");
+  }
+
+  const nvidia = safeExec("nvidia-smi", [
+    "--query-gpu=name,driver_version,memory.used,memory.total,utilization.gpu",
+    "--format=csv,noheader",
+  ]);
+  console.log(`  nvidia: ${nvidia || "n/a"}`);
+
+  const packages = safeExec("pacman", [
+    "-Q",
+    "cuda",
+    "cudnn",
+    "cudnn-frontend",
+    "nvidia-580xx-utils",
+    "linux-cachyos",
+    "onnxruntime-opt-cuda",
+  ]);
+  if (packages) {
+    console.log("  packages:");
+    for (const line of packages.split(/\n/)) {
+      console.log(`    ${line}`);
+    }
+  }
+
+  console.log("\nLatest Parakeet runtime libraries");
+  if (!latestRuntime) {
+    console.log("  none");
+    return;
+  }
+
+  console.log(`  timestamp: ${latestRuntime.timestamp || "n/a"}`);
+  console.log(`  pid: ${latestRuntime.pid || "n/a"}`);
+  console.log(`  providerRequested: ${latestRuntime.providerRequested || "n/a"}`);
+  console.log(`  providerUsed: ${latestRuntime.providerUsed || "n/a"}`);
+  console.log(`  nvidiaDriverVersion: ${latestRuntime.nvidiaDriverVersion || "n/a"}`);
+  console.log("  runtimeSourceCounts:");
+  for (const [source, count] of Object.entries(latestRuntime.runtimeSourceCounts || {})) {
+    console.log(`    ${source}: ${count}`);
+  }
+  console.log("  libraryPaths:");
+  for (const libraryPath of latestRuntime.libraryPaths || []) {
+    console.log(`    ${libraryPath}`);
   }
 }
 
@@ -134,6 +267,36 @@ function main() {
   printCounts("Failure classes", countBy(failures, "errorClass"));
   printCounts("Provider used", countBy(rows.filter((row) => row.providerUsed), "providerUsed"));
   printCounts("Retry kinds", countBy(rows.filter((row) => row.retryKind), "retryKind"));
+  printCounts("Attempt modes", countBy(attempts.filter((row) => row.mode), "mode"));
+  printCounts(
+    "Failure classes by provider",
+    countBy(
+      failures.filter((row) => row.providerUsed || row.provider),
+      (row) => `${row.providerUsed || row.provider}:${row.errorClass || "unknown"}`
+    )
+  );
+  printCounts(
+    "Failure classes by attempt mode",
+    countBy(
+      failures.filter((row) => row.mode),
+      (row) => `${row.mode}:${row.errorClass || "unknown"}`
+    )
+  );
+  printCounts(
+    "Sidecar restart reasons",
+    countBy(
+      rows.filter((row) =>
+        [
+          "parakeet_sidecar_restart",
+          "parakeet_health_restart_requested",
+          "parakeet_health_restart_complete",
+          "parakeet_health_restart_failed",
+          "parakeet_health_restart_skipped_cooldown",
+        ].includes(row.event)
+      ),
+      (row) => `${row.event}:${row.reason || "unknown"}`
+    )
+  );
 
   console.log("\nParakeet attempt latency");
   console.log(`  count: ${latencies.length}`);
@@ -148,6 +311,9 @@ function main() {
   console.log(`  persisted: ${recordingRollup.filter((row) => row.persisted).length}`);
   console.log(`  trueFailures: ${trueFailures.length}`);
   console.log(`  partialTailRisks: ${partialTailRisks.length}`);
+
+  printRecordingBuckets(recordingRollup);
+  printRuntimeState(rows);
 
   console.log("\nRecent suspicious/failure events");
   const recent = rows

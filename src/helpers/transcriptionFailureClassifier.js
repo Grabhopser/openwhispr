@@ -36,6 +36,9 @@ function classifySuspiciousSuccess({ durationMs = null, rms = null, textLength =
   if (Number.isFinite(rms) && rms > 0.01 && textLength === 0) {
     return "model_empty_non_silent";
   }
+  if (durationMs > 2500 && textLength < 8) {
+    return "model_suspicious_short";
+  }
   if (durationMs > 8000 && textLength < 20) {
     return "model_suspicious_short";
   }

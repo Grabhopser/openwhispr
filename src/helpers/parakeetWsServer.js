@@ -17,6 +17,8 @@ const PORT_RANGE_END = 6029;
 const STARTUP_TIMEOUT_MS = 60000;
 const HEALTH_CHECK_INTERVAL_MS = 5000;
 const TRANSCRIPTION_TIMEOUT_MS = 300000;
+const RUNTIME_LIBRARY_PATTERN =
+  /cuda|cudnn|cublas|cufft|curand|onnxruntime|nvrtc|nvjitlink|libnvidia/i;
 
 class ParakeetWsServer {
   constructor() {
@@ -40,6 +42,7 @@ class ParakeetWsServer {
       fallbackUsed: false,
       cudaLibDirs: [],
       evidenceLines: [],
+      runtimeLibraries: null,
       lastError: null,
     };
   }
@@ -262,6 +265,7 @@ class ParakeetWsServer {
       fallbackUsed: Boolean(options.isFallbackAttempt),
       cudaLibDirs: envTrace.cudaLibDirs,
       evidenceLines: [],
+      runtimeLibraries: null,
       lastError: null,
     };
 
@@ -339,6 +343,132 @@ class ParakeetWsServer {
     });
 
     await this._warmUp();
+    this._logRuntimeLibraries();
+  }
+
+  _classifyRuntimeLibraryPath(libraryPath) {
+    if (!libraryPath) return "other";
+    if (libraryPath.includes("/resources/bin/") || libraryPath.includes("/.mount_OpenWh")) {
+      return "appimage";
+    }
+    if (libraryPath.includes("/.cache/openwhispr/")) {
+      return "openwhispr_cache";
+    }
+    if (libraryPath.startsWith("/opt/cuda/")) {
+      return "system_opt_cuda";
+    }
+    if (libraryPath.startsWith("/usr/lib/") || libraryPath.startsWith("/lib/")) {
+      return "system_usr";
+    }
+    return "other";
+  }
+
+  _collectRuntimeLibraries() {
+    if (process.platform !== "linux" || !this.process?.pid) {
+      return {
+        supported: false,
+        reason: process.platform === "linux" ? "missing_pid" : "unsupported_platform",
+        pid: this.process?.pid || null,
+        libraryPaths: [],
+        runtimeSourceCounts: {},
+      };
+    }
+
+    const mapsPath = `/proc/${this.process.pid}/maps`;
+    const libraryPaths = [];
+    const seen = new Set();
+
+    try {
+      const content = fs.readFileSync(mapsPath, "utf8");
+      for (const line of content.split(/\n/)) {
+        const match = line.match(/\/\S+$/);
+        if (!match) continue;
+
+        const libraryPath = match[0];
+        if (!RUNTIME_LIBRARY_PATTERN.test(libraryPath)) continue;
+        if (seen.has(libraryPath)) continue;
+
+        seen.add(libraryPath);
+        libraryPaths.push(libraryPath);
+      }
+    } catch (error) {
+      return {
+        supported: true,
+        status: "failure",
+        errorClass: "runtime_library_provenance_failed",
+        error: error.message,
+        pid: this.process.pid,
+        libraryPaths: [],
+        runtimeSourceCounts: {},
+      };
+    }
+
+    libraryPaths.sort();
+
+    const runtimeSourceCounts = {
+      appimage: 0,
+      openwhispr_cache: 0,
+      system_usr: 0,
+      system_opt_cuda: 0,
+      other: 0,
+    };
+
+    for (const libraryPath of libraryPaths) {
+      const source = this._classifyRuntimeLibraryPath(libraryPath);
+      runtimeSourceCounts[source] = (runtimeSourceCounts[source] || 0) + 1;
+    }
+
+    return {
+      supported: true,
+      status: "success",
+      pid: this.process.pid,
+      libraryPaths,
+      runtimeSourceCounts,
+    };
+  }
+
+  _getNvidiaDriverVersion() {
+    try {
+      const output = execFileSync("nvidia-smi", ["--query-gpu=driver_version", "--format=csv,noheader"], {
+        stdio: ["ignore", "pipe", "ignore"],
+        encoding: "utf8",
+        timeout: 3000,
+      });
+      return output.split(/\n/).map((line) => line.trim()).find(Boolean) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  _logRuntimeLibraries() {
+    const runtimeLibraries = this._collectRuntimeLibraries();
+    this.lastBackendTrace.runtimeLibraries = runtimeLibraries;
+
+    debugLogger.writeDiagnostic?.("parakeet_runtime_libraries", {
+      service: "parakeet",
+      stage: "inference",
+      status: runtimeLibraries.status || (runtimeLibraries.supported ? "success" : "skipped"),
+      errorClass: runtimeLibraries.errorClass || null,
+      providerRequested: this.lastBackendTrace.providerAttempted || null,
+      providerUsed: this.lastBackendTrace.providerUsed || null,
+      providerPreference: this.lastBackendTrace.providerPreference || null,
+      fallbackUsed: Boolean(this.lastBackendTrace.fallbackUsed),
+      pid: runtimeLibraries.pid || null,
+      port: this.port,
+      modelName: this.modelName,
+      supported: runtimeLibraries.supported,
+      reason: runtimeLibraries.reason || null,
+      libraryPaths: runtimeLibraries.libraryPaths || [],
+      runtimeSourceCounts: runtimeLibraries.runtimeSourceCounts || {},
+      nvidiaDriverVersion: this._getNvidiaDriverVersion(),
+    });
+
+    debugLogger.info("Parakeet runtime library provenance captured", {
+      pid: runtimeLibraries.pid,
+      providerUsed: this.lastBackendTrace.providerUsed,
+      runtimeSourceCounts: runtimeLibraries.runtimeSourceCounts,
+      libraryCount: runtimeLibraries.libraryPaths?.length || 0,
+    });
   }
 
   _captureProviderTrace(stream, text) {
