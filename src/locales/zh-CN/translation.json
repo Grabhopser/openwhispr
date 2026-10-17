@@ -2596,6 +2596,8 @@
       },
       "parakeet": {
         "parakeet_tdt_0_6b_v3": "快速多语言语音识别，自动语言检测（25 种语言）",
+        "parakeet_tdt_0_6b_v3_gguf": "运行于 transcribe.cpp 引擎的 Parakeet（Q8_0）：速度相同，错误比 ONNX 版本更少（25 种语言）",
+        "canary_1b_v2_gguf": "CPU 上最准确的 NVIDIA 模型，延迟约为 Parakeet 的两倍；每次听写自动检测语言（25 种语言）",
         "parakeet_unified_en_0_6b": "仅英语 ASR，最先进的准确度（平均 WER 5.91%）",
         "nemotron_speech_streaming_en_0_6b": "NVIDIA Nemotron 英语流式语音识别",
         "nemotron_3_5_asr_streaming_0_6b": "NVIDIA Nemotron 多语言流式语音识别，自动语言检测（15 种语言）",

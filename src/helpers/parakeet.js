@@ -1,5 +1,6 @@
 const fs = require("fs");
 const fsPromises = require("fs").promises;
+const crypto = require("crypto");
 const path = require("path");
 const { pipeline } = require("stream/promises");
 const debugLogger = require("./debugLogger");
@@ -18,10 +19,18 @@ const { assertParakeetSupported, getParakeetCapability } = require("./parakeetCa
 
 const modelRegistryData = require("../models/modelRegistryData.json");
 const {
+  getModelEngine,
+  getModelDownloadFiles,
   getModelRuntime,
   getRequiredModelFiles,
   isSherpaLocalProvider,
 } = require("./parakeetModelInfo");
+
+async function sha256File(filePath) {
+  const hash = crypto.createHash("sha256");
+  await pipeline(fs.createReadStream(filePath), hash);
+  return hash.digest("hex");
+}
 
 function getParakeetModelConfig(modelName) {
   const modelInfo = modelRegistryData.parakeetModels[modelName];
@@ -74,7 +83,7 @@ class ParakeetManager {
   // Cohere models keep their weights in encoder.int8.onnx.data; transducers in
   // encoder.int8.onnx. Used as the reported on-disk size of a model.
   _getModelWeightsSize(modelDir) {
-    for (const file of ["encoder.int8.onnx.data", "encoder.int8.onnx"]) {
+    for (const file of ["model.gguf", "encoder.int8.onnx.data", "encoder.int8.onnx"]) {
       try {
         return fs.statSync(path.join(modelDir, file)).size;
       } catch {}
@@ -99,7 +108,7 @@ class ParakeetManager {
         capability.supported &&
         isSherpaLocalProvider(localTranscriptionProvider) &&
         parakeetModel &&
-        this.serverManager.isAvailable(getModelRuntime(parakeetModel))
+        this.serverManager.isAvailableForModel(parakeetModel)
       ) {
         if (this.serverManager.isModelDownloaded(parakeetModel)) {
           debugLogger.info("Pre-warming parakeet server", { model: parakeetModel });
@@ -232,7 +241,8 @@ class ParakeetManager {
   async transcribeLocalParakeet(audioBlob, options = {}) {
     const model = options.model || "parakeet-tdt-0.6b-v3";
     assertParakeetSupported();
-    const serverAvailable = this.serverManager.isAvailable(getModelRuntime(model));
+    const serverAvailable = this.serverManager.isAvailableForModel(model);
+    const engine = getModelEngine(model);
 
     debugLogger.logSTTPipeline("transcribeLocalParakeet - start", {
       options,
@@ -243,7 +253,9 @@ class ParakeetManager {
 
     if (!serverAvailable) {
       throw new Error(
-        "sherpa-onnx binary not found. Please ensure the app is installed correctly."
+        engine === "transcribe-cpp"
+          ? "transcribe.cpp library not found. Please ensure the app is installed correctly."
+          : "sherpa-onnx binary not found. Please ensure the app is installed correctly."
       );
     }
 
@@ -283,11 +295,13 @@ class ParakeetManager {
       result = await this.serverManager.transcribe(audioBuffer, {
         modelName: model,
         language: options.language,
+        spokenLanguages: options.spokenLanguages,
         signal: options.signal,
       });
     } catch (error) {
       debugLogger.writeDiagnostic("local_transcription_complete", {
         service: "parakeet",
+        engine,
         status: "failure",
         model,
         audioBytes: audioBuffer.length,
@@ -307,11 +321,16 @@ class ParakeetManager {
     // Metadata only — never the transcript text.
     debugLogger.writeDiagnostic("local_transcription_complete", {
       service: "parakeet",
+      engine,
       status: parsed.success ? (parsed.warning ? "partial" : "success") : "failure",
       model,
       audioBytes: audioBuffer.length,
       wallMs: elapsed,
       engineMs: result.elapsed ?? null,
+      // Language codes only (e.g. "de"), never text.
+      language: result.language || null,
+      languageSource: result.languageSource || null,
+      languageMs: result.languageMs ?? null,
       textLength: parsed.text?.length || 0,
       truncated: !!result.truncated,
       errorClass: parsed.success ? null : parsed.code || parsed.error || "unknown",
@@ -362,6 +381,10 @@ class ParakeetManager {
 
     if (this.currentDownloadProcess) {
       throw createDownloadInProgressError(modelName, this.currentDownloadProcess.model);
+    }
+
+    if (getModelEngine(modelName) === "transcribe-cpp") {
+      return this._downloadFileModel(modelName, progressCallback);
     }
 
     const archivePath = path.join(modelsDir, `${modelName}.tar.bz2`);
@@ -460,7 +483,7 @@ class ParakeetManager {
       // serving (or starting) another model — e.g. mid-dictation.
       const serverStatus = this.serverManager.getServerStatus();
       if (
-        this.serverManager.isAvailable(getModelRuntime(modelName)) &&
+        this.serverManager.isAvailableForModel(modelName) &&
         !serverStatus.running &&
         !serverStatus.starting
       ) {
@@ -487,6 +510,105 @@ class ParakeetManager {
     } catch (error) {
       if (error.isAbort) {
         await fsPromises.unlink(archivePath).catch(() => {});
+        throw Object.assign(new Error("Download interrupted by user"), {
+          code: "DOWNLOAD_CANCELLED",
+        });
+      }
+      throw error;
+    } finally {
+      if (this.currentDownloadProcess === downloadProcess) {
+        this.currentDownloadProcess = null;
+      }
+    }
+  }
+
+  // transcribe.cpp models are plain GGUF files: each one is downloaded next to
+  // the model directory, checked against its pinned sha256, then moved in. The
+  // directory only counts as installed once every file is in place.
+  async _downloadFileModel(modelName, progressCallback) {
+    const files = getModelDownloadFiles(modelName);
+    const modelsDir = this.getModelsDir();
+    const modelPath = this.getModelPath(modelName);
+    const totalBytes = files.reduce((sum, file) => sum + file.bytes, 0);
+    const { signal, abort } = createDownloadSignal();
+    const downloadProcess = {
+      abort,
+      model: modelName,
+      phase: "progress",
+      percentage: 0,
+      downloadedBytes: 0,
+      totalBytes,
+    };
+    this.currentDownloadProcess = downloadProcess;
+    const report = (bytes) => {
+      downloadProcess.downloadedBytes = bytes;
+      downloadProcess.percentage = totalBytes > 0 ? Math.round((bytes / totalBytes) * 100) : 0;
+      progressCallback?.({
+        type: "progress",
+        model: modelName,
+        downloaded_bytes: bytes,
+        total_bytes: totalBytes,
+        percentage: downloadProcess.percentage,
+      });
+    };
+
+    try {
+      await fsPromises.mkdir(modelsDir, { recursive: true });
+      const spaceCheck = await checkDiskSpace(modelsDir, totalBytes * 1.2);
+      if (!spaceCheck.ok) {
+        throw new Error(
+          `Not enough disk space to download model. Need ~${Math.round((totalBytes * 1.2) / 1_000_000)}MB, ` +
+            `only ${Math.round(spaceCheck.availableBytes / 1_000_000)}MB available.`
+        );
+      }
+
+      let doneBytes = 0;
+      for (const file of files) {
+        const finalPath = path.join(modelPath, file.name);
+        if (fs.existsSync(finalPath)) {
+          doneBytes += file.bytes;
+          report(doneBytes);
+          continue;
+        }
+        const stagingPath = path.join(modelsDir, `${modelName}--${file.name}`);
+        await downloadFile(file.url, stagingPath, {
+          timeout: 600000,
+          signal,
+          expectedSize: file.bytes,
+          onProgress: (downloaded) => report(doneBytes + downloaded),
+        });
+        const digest = await sha256File(stagingPath);
+        if (digest !== file.sha256) {
+          await fsPromises.unlink(stagingPath).catch(() => {});
+          const err = new Error(`Checksum mismatch for ${file.name}; the download was discarded`);
+          err.code = "CHECKSUM_MISMATCH";
+          throw err;
+        }
+        await fsPromises.mkdir(modelPath, { recursive: true });
+        await fsPromises.rename(stagingPath, finalPath);
+        doneBytes += file.bytes;
+        report(doneBytes);
+      }
+
+      progressCallback?.({ type: "complete", model: modelName, percentage: 100 });
+
+      const serverStatus = this.serverManager.getServerStatus();
+      if (
+        this.serverManager.isAvailableForModel(modelName) &&
+        !serverStatus.running &&
+        !serverStatus.starting
+      ) {
+        this.serverManager.startServer(modelName).catch((err) => {
+          debugLogger.warn("Post-download server pre-warm failed (non-fatal)", {
+            error: err.message,
+            model: modelName,
+          });
+        });
+      }
+
+      return { model: modelName, downloaded: true, path: modelPath, success: true };
+    } catch (error) {
+      if (error.isAbort) {
         throw Object.assign(new Error("Download interrupted by user"), {
           code: "DOWNLOAD_CANCELLED",
         });

@@ -57,6 +57,9 @@ function setup(t, options = {}) {
       isAvailable() {
         return true;
       }
+      isAvailableForModel() {
+        return true;
+      }
       async startServer() {
         calls.warms++;
         calls.events.push("warm");

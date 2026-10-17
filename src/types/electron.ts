@@ -2014,7 +2014,7 @@ declare global {
       // Parakeet operations (NVIDIA via sherpa-onnx)
       transcribeLocalParakeet: (
         audioBlob: ArrayBuffer,
-        options?: { model?: string; language?: string }
+        options?: { model?: string; language?: string; spokenLanguages?: string[] }
       ) => Promise<ParakeetTranscriptionResult>;
       checkParakeetInstallation: () => Promise<ParakeetCheckResult>;
       downloadParakeetModel: (modelName: string) => Promise<ParakeetModelResult>;

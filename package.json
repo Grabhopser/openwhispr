@@ -1,6 +1,6 @@
 {
   "name": "open-whispr",
-  "version": "1.10.3-cpu.2",
+  "version": "1.10.3-cpu.3",
   "description": "A desktop dictation application using whisper.cpp for speech-to-text transcription",
   "main": "main.js",
   "private": true,
@@ -15,6 +15,7 @@
     "compile:text-monitor": "node scripts/build-text-monitor.js",
     "compile:winpaste": "node scripts/build-windows-fast-paste.js",
     "compile:linux-paste": "node scripts/build-linux-fast-paste.js",
+    "compile:transcribe-sidecar": "node scripts/build-transcribe-sidecar.js",
     "compile:linux-system-audio": "node scripts/build-linux-system-audio.js",
     "compile:media-remote": "node scripts/build-media-remote.js",
     "compile:mediaremote-adapter": "node scripts/build-mediaremote-adapter.js",
@@ -22,7 +23,7 @@
     "compile:calendar-listener": "node scripts/build-macos-calendar-listener.js",
     "compile:audio-tap": "node scripts/build-macos-audio-tap.js",
     "compile:window-bounds": "node scripts/build-macos-window-bounds.js",
-    "compile:native": "npm run compile:globe && npm run compile:fast-paste && npm run compile:winkeys && npm run compile:linuxkeys && npm run compile:winpaste && npm run compile:linux-paste && npm run compile:linux-system-audio && npm run compile:text-monitor && npm run compile:media-remote && npm run compile:mediaremote-adapter && npm run compile:mic-listener && npm run compile:calendar-listener && npm run compile:audio-tap && npm run compile:window-bounds",
+    "compile:native": "npm run compile:globe && npm run compile:fast-paste && npm run compile:winkeys && npm run compile:linuxkeys && npm run compile:winpaste && npm run compile:linux-paste && npm run compile:transcribe-sidecar && npm run compile:linux-system-audio && npm run compile:text-monitor && npm run compile:media-remote && npm run compile:mediaremote-adapter && npm run compile:mic-listener && npm run compile:calendar-listener && npm run compile:audio-tap && npm run compile:window-bounds",
     "prestart": "npm run compile:native && npm run download:meeting-aec-helper && npm run download:sherpa-onnx && npm run download:yt-dlp && npm run download:qdrant && npm run download:embedding-model && npm run download:whisper-vad-model",
     "start": "electron .",
     "dev": "concurrently -k -r \"npm:dev:renderer\" \"npm:dev:main\"",
@@ -232,5 +233,8 @@
     "markdown-it": "14.3.2",
     "shell-quote": "1.12.0",
     "tmp": "0.2.7"
+  },
+  "optionalDependencies": {
+    "@transcribe-cpp/linux-x64-cpu-vulkan": "0.4.0"
   }
 }

@@ -14,8 +14,11 @@ const {
 const { getSafeTempDir } = require("./safeTempDir");
 const { createAbortError } = require("./abortError");
 const ParakeetWsServer = require("./parakeetWsServer");
+const TranscribeCppServer = require("./transcribeCppServer");
 const { splitAtPauses } = require("./parakeetSegmentation");
 const {
+  getModelInfo,
+  getModelEngine,
   getModelRuntime,
   getModelType,
   getRequiredModelFiles,
@@ -55,6 +58,28 @@ async function mapWithConcurrency(items, limit, fn) {
 class ParakeetServerManager {
   constructor() {
     this.wsServer = new ParakeetWsServer();
+    this.tcppServer = new TranscribeCppServer();
+  }
+
+  _serverFor(modelName) {
+    return getModelEngine(modelName) === "transcribe-cpp" ? this.tcppServer : this.wsServer;
+  }
+
+  // Starts the engine a model needs and stops the other one, so only one
+  // speech model is resident at a time.
+  async _startEngine(modelName, modelDir, runtime, language) {
+    const server = this._serverFor(modelName);
+    const other = server === this.wsServer ? this.tcppServer : this.wsServer;
+    const otherStatus = other.getStatus();
+    if (otherStatus.running || otherStatus.starting) await other.stop();
+    await server.start(modelName, modelDir, runtime, language);
+    return server;
+  }
+
+  isAvailableForModel(modelName) {
+    return getModelEngine(modelName) === "transcribe-cpp"
+      ? this.tcppServer.isAvailable()
+      : this.wsServer.isAvailable(getModelRuntime(modelName));
   }
 
   getBinaryPath(runtime) {
@@ -113,7 +138,7 @@ class ParakeetServerManager {
   async transcribe(audioBuffer, options = {}) {
     // signal is optional; only cancellable uploads pass one. Aborting stops
     // scheduling further segments — the in-flight one finishes server-side.
-    const { modelName = "parakeet-tdt-0.6b-v3", language, signal } = options;
+    const { modelName = "parakeet-tdt-0.6b-v3", language, spokenLanguages, signal } = options;
     const throwIfAborted = () => {
       if (signal?.aborted) throw createAbortError("Parakeet transcription cancelled");
     };
@@ -137,7 +162,7 @@ class ParakeetServerManager {
       throwIfAborted();
       const runtime = getModelRuntime(modelName);
       // Awaiting unconditionally also covers a startup's warm-up completion.
-      await this.wsServer.start(
+      const server = await this._startEngine(
         modelName,
         modelDir,
         runtime,
@@ -153,17 +178,42 @@ class ParakeetServerManager {
         return { text: "", elapsed: 0 };
       }
 
+      // transcribe.cpp models that need a language get one per dictation,
+      // shared by all of its segments.
+      let decodeOptions = { signal };
+      let languageInfo = null;
+      if (server === this.tcppServer) {
+        languageInfo = await server.resolveLanguage(samples, { language, spokenLanguages, signal });
+        decodeOptions = { signal, language: languageInfo.language };
+      }
+      // An empty decode under a detected language is most often a wrong
+      // detection, so the retry uses the runner-up language.
+      const fallbackLanguage = languageInfo?.alternatives?.[0];
+      const retryOptions = fallbackLanguage
+        ? { ...decodeOptions, language: fallbackLanguage }
+        : decodeOptions;
+      const withLanguage = (result, usedLanguage = languageInfo?.language) =>
+        languageInfo
+          ? {
+              ...result,
+              language: usedLanguage || result.language,
+              languageSource: languageInfo.source,
+              languageMs: languageInfo.languageMs,
+            }
+          : result;
+
       const maxSegmentSeconds =
-        runtime === "online"
+        getModelInfo(modelName)?.maxSegmentSeconds ||
+        (runtime === "online"
           ? ONLINE_MAX_SEGMENT_SECONDS
           : getModelType(modelName) === "cohere-transcribe"
             ? COHERE_MAX_SEGMENT_SECONDS
-            : MAX_SEGMENT_SECONDS;
+            : MAX_SEGMENT_SECONDS);
       const segments = splitAtPauses(samples, { sampleRate: SAMPLE_RATE, maxSegmentSeconds });
 
       if (segments.length === 1) {
-        const result = await this.wsServer.transcribe(samples, SAMPLE_RATE, { signal });
-        if (result.text?.trim()) return result;
+        const result = await server.transcribe(samples, SAMPLE_RATE, decodeOptions);
+        if (result.text?.trim()) return withLanguage(result);
         throwIfAborted();
         // The RMS gate above already established audible audio, so an empty
         // decode here loses the whole dictation — retry once before giving up.
@@ -172,8 +222,11 @@ class ParakeetServerManager {
           rms,
           samplesBytes: samples.length,
         });
-        const retry = await this.wsServer.transcribe(samples, SAMPLE_RATE, { signal });
-        return { ...retry, elapsed: (result.elapsed || 0) + (retry.elapsed || 0) };
+        const retry = await server.transcribe(samples, SAMPLE_RATE, retryOptions);
+        return withLanguage(
+          { ...retry, elapsed: (result.elapsed || 0) + (retry.elapsed || 0) },
+          retryOptions.language
+        );
       }
 
       const shortestSegmentBytes = Math.min(...segments.map((segment) => segment.length));
@@ -185,7 +238,7 @@ class ParakeetServerManager {
 
       const decodeSegment = async (segment, segmentIndex) => {
         throwIfAborted();
-        const first = await this.wsServer.transcribe(segment, SAMPLE_RATE, { signal });
+        const first = await server.transcribe(segment, SAMPLE_RATE, decodeOptions);
         if (first.text || computeFloat32RMS(segment) < SILENCE_RMS_THRESHOLD) return first;
         throwIfAborted();
         // An empty decode of audible audio silently amputates the transcript
@@ -194,7 +247,7 @@ class ParakeetServerManager {
           segmentIndex,
           segmentDuration: segment.length / BYTES_PER_SAMPLE / SAMPLE_RATE,
         });
-        const retry = await this.wsServer.transcribe(segment, SAMPLE_RATE, { signal });
+        const retry = await server.transcribe(segment, SAMPLE_RATE, retryOptions);
         if (!retry.text) {
           debugLogger.warn("Parakeet segment still empty after retry; transcript truncated", {
             segmentIndex,
@@ -212,7 +265,7 @@ class ParakeetServerManager {
       // server's work threads side by side instead of in four serial passes.
       const results = await mapWithConcurrency(
         segments,
-        this.wsServer.maxConcurrentDecodes,
+        server.maxConcurrentDecodes,
         decodeSegment
       );
       const text = results
@@ -220,9 +273,11 @@ class ParakeetServerManager {
         .filter(Boolean)
         .join(" ");
       const elapsed = results.reduce((sum, result) => sum + (result.elapsed || 0), 0);
-      return results.some((result) => result.truncated)
-        ? { text, elapsed, truncated: true }
-        : { text, elapsed };
+      return withLanguage(
+        results.some((result) => result.truncated)
+          ? { text, elapsed, truncated: true }
+          : { text, elapsed }
+      );
     } finally {
       this._cleanupFiles(filesToCleanup);
     }
@@ -245,8 +300,14 @@ class ParakeetServerManager {
 
   async startServer(modelName, language) {
     const runtime = getModelRuntime(modelName);
-    if (!this.wsServer.isAvailable(runtime)) {
-      return { success: false, reason: "parakeet WS server binary not found" };
+    if (!this.isAvailableForModel(modelName)) {
+      return {
+        success: false,
+        reason:
+          getModelEngine(modelName) === "transcribe-cpp"
+            ? "transcribe.cpp native library not found"
+            : "parakeet WS server binary not found",
+      };
     }
 
     const modelDir = path.join(this.getModelsDir(), modelName);
@@ -255,13 +316,13 @@ class ParakeetServerManager {
     }
 
     try {
-      await this.wsServer.start(
+      const server = await this._startEngine(
         modelName,
         modelDir,
         runtime,
         resolveModelLanguage(modelName, language)
       );
-      return { success: true, port: this.wsServer.port };
+      return { success: true, port: server.port };
     } catch (error) {
       debugLogger.error("Failed to start parakeet WS server", { error: error.message });
       return { success: false, reason: error.message };
@@ -269,11 +330,12 @@ class ParakeetServerManager {
   }
 
   async stopServer() {
-    await this.wsServer.stop();
+    await Promise.all([this.wsServer.stop(), this.tcppServer.stop()]);
   }
 
   getServerStatus() {
-    return this.wsServer.getStatus();
+    const tcpp = this.tcppServer.getStatus();
+    return tcpp.running || tcpp.starting ? tcpp : this.wsServer.getStatus();
   }
 
   createOnlineStream(options) {

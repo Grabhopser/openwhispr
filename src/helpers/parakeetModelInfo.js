@@ -22,6 +22,16 @@ function getModelRuntime(modelName) {
   return getModelInfo(modelName)?.runtime === "online" ? "online" : "offline";
 }
 
+// "transcribe-cpp" models run GGUF weights in the native transcribe-sidecar
+// process instead of the sherpa-onnx sidecar.
+function getModelEngine(modelName) {
+  return getModelInfo(modelName)?.engine === "transcribe-cpp" ? "transcribe-cpp" : "sherpa";
+}
+
+function getModelDownloadFiles(modelName) {
+  return getModelEngine(modelName) === "transcribe-cpp" ? getModelInfo(modelName)?.files || [] : [];
+}
+
 function getModelType(modelName) {
   return getModelInfo(modelName)?.modelType === "cohere-transcribe"
     ? "cohere-transcribe"
@@ -39,6 +49,9 @@ function getSherpaModelType(modelName) {
 }
 
 function getRequiredModelFiles(modelName) {
+  if (getModelEngine(modelName) === "transcribe-cpp") {
+    return getModelDownloadFiles(modelName).map((file) => file.name);
+  }
   return getModelType(modelName) === "cohere-transcribe"
     ? COHERE_TRANSCRIBE_MODEL_FILES
     : TRANSDUCER_MODEL_FILES;
@@ -63,6 +76,9 @@ function resolveModelLanguage(modelName, language) {
 }
 
 module.exports = {
+  getModelInfo,
+  getModelEngine,
+  getModelDownloadFiles,
   getModelRuntime,
   getModelType,
   getSherpaModelType,

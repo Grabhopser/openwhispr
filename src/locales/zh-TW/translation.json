@@ -2596,6 +2596,8 @@
       },
       "parakeet": {
         "parakeet_tdt_0_6b_v3": "快速多語言 ASR，自動語言偵測（25 種語言）",
+        "parakeet_tdt_0_6b_v3_gguf": "執行於 transcribe.cpp 引擎的 Parakeet（Q8_0）：速度相同，錯誤比 ONNX 版本更少（25 種語言）",
+        "canary_1b_v2_gguf": "CPU 上最準確的 NVIDIA 模型，延遲約為 Parakeet 的兩倍；每次聽寫自動偵測語言（25 種語言）",
         "parakeet_unified_en_0_6b": "僅英語 ASR，最先進的準確度（平均 WER 5.91%）",
         "nemotron_speech_streaming_en_0_6b": "NVIDIA Nemotron 英語串流語音辨識",
         "nemotron_3_5_asr_streaming_0_6b": "NVIDIA Nemotron 多語言串流語音辨識，自動語言偵測（15 種語言）",

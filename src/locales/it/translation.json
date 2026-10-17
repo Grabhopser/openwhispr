@@ -2596,6 +2596,8 @@
       },
       "parakeet": {
         "parakeet_tdt_0_6b_v3": "ASR multilingue veloce con rilevamento automatico della lingua (25 lingue)",
+        "parakeet_tdt_0_6b_v3_gguf": "Parakeet sul motore transcribe.cpp (Q8_0): stessa velocità, meno errori della versione ONNX (25 lingue)",
+        "canary_1b_v2_gguf": "Il modello NVIDIA più preciso su CPU, circa il doppio della latenza di Parakeet; rileva la lingua a ogni dettatura (25 lingue)",
         "parakeet_unified_en_0_6b": "ASR solo inglese con precisione all'avanguardia (5,91% WER medio)",
         "nemotron_speech_streaming_en_0_6b": "ASR streaming in inglese di NVIDIA Nemotron",
         "nemotron_3_5_asr_streaming_0_6b": "ASR multilingue in streaming di NVIDIA Nemotron con rilevamento automatico della lingua (15 lingue)",

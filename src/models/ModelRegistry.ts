@@ -118,6 +118,13 @@ export interface ParakeetModelInfo {
   recommended?: boolean;
   downloadUrl: string;
   extractDir: string;
+  /** "transcribe-cpp" runs GGUF files in the native transcribe-sidecar; default is sherpa-onnx. */
+  engine?: "transcribe-cpp";
+  /** Single files downloaded directly (transcribe-cpp models), verified by sha256. */
+  files?: Array<{ name: string; url: string; bytes: number; sha256: string }>;
+  maxSegmentSeconds?: number;
+  /** "langid": the model needs a language, picked per dictation by a language-ID model. */
+  languageDetection?: "langid";
 }
 
 export type ParakeetModelsMap = Record<string, ParakeetModelInfo>;

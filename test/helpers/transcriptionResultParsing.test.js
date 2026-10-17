@@ -86,6 +86,7 @@ test("parakeet: execution failures and cancellation retain their original errors
   ]) {
     manager.serverManager = {
       isAvailable: () => true,
+      isAvailableForModel: () => true,
       isModelDownloaded: () => true,
       transcribe: async () => {
         throw failure;

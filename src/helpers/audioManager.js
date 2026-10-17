@@ -2479,6 +2479,8 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         result = await window.electronAPI.transcribeLocalParakeet(arrayBuffer, {
           model,
           language: getBaseLanguageCode(this.getEffectiveSttLanguage(getSettings())),
+          // Limits language ID for models that need a language (Canary).
+          spokenLanguages: getSettings().spokenLanguages,
         });
         timings.transcriptionProcessingDurationMs = Math.round(
           performance.now() - transcriptionStart

@@ -83,6 +83,9 @@
     "!**/node_modules/cross-env/**",
     "!**/node_modules/@electron/notarize/**",
 
+    "!**/node_modules/@transcribe-cpp/*/libggml-vulkan.so",
+    "!**/node_modules/@transcribe-cpp/*/ggml-vulkan.dll",
+
     "!**/node_modules/**/test/**",
     "!**/node_modules/**/tests/**",
     "!**/node_modules/**/*.ts",
@@ -96,6 +99,7 @@
     "**/node_modules/better-sqlite3/**/*",
     "**/node_modules/onnxruntime-node/**/*",
     "**/node_modules/@napi-rs/keyring/**/*",
+    "**/node_modules/@transcribe-cpp/**/*",
     "src/workers/**/*"
   ],
   "extraResources": [
@@ -113,6 +117,7 @@
         "whisper-server-*",
         "llama-server-*",
         "sherpa-onnx-*",
+        "transcribe-sidecar-*",
         "yt-dlp-*",
         "qdrant-*",
         "macos-audio-tap",
