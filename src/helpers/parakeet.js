@@ -278,11 +278,24 @@ class ParakeetManager {
     });
 
     const startTime = Date.now();
-    const result = await this.serverManager.transcribe(audioBuffer, {
-      modelName: model,
-      language: options.language,
-      signal: options.signal,
-    });
+    let result;
+    try {
+      result = await this.serverManager.transcribe(audioBuffer, {
+        modelName: model,
+        language: options.language,
+        signal: options.signal,
+      });
+    } catch (error) {
+      debugLogger.writeDiagnostic("local_transcription_complete", {
+        service: "parakeet",
+        status: "failure",
+        model,
+        audioBytes: audioBuffer.length,
+        wallMs: Date.now() - startTime,
+        errorClass: error?.name === "AbortError" ? "aborted" : "engine_error",
+      });
+      throw error;
+    }
     const elapsed = Date.now() - startTime;
 
     debugLogger.logSTTPipeline("transcribeLocalParakeet - completed", {
@@ -290,7 +303,20 @@ class ParakeetManager {
       textLength: result.text?.length || 0,
     });
 
-    return this.parseParakeetResult(result);
+    const parsed = this.parseParakeetResult(result);
+    // Metadata only — never the transcript text.
+    debugLogger.writeDiagnostic("local_transcription_complete", {
+      service: "parakeet",
+      status: parsed.success ? (parsed.warning ? "partial" : "success") : "failure",
+      model,
+      audioBytes: audioBuffer.length,
+      wallMs: elapsed,
+      engineMs: result.elapsed ?? null,
+      textLength: parsed.text?.length || 0,
+      truncated: !!result.truncated,
+      errorClass: parsed.success ? null : parsed.code || parsed.error || "unknown",
+    });
+    return parsed;
   }
 
   parseParakeetResult(output) {

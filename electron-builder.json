@@ -277,7 +277,7 @@
   },
   "publish": {
     "provider": "github",
-    "owner": "OpenWhispr",
+    "owner": "Grabhopser",
     "repo": "openwhispr",
     "private": false,
     "releaseType": "draft"

@@ -4,6 +4,9 @@ const assert = require("node:assert/strict");
 const Module = require("node:module");
 
 process.env.NODE_ENV = "test";
+// Fork builds keep upstream updates off by default; the upstream behaviour
+// below is tested with the opt-in set, the fork default at the end.
+process.env.OPENWHISPR_ENABLE_UPSTREAM_UPDATES = "1";
 
 const updaterModulePath = require.resolve("../../src/updater.js");
 const originalLoad = Module._load;
@@ -236,4 +239,26 @@ test("a Linux AppImage is supported, but deb/rpm/tar.gz installs never touch the
   assert.match(result.message, /package manager/);
 
   packaged.cleanup();
+});
+
+test("fork builds never check for upstream updates unless opted in", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  setPlatform("linux");
+  process.env.APPIMAGE = "/opt/OpenWhispr.AppImage";
+  delete process.env.OPENWHISPR_ENABLE_UPSTREAM_UPDATES;
+  try {
+    const autoUpdater = makeAutoUpdater();
+    const manager = createUpdateManager(autoUpdater);
+    manager.setAutoUpdatesEnabled(true);
+    assert.equal((await manager.getUpdateStatus()).isSupported, false);
+
+    manager.checkForUpdatesOnStartup();
+    t.mock.timers.tick(STARTUP_DELAY_MS + PERIODIC_INTERVAL_MS);
+    const result = await manager.checkForUpdates();
+    assert.equal(autoUpdater.calls, 0);
+    assert.match(result.message, /disabled in this fork/);
+    manager.cleanup();
+  } finally {
+    process.env.OPENWHISPR_ENABLE_UPSTREAM_UPDATES = "1";
+  }
 });

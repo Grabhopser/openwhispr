@@ -2,7 +2,13 @@ const { autoUpdater } = require("electron-updater");
 
 // electron-updater can only replace an AppImage on Linux; deb, rpm and tar.gz
 // installs are updated by the package manager instead.
-const isUpdaterSupported = process.platform !== "linux" || Boolean(process.env.APPIMAGE);
+// This is a personal fork: official upstream builds would replace it, so
+// update checks stay off unless OPENWHISPR_ENABLE_UPSTREAM_UPDATES=1.
+const forkUpdatesDisabled = !["1", "true"].includes(
+  String(process.env.OPENWHISPR_ENABLE_UPSTREAM_UPDATES || "").toLowerCase()
+);
+const isUpdaterSupported =
+  !forkUpdatesDisabled && (process.platform !== "linux" || Boolean(process.env.APPIMAGE));
 
 class UpdateManager {
   constructor() {
@@ -168,7 +174,9 @@ class UpdateManager {
       if (!isUpdaterSupported) {
         return {
           updateAvailable: false,
-          message: "Updates are installed through the system package manager",
+          message: forkUpdatesDisabled
+            ? "Update checks are disabled in this fork build"
+            : "Updates are installed through the system package manager",
         };
       }
 
