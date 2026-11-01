@@ -676,7 +676,10 @@ test("GNOME does not retry a failed ydotool after the native paths also fail", a
   );
 });
 
-test("KDE tries portal before uinput", async () => {
+// Portal keystrokes do not reach Chromium-based browsers (e.g. Vivaldi) on
+// KWin 6.8; uinput does. The clipboard is written to X11 and Wayland on KDE,
+// so uinput no longer desyncs it.
+test("KDE tries uinput before portal", async () => {
   const spawnCalls = [];
   const TestClipboardManager = loadClipboardManager({
     spawn: createSpawn(spawnCalls, [1, 0]),
@@ -691,8 +694,8 @@ test("KDE tries portal before uinput", async () => {
   assert.deepEqual(
     spawnCalls.map((call) => call.args),
     [
-      ["--portal", "--shift-insert"],
       ["--uinput", "--shift-insert"],
+      ["--portal", "--shift-insert"],
     ]
   );
 });

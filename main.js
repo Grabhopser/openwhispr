@@ -709,13 +709,15 @@ function registerSidecars() {
 
 // Phase 2: Non-critical setup after windows are visible
 function initializeDeferredManagers() {
-  ensureYdotool().catch((err) => {
-    require("./src/helpers/debugLogger").warn(
-      "ydotool setup error",
-      { error: err?.message },
-      "clipboard"
-    );
-  });
+  ensureYdotool({ isPasteAvailable: () => !!clipboardManager?.checkPasteTools()?.available }).catch(
+    (err) => {
+      require("./src/helpers/debugLogger").warn(
+        "ydotool setup error",
+        { error: err?.message },
+        "clipboard"
+      );
+    }
+  );
   if (process.platform !== "darwin") {
     clipboardManager.preWarmAccessibility();
   }

@@ -123,38 +123,59 @@ class ClipboardManager {
     return isWayland;
   }
 
+  _writeClipboardKdeX11(text) {
+    if (this.commandExists("xclip")) {
+      try {
+        const result = spawnSync("xclip", ["-selection", "clipboard"], {
+          input: text,
+          timeout: 200,
+        });
+        if (result.status === 0) {
+          clipboard.writeText(text);
+          return;
+        }
+      } catch {}
+    }
+    if (this.commandExists("xsel")) {
+      try {
+        const result = spawnSync("xsel", ["--clipboard", "--input"], {
+          input: text,
+          timeout: 200,
+        });
+        if (result.status === 0) {
+          clipboard.writeText(text);
+          return;
+        }
+      } catch {}
+    }
+    // Last resort: Electron's clipboard.writeText should work on XWayland
+    clipboard.writeText(text);
+  }
+
+  _copyToWaylandClipboard(text) {
+    if (!this.commandExists("wl-copy")) return;
+    try {
+      // Text via stdin, not argv, so it does not show up in the process list.
+      // wl-copy keeps serving in the background; ignore its output so this
+      // call does not wait on inherited pipes until the timeout.
+      spawnSync("wl-copy", [], {
+        input: text,
+        stdio: ["pipe", "ignore", "ignore"],
+        timeout: 200,
+      });
+    } catch {}
+  }
+
   _writeClipboardWayland(text, webContents) {
     const { isKde } = getLinuxSessionInfo();
 
     // On KDE with XWayland, write to X11 clipboard directly because
-    // wl-copy targets the Wayland clipboard which is desynced from X11
+    // wl-copy targets the Wayland clipboard which is desynced from X11.
+    // Also write the Wayland clipboard: native Wayland apps (e.g. Chromium)
+    // can get a stale selection through KWin's X11->Wayland bridge.
     if (isKde) {
-      if (this.commandExists("xclip")) {
-        try {
-          const result = spawnSync("xclip", ["-selection", "clipboard"], {
-            input: text,
-            timeout: 200,
-          });
-          if (result.status === 0) {
-            clipboard.writeText(text);
-            return;
-          }
-        } catch {}
-      }
-      if (this.commandExists("xsel")) {
-        try {
-          const result = spawnSync("xsel", ["--clipboard", "--input"], {
-            input: text,
-            timeout: 200,
-          });
-          if (result.status === 0) {
-            clipboard.writeText(text);
-            return;
-          }
-        } catch {}
-      }
-      // Last resort: Electron's clipboard.writeText should work on XWayland
-      clipboard.writeText(text);
+      this._writeClipboardKdeX11(text);
+      this._copyToWaylandClipboard(text);
       return;
     }
 
@@ -1830,13 +1851,6 @@ class ClipboardManager {
           }
         };
 
-        // KDE with XWayland: portal first because clipboard and input are both
-        // on X11; uinput causes clipboard desync (X11 clipboard vs Wayland input).
-        if (isKde && !this.portalDenied && !this.portalUnavailable && !this.portalFailed) {
-          const portalPaste = await tryPortalPaste();
-          if (portalPaste) return { method: "portal", ...portalPaste };
-        }
-
         // GNOME: only lead with the portal when a saved token lets it run
         // silently — a tokenless portal can stall 10s+ on a permission dialog
         // (issue #494), so first-time pastes try uinput and only fall back to
@@ -1882,9 +1896,11 @@ class ClipboardManager {
           debugLogger.warn("uinput paste failed", { error: uinputError?.message }, "clipboard");
         }
 
+        // KDE: uinput first, portal only as fallback. Portal keystrokes do not
+        // reach Chromium-based browsers on KWin 6.8, and the clipboard is written
+        // to both X11 and Wayland on KDE, so uinput no longer desyncs it.
         if (
-          isGnome &&
-          !shouldPreferGnomePortal &&
+          ((isGnome && !shouldPreferGnomePortal) || isKde) &&
           !this.portalDenied &&
           !this.portalUnavailable &&
           !this.portalFailed

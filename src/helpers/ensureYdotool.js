@@ -84,13 +84,20 @@ function userInInputGroup() {
   }
 }
 
-async function ensureYdotool() {
+async function ensureYdotool({ isPasteAvailable } = {}) {
   if (process.platform !== "linux") return;
 
   const sessionType = (process.env.XDG_SESSION_TYPE || "").toLowerCase();
   if (sessionType !== "wayland" && !process.env.WAYLAND_DISPLAY) return;
 
   const log = getLogger();
+
+  // ydotool is only a fallback. Skip the setup warning when paste already works
+  // another way (portal, native uinput helper, XWayland).
+  if (isPasteAvailable?.()) {
+    log.debug("paste available without ydotool, skipping ydotool check", {}, "clipboard");
+    return;
+  }
 
   const hasYdotool = commandExists("ydotool");
   const hasYdotoold = commandExists("ydotoold");
