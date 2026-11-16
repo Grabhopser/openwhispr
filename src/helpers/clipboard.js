@@ -804,7 +804,7 @@ class ClipboardManager {
         clearTimeout(timeoutId);
         const output = stdout.trim();
         if (code === 0 && (expectedOutput === undefined || output === expectedOutput)) {
-          resolve();
+          resolve(output);
         } else {
           const errorOutput = stderr.trim() || output;
           reject(
@@ -1061,6 +1061,17 @@ class ClipboardManager {
         elapsedMs: Date.now() - startTime,
         textLength: text.length,
       });
+      // Metadata only — never the text.
+      debugLogger.writeDiagnostic?.("paste_complete", {
+        status: pasteResult?.pasted === false ? "skipped" : "success",
+        platform,
+        method,
+        pasted: pasteResult?.pasted !== false,
+        reason: pasteResult?.reason ?? null,
+        uinputReady: pasteResult?.uinputReady ?? null,
+        elapsedMs: Date.now() - startTime,
+        textLength: text.length,
+      });
       return pasteResult || { restoreComplete: Promise.resolve() };
     } catch (error) {
       this.safeLog("❌ Paste operation failed", {
@@ -1068,6 +1079,15 @@ class ClipboardManager {
         method,
         elapsedMs: Date.now() - startTime,
         error: error.message,
+      });
+      debugLogger.writeDiagnostic?.("paste_complete", {
+        status: "failure",
+        platform,
+        method,
+        pasted: false,
+        errorClass: error?.code || error?.name || "error",
+        elapsedMs: Date.now() - startTime,
+        textLength: text.length,
       });
       throw error;
     }
@@ -1802,8 +1822,9 @@ class ClipboardManager {
             throw new Error("uinput timed out earlier this session, skipping");
           }
           const args = ["--uinput", "--shift-insert"];
+          let output;
           try {
-            await spawnFastPaste(args, "uinput");
+            output = await spawnFastPaste(args, "uinput");
           } catch (error) {
             // A timeout means uinput hangs in this environment (unlike a fast
             // error, which can be transient) — don't re-pay 2s on every paste.
@@ -1812,13 +1833,21 @@ class ClipboardManager {
             }
             throw error;
           }
+          // "uinput-ready-ms N": KWin listed the virtual keyboard after N ms;
+          // "timeout"/"fixed": no confirmation, the keys may have been dropped.
+          const readyMatch = /uinput-ready(?:-ms)? (\d+|timeout|fixed)/.exec(output || "");
+          const uinputReady = readyMatch
+            ? /^\d+$/.test(readyMatch[1])
+              ? Number(readyMatch[1])
+              : readyMatch[1]
+            : null;
           this.safeLog("✅ Paste successful using native linux-fast-paste (uinput)");
           debugLogger.info(
             "Paste successful",
-            { tool: "linux-fast-paste", method: "uinput", detectedWindowClass },
+            { tool: "linux-fast-paste", method: "uinput", detectedWindowClass, uinputReady },
             "clipboard"
           );
-          return { restoreComplete: restoreClipboard() };
+          return { restoreComplete: restoreClipboard(), uinputReady };
         };
 
         const tryPortalPaste = async () => {

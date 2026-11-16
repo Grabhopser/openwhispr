@@ -700,6 +700,26 @@ test("KDE tries uinput before portal", async () => {
   );
 });
 
+test("KDE uinput paste reports how long KWin took to list the virtual keyboard", async () => {
+  const spawnCalls = [];
+  const TestClipboardManager = loadClipboardManager({
+    spawn: createSpawn(spawnCalls, [0], { stdout: ["uinput-ready-ms 37\n"] }),
+  });
+  const manager = new TestClipboardManager();
+  manager.commandExists = () => false;
+  manager.resolveLinuxFastPasteBinary = () => "/tmp/linux-fast-paste";
+  manager._readPortalToken = () => null;
+
+  const result = await withWaylandEnvironment("KDE", () => manager.pasteLinux(null));
+
+  assert.equal(result.method, "uinput");
+  assert.equal(result.uinputReady, 37);
+  assert.deepEqual(
+    spawnCalls.map((call) => call.args),
+    [["--uinput", "--shift-insert"]]
+  );
+});
+
 test("portal exit zero succeeds with or without a restore token", async () => {
   const calls = [];
   const TestClipboardManager = loadClipboardManager({

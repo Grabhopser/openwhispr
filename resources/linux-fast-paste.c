@@ -660,7 +660,113 @@ static void emit_key(int fd, int code, int val) {
     emit(fd, EV_SYN, SYN_REPORT, 0);
 }
 
-static int paste_via_uinput(paste_mode_t mode, int copy_mode) {
+/* A freshly created uinput keyboard only receives keys once the compositor has
+ * opened it; evdev drops events written before that. KWin takes 20-60 ms
+ * (more under load), so the old fixed 50 ms wait lost pastes now and then.
+ * On KDE, wait until KWin lists the device; elsewhere keep the fixed wait. */
+#define UINPUT_FIXED_SETTLE_US 50000
+#define UINPUT_READY_TIMEOUT_MS 500
+#define UINPUT_READY_POLL_US 5000
+#define UINPUT_READY_SETTLE_US 10000
+/* Destroying the device discards events the compositor has not read yet. */
+#define UINPUT_DESTROY_DELAY_US 100000
+
+static long uinput_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+/* Finds the eventN node name of the uinput device; 0 on success. */
+static int uinput_event_name(int fd, char *out, size_t out_len) {
+    char sysname[64];
+    if (ioctl(fd, UI_GET_SYSNAME(sizeof(sysname)), sysname) < 0) return -1;
+    char dir_path[160];
+    snprintf(dir_path, sizeof(dir_path), "/sys/devices/virtual/input/%s", sysname);
+    DIR *dir = opendir(dir_path);
+    if (!dir) return -1;
+    int found = -1;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strncmp(entry->d_name, "event", 5) == 0) {
+            snprintf(out, out_len, "%s", entry->d_name);
+            found = 0;
+            break;
+        }
+    }
+    closedir(dir);
+    return found;
+}
+
+#ifdef HAVE_GIO
+/* 1 if KWin lists the input device, 0 if not yet, -1 if KWin cannot be asked. */
+static int kwin_lists_device(GDBusConnection *conn, const char *event_name) {
+    GVariant *reply = g_dbus_connection_call_sync(
+        conn, "org.kde.KWin", "/org/kde/KWin/InputDevice", "org.freedesktop.DBus.Properties",
+        "Get", g_variant_new("(ss)", "org.kde.KWin.InputDeviceManager", "devicesSysNames"),
+        G_VARIANT_TYPE("(v)"), G_DBUS_CALL_FLAGS_NONE, 200, NULL, NULL);
+    if (!reply) return -1;
+    GVariant *value = NULL;
+    g_variant_get(reply, "(v)", &value);
+    int listed = -1;
+    if (g_variant_is_of_type(value, G_VARIANT_TYPE_STRING_ARRAY)) {
+        gsize count = 0;
+        const gchar **names = g_variant_get_strv(value, &count);
+        listed = 0;
+        for (gsize i = 0; i < count; i++) {
+            if (strcmp(names[i], event_name) == 0) listed = 1;
+        }
+        g_free(names);
+    }
+    g_variant_unref(value);
+    g_variant_unref(reply);
+    return listed;
+}
+#endif
+
+/* Prints "uinput-ready-ms N", "uinput-ready timeout" or "uinput-ready fixed". */
+static void wait_for_uinput_device(int fd) {
+#ifdef HAVE_GIO
+    const char *desktop = getenv("XDG_CURRENT_DESKTOP");
+    if (desktop && strstr(desktop, "KDE")) {
+        GDBusConnection *conn = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, NULL);
+        if (conn) {
+            long start = uinput_now_ms();
+            char event_name[32] = "";
+            int listed = 0;
+            while (uinput_now_ms() - start < UINPUT_READY_TIMEOUT_MS) {
+                if (!event_name[0] && uinput_event_name(fd, event_name, sizeof(event_name)) != 0) {
+                    event_name[0] = '\0';
+                }
+                if (event_name[0]) {
+                    listed = kwin_lists_device(conn, event_name);
+                    if (listed != 0) break;
+                }
+                usleep(UINPUT_READY_POLL_US);
+            }
+            long waited = uinput_now_ms() - start;
+            g_object_unref(conn);
+            if (listed == 1) {
+                usleep(UINPUT_READY_SETTLE_US);
+                printf("uinput-ready-ms %ld\n", waited);
+                fflush(stdout);
+                return;
+            }
+            if (listed == 0) {
+                printf("uinput-ready timeout\n");
+                fflush(stdout);
+                return;
+            }
+            /* KWin did not answer: fall through to the fixed wait. */
+        }
+    }
+#endif
+    usleep(UINPUT_FIXED_SETTLE_US);
+    printf("uinput-ready fixed\n");
+    fflush(stdout);
+}
+
+static int paste_via_uinput(paste_mode_t mode, int copy_mode, int no_keys) {
     int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
     if (fd < 0) {
         fprintf(stderr, "Cannot open /dev/uinput: %s\n", strerror(errno));
@@ -690,9 +796,11 @@ static int paste_via_uinput(paste_mode_t mode, int copy_mode) {
         return 4;
     }
 
-    usleep(50000);
+    wait_for_uinput_device(fd);
 
-    if (!copy_mode && mode == PASTE_MODE_SHIFT_INSERT) {
+    if (no_keys) {
+        /* --no-keys: readiness probe only, nothing is typed. */
+    } else if (!copy_mode && mode == PASTE_MODE_SHIFT_INSERT) {
         emit_key(fd, KEY_LEFTSHIFT, 1);
         usleep(8000);
         emit_key(fd, KEY_INSERT, 1);
@@ -715,7 +823,7 @@ static int paste_via_uinput(paste_mode_t mode, int copy_mode) {
         emit_key(fd, KEY_LEFTCTRL, 0);
     }
 
-    usleep(20000);
+    usleep(UINPUT_DESTROY_DELAY_US);
 
     ioctl(fd, UI_DEV_DESTROY);
     close(fd);
@@ -1002,6 +1110,7 @@ int main(int argc, char *argv[]) {
     int force_terminal = 0;
     int force_shift_insert = 0;
     int use_uinput = 0;
+    int uinput_no_keys = 0;
     int use_portal = 0;
     int media_play_pause = 0;
     int copy_mode = 0;
@@ -1020,6 +1129,8 @@ int main(int argc, char *argv[]) {
             force_shift_insert = 1;
         } else if (strcmp(argv[i], "--uinput") == 0) {
             use_uinput = 1;
+        } else if (strcmp(argv[i], "--no-keys") == 0) {
+            uinput_no_keys = 1;
         } else if (strcmp(argv[i], "--portal") == 0) {
             use_portal = 1;
         } else if (strcmp(argv[i], "--media-play-pause") == 0) {
@@ -1100,7 +1211,7 @@ int main(int argc, char *argv[]) {
     if (use_uinput) {
 #ifdef HAVE_UINPUT
         paste_mode_t mode = resolve_paste_mode(force_terminal, force_shift_insert, target_window);
-        return paste_via_uinput(mode, copy_mode);
+        return paste_via_uinput(mode, copy_mode, uinput_no_keys);
 #else
         fprintf(stderr, "uinput support not compiled in\n");
         return 3;
